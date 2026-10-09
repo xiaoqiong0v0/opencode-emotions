@@ -1,0 +1,35 @@
+{
+  "name": "@xiaoqiong0v0/opencode-emotions",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "OpenCode 插件：用极短符号/命令表达情绪，归一化为 emoji(等级/3) 标注写回消息。",
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "main": "./dist/index.js",
+  "exports": {
+    ".": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "npm run build && node --test \"test/**/*.test.js\"",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "emotions"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@xiaoqiong0v0/opencode-plugin-logger": "^1.0.5"
+  },
+  "peerDependencies": {
+    "@opencode-ai/plugin": "^1.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.7.0"
+  }
+}
