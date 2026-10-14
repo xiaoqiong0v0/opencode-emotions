@@ -7,13 +7,21 @@
     "dist",
     "README.md"
   ],
-  "main": "./dist/index.js",
+  "main": "./dist/emotions.js",
   "exports": {
-    ".": "./dist/index.js"
+    ".": "./dist/emotions.js",
+    "./tui": "./dist/tui.js"
+  },
+  "bin": {
+    "voice-cli": "./dist/cli/voice-cli.js"
   },
   "scripts": {
-    "build": "tsc",
+    "prebuild": "node scripts/clean-dist.mjs",
+    "build": "tsc && node scripts/build-tui.mjs",
     "test": "npm run build && node --test \"test/**/*.test.js\"",
+    "voice": "node dist/runtime/voice-runtime.js",
+    "voice-cli": "node dist/cli/voice-cli.js",
+    "publish:proj": "npm run build && node scripts/publish-proj.mjs",
     "prepublishOnly": "npm run build"
   },
   "keywords": [
@@ -23,13 +31,19 @@
   ],
   "license": "MIT",
   "dependencies": {
-    "@xiaoqiong0v0/opencode-plugin-logger": "^1.0.5"
+    "@xiaoqiong0v0/opencode-plugin-logger": "^1.0.5",
+    "ffmpeg-static": "^5.3.0",
+    "ws": "^8.22.0"
   },
   "peerDependencies": {
     "@opencode-ai/plugin": "^1.18.0"
   },
   "devDependencies": {
+    "@babel/core": "^7.28.0",
+    "@babel/preset-typescript": "^7.27.1",
     "@types/node": "^24.0.0",
+    "@types/ws": "^8.18.2",
+    "babel-preset-solid": "^1.9.12",
     "typescript": "^5.7.0"
   }
 }
