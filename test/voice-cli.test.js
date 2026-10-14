@@ -2,7 +2,7 @@
  * 语音 CLI / 情绪指令 / i18n / 槽位指示 的离线单测（不触发真实播放、网络或设备枚举）。
  *
  * 覆盖：emotion→instruction 映射与别名、resolveTtsConfig 的情绪/provider 覆盖、
- * 语言解析与词表选择、槽位单词条形态、CLI 参数解析、config 的 language 字段。
+ * 语言解析与词表选择、槽位单词条形态、CLI 参数解析、config 的 uiLanguage/toolLanguage 字段。
  */
 
 import { test } from "node:test";
@@ -32,7 +32,14 @@ import {
   modeSegmentWidth,
 } from "../dist/voice/slot.js";
 import { PLAY_COMMAND, parseCliArgs } from "../dist/voice/cli.js";
-import { CONFIG_FILE_NAME, DEFAULT_VOICE_CONFIG, ENV_LANGUAGE, loadVoiceConfig } from "../dist/voice/config.js";
+import {
+  CONFIG_FILE_NAME,
+  DEFAULT_VOICE_CONFIG,
+  ENV_LANGUAGE,
+  ENV_TOOL_LANGUAGE,
+  ENV_UI_LANGUAGE,
+  loadVoiceConfig,
+} from "../dist/voice/config.js";
 
 test("emotion：规范情绪与别名映射为 CosyVoice 风格指令", () => {
   assert.equal(resolveEmotionInstruction("happy"), "用开心的语气说");
@@ -71,15 +78,15 @@ test("resolveTtsConfig：provider 参数优先于环境变量与文件", () => {
 });
 
 test("i18n：语言解析与归一化", () => {
-  assert.equal(DEFAULT_LANGUAGE, "zh");
+  assert.equal(DEFAULT_LANGUAGE, "en");
   assert.deepEqual([...LANGUAGES], ["zh", "en"]);
   assert.equal(resolveLanguage("en"), "en");
   assert.equal(resolveLanguage("EN"), "en");
   assert.equal(resolveLanguage("zh-CN"), "zh", "区域码归一化");
   assert.equal(resolveLanguage(" zh_Hans "), "zh");
-  assert.equal(resolveLanguage("fr"), "zh", "不支持的语言回退默认");
-  assert.equal(resolveLanguage(undefined), "zh");
-  assert.equal(resolveLanguage(""), "zh");
+  assert.equal(resolveLanguage("fr"), "en", "不支持的语言回退默认 en");
+  assert.equal(resolveLanguage(undefined), "en");
+  assert.equal(resolveLanguage(""), "en");
 });
 
 test("i18n：中英文案不同且插值可用", () => {
@@ -215,20 +222,22 @@ test("voice-cli 入口保护：被 import 时不执行 main、不打印任何内
   assert.equal(stderr, "", "import 不应产生 stderr");
 });
 
-test("config：language 字段（文件值 / 环境变量覆盖 / 非法回退默认）", () => {
+test("config：语言拆两键 uiLanguage/toolLanguage（默认 en / 旧键兜底 / 环境变量覆盖）", () => {
+  assert.equal(ENV_UI_LANGUAGE, "VOICE_UI_LANGUAGE");
+  assert.equal(ENV_TOOL_LANGUAGE, "VOICE_TOOL_LANGUAGE");
   assert.equal(ENV_LANGUAGE, "VOICE_LANGUAGE");
-  assert.equal(DEFAULT_VOICE_CONFIG.language, "zh");
+  assert.equal(DEFAULT_VOICE_CONFIG.uiLanguage, "en");
+  assert.equal(DEFAULT_VOICE_CONFIG.toolLanguage, "en");
   const dir = mkdtempSync(join(tmpdir(), "voice-lang-"));
   try {
     writeFileSync(join(dir, CONFIG_FILE_NAME), `{ "language": "en" }`, "utf8");
-    assert.equal(loadVoiceConfig({ configDir: dir, env: {} }).language, "en");
-    assert.equal(
-      loadVoiceConfig({ configDir: dir, env: { VOICE_LANGUAGE: "zh" } }).language,
-      "zh",
-      "环境变量覆盖文件",
-    );
-    writeFileSync(join(dir, CONFIG_FILE_NAME), `{ "language": "xx" }`, "utf8");
-    assert.equal(loadVoiceConfig({ configDir: dir, env: {} }).language, "zh", "非法语言回退默认");
+    let cfg = loadVoiceConfig({ configDir: dir, env: {} });
+    assert.deepEqual([cfg.uiLanguage, cfg.toolLanguage], ["en", "en"], "旧键兜底两者");
+    cfg = loadVoiceConfig({ configDir: dir, env: { VOICE_UI_LANGUAGE: "zh" } });
+    assert.deepEqual([cfg.uiLanguage, cfg.toolLanguage], ["zh", "en"], "新环境变量各自覆盖");
+    writeFileSync(join(dir, CONFIG_FILE_NAME), `{ "uiLanguage": "xx" }`, "utf8");
+    cfg = loadVoiceConfig({ configDir: dir, env: {} });
+    assert.equal(cfg.uiLanguage, "en", "非法语言回退默认 en");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

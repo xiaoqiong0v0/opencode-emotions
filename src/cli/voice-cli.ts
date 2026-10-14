@@ -6,7 +6,7 @@
  * - `speak --text <t> [--emotion <e>] [--voice <v>] [--rate <n>] [--provider <p>] [--background]`
  * - `devices`：列出本机音频输入设备（ffmpeg dshow）
  * - `status`：查看解析后的语音配置（不打印任何密钥）
- * - `help`：显示用法（随 `language` 本地化）
+ * - `help`：显示用法（随 `toolLanguage` 本地化）
  *
  * 进程模型（`speak`）：
  * - **前台**（默认）：直接调用 TTS provider 合成并播放，进程自然存活到播放结束；
@@ -76,7 +76,7 @@ function err(line: string): void {
  */
 async function runSpeak(command: Extract<CliCommand, { kind: "speak" }>): Promise<number> {
   const config = loadVoiceConfig();
-  const phrases = getPhrases(config.language);
+  const phrases = getPhrases(config.toolLanguage);
   const request = {
     text: command.text,
     voice: command.voice,
@@ -186,7 +186,7 @@ function runPlay(): number {
  */
 async function runDevices(): Promise<number> {
   const { listAudioDevices } = await import("../voice/capture.js");
-  const phrases = getPhrases(loadVoiceConfig().language);
+  const phrases = getPhrases(loadVoiceConfig().toolLanguage);
   let devices: Array<{ name: string; alternativeName?: string }>;
   try {
     devices = listAudioDevices();
@@ -213,7 +213,8 @@ async function runDevices(): Promise<number> {
 async function runStatus(): Promise<number> {
   const config = loadVoiceConfig();
   const resolved = resolveTtsConfig({ text: "-" }, process.env, config.tts);
-  out(`language: ${config.language}`);
+  out(`uiLanguage: ${config.uiLanguage}`);
+  out(`toolLanguage: ${config.toolLanguage}`);
   out(`provider: ${resolved.provider}`);
   out(`voice: ${resolved.voice || `(${DEFAULT_LABEL})`}`);
   out(`rate: ${resolved.rate}`);
@@ -277,11 +278,11 @@ export async function main(argv: readonly string[]): Promise<number> {
     case "play":
       return runPlay();
     case "help": {
-      out(getPhrases(loadVoiceConfig().language).cli.help);
+      out(getPhrases(loadVoiceConfig().toolLanguage).cli.help);
       return 0;
     }
     case "error":
-      err(`${command.message}\n\n${getPhrases(loadVoiceConfig().language).cli.help}`);
+      err(`${command.message}\n\n${getPhrases(loadVoiceConfig().toolLanguage).cli.help}`);
       return 1;
     default:
       return 1;

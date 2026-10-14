@@ -20,7 +20,7 @@
  *   （`babel-preset-solid` universal + `@babel/preset-typescript`）编译成 `dist/tui.js`——
  *   必须走 Solid 编译（JSX 会被包成 `createElement`/`insert`/`setProp` + `effect` 的响应式结构）；
  *   若改用 `tsc` 的 `jsx()` 产物，props/children 不会被包成访问器，槽位将失去响应式。
- * i18n：全部面向用户的文案取自 `lib/i18n.ts` 词表，语言来自 `emotions.jsonc` 的 `language`。
+ * i18n：全部面向用户的文案取自 `lib/i18n.ts` 词表，语言来自 `emotions.jsonc` 的 `uiLanguage`。
  * 健壮性：所有异常一律 catch，绝不影响 opencode；子进程异常退出时复位开关、可再次热键重启。
  */
 
@@ -103,10 +103,10 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolveDelay) => setTimeout(resolveDelay, ms));
 }
 
-/** 读取当前语言文案（配置读取失败回退默认，绝不影响 TUI）。 */
+/** 读取 UI 文案语言（`uiLanguage`）的文案表（配置读取失败回退默认，绝不影响 TUI）。 */
 function safePhrases(): Phrases {
   try {
-    return getPhrases(loadVoiceConfig().language);
+    return getPhrases(loadVoiceConfig().uiLanguage);
   } catch {
     return getPhrases(DEFAULT_LANGUAGE);
   }

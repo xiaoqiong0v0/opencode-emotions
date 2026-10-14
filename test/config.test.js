@@ -18,6 +18,9 @@ import {
   DEFAULT_CONFIG_TEMPLATE,
   DEFAULT_VOICE_CONFIG,
   ENV_CONFIG_DIR,
+  ENV_LANGUAGE,
+  ENV_TOOL_LANGUAGE,
+  ENV_UI_LANGUAGE,
   LEGACY_CONFIG_FILE_NAME,
   LEGACY_ENV_CONFIG_DIR,
   legacyVoiceConfigPath,
@@ -94,6 +97,78 @@ test("命名约定：配置文件名与插件同名，旧名仅作兼容", () =>
   assert.equal(LEGACY_CONFIG_FILE_NAME, "voice.jsonc");
   assert.equal(ENV_CONFIG_DIR, "EMOTIONS_CONFIG_DIR");
   assert.equal(LEGACY_ENV_CONFIG_DIR, "VOICE_CONFIG_DIR");
+});
+
+test("语言两键：默认均 en", () => {
+  assert.equal(DEFAULT_VOICE_CONFIG.uiLanguage, "en");
+  assert.equal(DEFAULT_VOICE_CONFIG.toolLanguage, "en");
+  const dir = tempDir();
+  try {
+    const cfg = loadVoiceConfig({ configDir: dir, env: {} });
+    assert.deepEqual([cfg.uiLanguage, cfg.toolLanguage], ["en", "en"]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("语言两键：互相独立（一个被文件覆盖不影响另一个，另一侧用默认 en）", () => {
+  const dir = tempDir();
+  try {
+    writeFileSync(join(dir, CONFIG_FILE_NAME), `{ "uiLanguage": "zh" }`, "utf8");
+    let cfg = loadVoiceConfig({ configDir: dir, env: {} });
+    assert.equal(cfg.uiLanguage, "zh");
+    assert.equal(cfg.toolLanguage, "en", "toolLanguage 不受 uiLanguage 影响");
+    writeFileSync(join(dir, CONFIG_FILE_NAME), `{ "toolLanguage": "zh" }`, "utf8");
+    cfg = loadVoiceConfig({ configDir: dir, env: {} });
+    assert.equal(cfg.uiLanguage, "en", "uiLanguage 不受 toolLanguage 影响");
+    assert.equal(cfg.toolLanguage, "zh");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("语言两键：旧键 language 兜底（新键缺→language；新键在则优先）", () => {
+  const dir = tempDir();
+  try {
+    writeFileSync(join(dir, CONFIG_FILE_NAME), `{ "language": "en" }`, "utf8");
+    let cfg = loadVoiceConfig({ configDir: dir, env: {} });
+    assert.deepEqual([cfg.uiLanguage, cfg.toolLanguage], ["en", "en"], "旧键兜底两者");
+    writeFileSync(join(dir, CONFIG_FILE_NAME), `{ "language": "en", "uiLanguage": "zh" }`, "utf8");
+    cfg = loadVoiceConfig({ configDir: dir, env: {} });
+    assert.deepEqual([cfg.uiLanguage, cfg.toolLanguage], ["zh", "en"], "新键优先于旧键，缺的那侧仍兜底");
+    writeFileSync(join(dir, CONFIG_FILE_NAME), `{ "uiLanguage": 42 }`, "utf8");
+    cfg = loadVoiceConfig({ configDir: dir, env: {} });
+    assert.deepEqual([cfg.uiLanguage, cfg.toolLanguage], ["en", "en"], "非字符串按缺失处理→兜底链");
+    writeFileSync(join(dir, CONFIG_FILE_NAME), `{ "uiLanguage": "xx" }`, "utf8");
+    cfg = loadVoiceConfig({ configDir: dir, env: {} });
+    assert.equal(cfg.uiLanguage, "en", "非法字符串回退默认 en");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("语言两键：环境变量优先级（新名 > 旧名 VOICE_LANGUAGE > 文件）", () => {
+  assert.equal(ENV_UI_LANGUAGE, "VOICE_UI_LANGUAGE");
+  assert.equal(ENV_TOOL_LANGUAGE, "VOICE_TOOL_LANGUAGE");
+  assert.equal(ENV_LANGUAGE, "VOICE_LANGUAGE");
+  const dir = tempDir();
+  try {
+    writeFileSync(join(dir, CONFIG_FILE_NAME), `{ "language": "en" }`, "utf8");
+    // 旧 env：兜底两者，且覆盖文件
+    let cfg = loadVoiceConfig({ configDir: dir, env: { VOICE_LANGUAGE: "zh" } });
+    assert.deepEqual([cfg.uiLanguage, cfg.toolLanguage], ["zh", "zh"], "旧 env 兜底两者且优先于文件");
+    // 新 env：各自覆盖，缺的那侧回落旧 env
+    cfg = loadVoiceConfig({ configDir: dir, env: { VOICE_UI_LANGUAGE: "zh", VOICE_LANGUAGE: "en" } });
+    assert.deepEqual([cfg.uiLanguage, cfg.toolLanguage], ["zh", "en"], "新名优先，旧名兜底另一侧");
+    // 新 env 单独覆盖一侧，另一侧回落文件旧键 language
+    cfg = loadVoiceConfig({ configDir: dir, env: { VOICE_TOOL_LANGUAGE: "zh" } });
+    assert.deepEqual([cfg.uiLanguage, cfg.toolLanguage], ["en", "zh"], "文件值仍生效");
+    // 大小写/区域码归一 + 非法值回退默认
+    cfg = loadVoiceConfig({ configDir: dir, env: { VOICE_UI_LANGUAGE: "EN-US", VOICE_TOOL_LANGUAGE: "bogus" } });
+    assert.deepEqual([cfg.uiLanguage, cfg.toolLanguage], ["en", "en"], "区域码归一；非法回退默认 en");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("loadVoiceConfig：新名缺失 + 旧名存在 → 原样复制为 emotions.jsonc（用户值保留、旧文件不删）", () => {

@@ -1,10 +1,18 @@
 /**
- * opencode-emotions 插件入口（V1 形态：默认导出 `{ id, server }`）。
+ * opencode-emotions **唯一 server 入口**（V1 形态：默认导出 `{ id, server }`）。
+ *
+ * 极性来源：命令（本插件，`/angry` 等）+ 语音（TUI 插件注入），统一渲染为 `emoji(等级/3)`；
+ * 手动符号解析（`!`/`?`/`...`/`666`）已移除（见 docs/设计-情绪输入插件.md）。
+ *
+ * 为什么只有一个 server 入口：opencode 对**一个 npm 包只解析一个 server 入口**
+ * （`exports["./server"]` / `main`）。原先 `voice_cli` 由第二个 server 插件 `src/tts-tool.ts`
+ * 注册，npm 安装时不会被加载 ⇒ 现将工具定义抽到 `src/voice/tool.ts`，与命令共用本入口。
  *
  * 钩子：
  * - `config`：注册全部情绪命令（含别名）。
- * - `chat.message`：解析消息并就地改写首个 text part 的 `.text` 为可见情绪标注；
- *   对已带标注的文本（无参数命令空参替换会残留尾部空格）只清理尾部空白。
+ * - `tool`：注册 CLI 风格工具 `voice_cli`（定义见 `src/voice/tool.ts`）。
+ * - `chat.message`：仅清理「以情绪标注开头」文本的尾部空白
+ *   （无参数命令模板空参替换会残留尾部空格，如 `😊(2/3) ` → `😊(2/3)`），不改写正文语义。
  * 所有异常一律 catch，绝不抛出影响会话。
  */
 
@@ -13,7 +21,8 @@ import createLogger from "@xiaoqiong0v0/opencode-plugin-logger";
 import type { Logger } from "@xiaoqiong0v0/opencode-plugin-logger";
 
 import { EMOTION_COMMANDS, commandTemplate } from "./lib/commands.js";
-import { rewriteEmotion, trimAnnotationTail } from "./lib/parser.js";
+import { trimAnnotationTail } from "./lib/parser.js";
+import { createVoiceTool } from "./voice/tool.js";
 
 /** V1 插件标识（本地文件插件必须导出 id）。 */
 const PLUGIN_ID = "emotions";
@@ -52,10 +61,18 @@ function registerCommands(cfg: CommandConfig): void {
   cfg.command = commands;
 }
 
-/** V1 server 工厂：返回 config 与 chat.message 钩子。 */
+/** V1 server 工厂：返回 config / tool / chat.message 钩子。 */
 const server: Plugin = async (): Promise<Hooks> => {
   log.loaded();
+  // 工具注册单独兜底：即便失败也只跳过 tool 钩子，不影响情绪命令
+  let voiceTool: Hooks["tool"];
+  try {
+    voiceTool = createVoiceTool(log);
+  } catch (err) {
+    log.error("voice_cli 工具注册失败", err as Error);
+  }
   return {
+    ...(voiceTool ? { tool: voiceTool } : {}),
     config: async (cfg) => {
       try {
         registerCommands(cfg as unknown as CommandConfig);
@@ -71,13 +88,7 @@ const server: Plugin = async (): Promise<Hooks> => {
         // 只处理首个 text part
         const first = parts.find((part) => part?.type === "text");
         if (!first || typeof first.text !== "string") return;
-        const rewritten = rewriteEmotion(first.text);
-        if (rewritten !== null) {
-          first.text = rewritten;
-          log.hook("chat.message", `已改写情绪标注：${rewritten.slice(0, 40)}`);
-          return;
-        }
-        // 未命中符号：仅当文本以情绪标注开头时清理尾部空白（无参数命令产出 `😊(2/3) `）
+        // 命令产出以情绪标注开头；空参命令会残留尾部空白，这里统一清理
         const trimmed = trimAnnotationTail(first.text);
         if (trimmed === first.text) return;
         first.text = trimmed;

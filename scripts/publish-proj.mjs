@@ -4,8 +4,9 @@
  * 指向编译后的 TUI 产物。
  *
  * 约定（与 `dist/` 结构一一对应）：
- * - `.opencode/plugin/` **顶层只允许真插件入口**（`emotions.js` / `tts-tool.js` / `tui.js`）；
+ * - `.opencode/plugin/` **顶层只允许真插件入口**（`emotions.js` / `tui.js`）；
  *   opencode 会把该目录顶层的每个 `.js` 当插件自动 import，故 CLI / 运行时等非插件产物一律进子目录。
+ *   `emotions.js` 是**唯一 server 入口**（情绪命令 + `voice_cli` 工具），另有 `tui.js`（TUI 插件）。
  * - 子目录（`cli/` `runtime/` `lib/` `voice/`）不被自动扫描，可安全承载依赖。
  *
  * 行为：
@@ -32,7 +33,7 @@ const PLUGIN_DIR = join(ROOT, ".opencode", "plugin");
 const TUI_JSON = join(ROOT, ".opencode", "tui.json");
 
 /** 允许出现在插件目录顶层的真插件入口（其余非插件产物必须进子目录）。 */
-const PLUGIN_ENTRIES = ["emotions.js", "tts-tool.js", "tui.js"];
+const PLUGIN_ENTRIES = ["emotions.js", "tui.js"];
 /** 允许出现在顶层的非插件子目录。 */
 const ALLOWED_DIRS = ["cli", "runtime", "lib", "voice"];
 /** TUI 插件入口（相对 `tui.json` 所在的 `.opencode/` 目录）。 */

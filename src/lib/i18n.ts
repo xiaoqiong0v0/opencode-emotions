@@ -1,10 +1,9 @@
 /**
  * 多语言（i18n）词表与语言解析（纯函数，零依赖、无 IO）。
  *
- * 语言来自 `<配置目录>/emotions.jsonc` 的 `language`（默认 `zh`），作用于：
- * - server 插件在**加载时**按配置本地化工具描述（注册给模型）；
- * - TUI 槽位指示、toast、命令标题等**面向用户的文案**；
- * - `voice-cli --help` 的帮助文本。
+ * 语言来自 `<配置目录>/emotions.jsonc`，拆为两个独立键（默认均 `en`，旧键 `language` 兜底两者）：
+ * - `uiLanguage` → TUI 槽位指示、toast、命令标题等**面向用户的 UI 文案**；
+ * - `toolLanguage` → server 插件在**加载时**本地化工具描述（注册给模型）与 `voice-cli --help`。
  *
  * 约定：所有面向用户/模型的文案**必须集中在本表**，禁止在调用处散落硬编码；
  * 带变量的文案用 `{name}` 占位符，经 `format()` 填充。
@@ -16,12 +15,12 @@ export type Language = "zh" | "en";
 /** 全部受支持语言。 */
 export const LANGUAGES: readonly Language[] = ["zh", "en"];
 
-/** 默认语言。 */
-export const DEFAULT_LANGUAGE: Language = "zh";
+/** 默认语言（未知值回退目标，与 `uiLanguage`/`toolLanguage` 的内置默认一致）。 */
+export const DEFAULT_LANGUAGE: Language = "en";
 
 /**
  * 把任意输入归一化为受支持语言（大小写、区域/分隔符不敏感：`zh-CN`→`zh`、`EN`→`en`）。
- * 未知或空值回退到默认语言。
+ * 未知或空值回退到 `DEFAULT_LANGUAGE`（现为 `en`，与内置默认保持一致）。
  * @param raw 原始值（可来自配置/环境变量）
  * @returns 受支持语言
  */
@@ -136,7 +135,7 @@ const HELP_ZH = [
   "        great / excited / good / nice / ok / fine、calm / plain、fear / afraid、disgust、surprise",
   "  neutral 或省略 = 不加风格指令",
   "",
-  "配置：<配置目录>/emotions.jsonc（tts.*、language）；环境变量 TTS_*、VOICE_LANGUAGE 可覆盖。",
+  "配置：<配置目录>/emotions.jsonc（tts.*、uiLanguage/toolLanguage）；环境变量 TTS_*、VOICE_UI_LANGUAGE/VOICE_TOOL_LANGUAGE（旧名 VOICE_LANGUAGE 兜底两者）可覆盖。",
 ].join("\n");
 
 /** 英文帮助文本。 */
@@ -158,7 +157,7 @@ const HELP_EN = [
   "           great / excited / good / nice / ok / fine, calm / plain, fear / afraid, disgust, surprise",
   "  neutral or omitted = no style instruction",
   "",
-  "Config: <config-dir>/emotions.jsonc (tts.*, language); env TTS_* and VOICE_LANGUAGE override.",
+  "Config: <config-dir>/emotions.jsonc (tts.*, uiLanguage/toolLanguage); env TTS_* and VOICE_UI_LANGUAGE/VOICE_TOOL_LANGUAGE (legacy VOICE_LANGUAGE as fallback for both) override.",
 ].join("\n");
 
 /** 全语言文案表（键必须与 `Phrases` 完全一致，缺键由类型检查拦截）。 */

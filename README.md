@@ -1,14 +1,23 @@
 # opencode-emotions
 
-OpenCode 插件：让用户用**极短符号**或**英文命令**表达情绪，插件把当前消息**可见地**改写为统一标注 `emoji(等级/3)`，让模型读到准确的情绪。零自然语言、免 i18n、无状态（只作用于当前这条消息）。
+OpenCode 插件：用**极简英文命令**（`/angry` 等）表达情绪，命令输出即带统一标注 `emoji(等级/3)`，让模型读到准确的情绪。零自然语言、免 i18n、无状态。
+另含 **TUI 插件**：把「语音输入」识别出的文本 + 情绪，以**同一套标注**注入会话或输入框。
+（早期的手动符号入口 `!`/`?`/`...`/`666` 已移除，见 `docs/设计-情绪输入插件.md`。）
 
-## 安装
+## 安装与生效
+
+### 推荐：`opencode plugin`（自动安装 + 改写配置）
 
 ```bash
-npm install @xiaoqiong0v0/opencode-emotions
+opencode plugin @xiaoqiong0v0/opencode-emotions           # 写入项目 .opencode/ 配置
+opencode plugin @xiaoqiong0v0/opencode-emotions --global  # 写入全局配置目录
 ```
 
-在 `opencode.jsonc` 的 `plugin` 数组中登记：
+该命令会安装 npm 包，并按包内入口**自动改写**两处配置：server 入口 → `opencode.json(c)` 的 `plugin`，tui 入口 → `tui.json` 的 `plugin`。
+
+### 手动：在配置里写包名
+
+server 插件（情绪命令）——`opencode.json(c)`：
 
 ```jsonc
 {
@@ -16,43 +25,39 @@ npm install @xiaoqiong0v0/opencode-emotions
 }
 ```
 
-本地开发：`npm run publish:proj`（= `npm run build` + 把 `dist/` 整体镜像到 `.opencode/plugin/`）后重启 opencode 生效，详见下文「本地发布」。
+TUI 插件（语音输入 UI + 热键）——`tui.json`：
 
-## 用法
+```jsonc
+{
+  "plugin": ["@xiaoqiong0v0/opencode-emotions"]
+}
+```
 
-### 1. 符号（前缀/后缀）
+改完**重启 opencode** 生效。
 
-在消息**开头**或**结尾**写一串符号（只认纯某一种符号，不能混写）：
+### 需要先 `npm install` 吗？
 
-| 符号（全/半角） | 情绪 | 最少个数 | 等级换算（封顶 3） | 1/3 | 2/3 | 3/3 |
-|---|---|---|---|---|---|---|
-| `!` / `！` | 怒 | 1 | `min(n, 3)` | 😠 | 😡 | 🤬 |
-| `?` / `？` | 疑惑 | 1 | `min(n, 3)` | 😕 | 🤔 | 😵 |
-| `...` / `。。。` | 无语 | 3 | `min(n-2, 3)` | 😐 | 😑 | 😮💨 |
-| `666` | 非常好 | 3 | `min(n-2, 3)` | 🙂 | 😊 | 🤩 |
+不需要。opencode 启动时会按配置里的**包名**自动把插件安装到自己的包缓存（`~/.cache/opencode/packages`）。
+`npm install @xiaoqiong0v0/opencode-emotions` 仅在你想在别处直接 `import` 本包时才需要。
 
-示例：
+### 包内入口如何被解析
 
-| 原始输入 | 归一化后 |
-|---|---|
-| `！！！测试` | `🤬(3/3) 测试` |
-| `!!! 又崩了` | `🤬(3/3) 又崩了` |
-| `又崩了 !!!` | `🤬(3/3) 又崩了` |
-| `？？？ 这是啥` | `😵(3/3) 这是啥` |
-| `... 算了` | `😐(1/3) 算了` |
-| `..... 服了` | `😮💨(3/3) 服了` |
-| `。。。算了` | `😐(1/3) 算了` |
-| `666 这版真不错` | `🙂(1/3) 这版真不错` |
-| `!!!`（只发符号） | `🤬(3/3)` |
+- **server 插件** = `package.json` 的 `exports["./server"]`，缺省回退 `main` → `dist/emotions.js`；
+- **TUI 插件** = `exports["./tui"]` → `dist/tui.js`。
 
-规则要点：
+> 依据（opencode v1.18.25 源码）：`packages/opencode/src/plugin/shared.ts` `resolvePackageEntrypoint()`、`packages/opencode/src/plugin/loader.ts` `resolve()`、`packages/opencode/src/cli/cmd/plug.ts`（`opencode plugin` 按 `exports["./server"]`/`main`/`exports["./tui"]` 判定要写哪些配置）。
 
-- 开头**标点类**可直接接正文（`！！！测试`）；开头**数字类 `666`** 必须后跟空白或行尾（防 `666元`）。
-- 结尾**不强制前置空格**，但**至少 2 个**（`崩溃了！！！` 有效；`好开心！` 单个不认）。
-- 首尾同时出现取**开头**；正文中间的符号不认。
-- 命中后符号被消耗，二次处理不再叠加（幂等）。
+## 依赖体积（含 `ffmpeg-static`）
 
-### 2. 情绪命令
+- **`ffmpeg-static`（写在 `dependencies`）**：npm 安装时会**下载**一个预编译 ffmpeg 二进制到 `node_modules/ffmpeg-static`（Windows `ffmpeg.exe` 实测 **≈ 79 MB**），用于语音采集与云 TTS 转码。代价是首次安装的网络流量与磁盘占用；可用环境变量 `FFMPEG_BIN` 指向系统自带 ffmpeg 以绕开随附二进制。
+- `ffmpeg-static` 自身按 **GPL-3.0-or-later** 分发（与本包 MIT 许可相互独立）。
+- `ws`：ASR/TTS 的 WebSocket 客户端（体积小）。
+
+> 只用情绪命令、不用语音的用户也会因 `dependencies` 拉入 `ffmpeg-static`（opencode 自动安装 `--production` 依赖）。
+
+## 用法：情绪命令
+
+消息以 `/` 触发命令，命令输出即为标注（可接你写的正文）：
 
 | 命令 | 别名 | 标注 |
 |---|---|---|
@@ -66,14 +71,27 @@ npm install @xiaoqiong0v0/opencode-emotions
 | `/happy` | `/good` `/nice` | 😊(2/3) |
 | `/great` | `/awesome` | 🤩(3/3) |
 
-例：`/angry 需求又改了` → `😡(2/3) 需求又改了`。无参数时只产生标注本身。
+例：`/angry 需求又改了` → `😡(2/3) 需求又改了`；无参数时只产生标注本身（`/great` → `🤩(3/3)`）。
+
+> 早期的手动符号入口（`!`/`？`/`...`/`666`）已**移除**：语音来源已能自动给出情绪，符号冗余且有误伤（`? 这是什么`、`666 元`）与硬限制（行首半角 `!` 被 shell 模式拦截）。原因与影响见 `docs/changes/设计-情绪输入插件.20261014.md`。
+
+## 语音输入（TUI 插件）
+
+TUI 插件在会话输入框右侧渲染一个状态指示（`🎙 ● 注入 F8/F9`），并用两个**点按**热键控制连续语音输入：
+
+| 热键 | 模式 | 行为 |
+|---|---|---|
+| `F8` | 注入 | 识别结果作为**新消息**发进当前会话（带 `🎙` 标记 + 情绪标注） |
+| `F9` | 输入 | 识别结果**追加进输入框**，由你编辑后发送 |
+
+两模式互斥；都关闭时停止后台语音运行时。ASR 依赖 DashScope 凭证与 ffmpeg，识别出的情绪映射为同一 `emoji(等级/3)` 标注。TUI 槽位/热键的 API **官方未公开**、跨版本可能变（详见 `docs/设计-语音输入注入.md`）。
 
 ## 语音输出（`voice_cli` 工具 / `voice-cli` 命令）
 
-由 **server 插件** `tts-tool` 提供 **CLI 风格**工具 `voice_cli`：模型在用户要求「说出来 / 念出来 / 朗读 / 用语音回答」时主动调用，把文字合成语音并对用户播放。
+由**唯一的 server 插件入口** `emotions`（`dist/emotions.js`）通过 `tool` 钩子提供 **CLI 风格**工具 `voice_cli`（工具定义在 `src/voice/tool.ts`）：模型在用户要求「说出来 / 念出来 / 朗读 / 用语音回答」时主动调用，把文字合成语音并对用户播放。
 工具只接受一个参数 `args`（完整 CLI 参数串），内部执行 `node dist/cli/voice-cli.js <args>`（PATH 上找不到 `node` 时回退 `process.execPath`）。
 
-> 为什么是 server 插件：`@opencode-ai/plugin/tui` 的 `TuiPluginModule` 声明 `server?: never`，TUI 插件无法注册工具；工具只能由 `{ id, server }` 的 server 插件提供。
+> 为什么由 server 插件提供：`@opencode-ai/plugin/tui` 的 `TuiPluginModule` 声明 `server?: never`，TUI 插件无法注册工具；工具只能由 `{ id, server }` 的 server 插件提供。现与情绪命令**合并进同一个 server 入口**——一个 npm 包只解析一个 server 入口（`exports["./server"]` / `main`），合并后 npm 安装时命令与 `voice_cli` **都生效**。
 
 **`voice_cli` 工具契约**（`args` 为命令串）：
 
@@ -81,7 +99,7 @@ npm install @xiaoqiong0v0/opencode-emotions
 |---|---|
 | `speak --text <t> [--emotion <e>] [--voice <v>] [--rate <n>] [--provider <p>]` | 合成并播放（工具会自动补 `--background`，立即返回、后台播放） |
 | `devices` | 列出音频输入设备 |
-| `status` | 查看解析后的配置（含 `language`） |
+| `status` | 查看解析后的配置（含 `uiLanguage`/`toolLanguage`） |
 | `help`（或省略 `args`） | 显示用法 |
 
 例：`speak --text "你好" --emotion happy`、`devices`、`status`、`help`。
@@ -102,8 +120,7 @@ node dist/cli/voice-cli.js speak --text "你好" --emotion happy --background # 
 
 | `dist/` 顶层 | 说明 | 镜像后 |
 |---|---|---|
-| `emotions.js` | server 插件入口 | `.opencode/plugin/emotions.js` |
-| `tts-tool.js` | server 插件入口（`voice_cli` 工具） | `.opencode/plugin/tts-tool.js` |
+| `emotions.js` | **唯一 server 插件入口**（情绪命令 + `voice_cli` 工具） | `.opencode/plugin/emotions.js` |
 | `tui.js` | TUI 插件入口（由 `src/tui.tsx` 编译） | `.opencode/plugin/tui.js` |
 | `cli/voice-cli.js` | CLI（非插件） | `.opencode/plugin/cli/` |
 | `runtime/voice-runtime.js` | 语音运行时（非插件） | `.opencode/plugin/runtime/` |
@@ -112,7 +129,7 @@ node dist/cli/voice-cli.js speak --text "你好" --emotion happy --background # 
 > **顶层只放真插件**：opencode 会把 `.opencode/plugin/` 顶层的**每个 `.js`** 当插件自动 import；CLI、语音运行时等非插件产物一律进子目录（`cli/`、`runtime/`），子目录不被扫描。`publish:proj` **断言顶层只有插件入口**——出现 `voice-cli.js` / `voice-runtime.js` 之类会立即报错退出（防回归）。
 > `tui.js` 由**宿主同款 Babel 链**（`babel-preset-solid` + `@babel/preset-typescript`，见 `scripts/build-tui.mjs`）编译：Solid 编译会把 JSX 包成 `createElement` / `insert` / `setProp` + `effect` 的**响应式**结构，而 `tsc` 的 `jsx()` 产物不会包裹 props/children（会失去响应式），故 `.tsx` **不进主 `tsc`**。产物保留裸 `@opentui/solid` / `solid-js` import，由宿主加载时重写为运行时模块 id。
 > 语音运行时由 TUI 插件从 `<cwd>/dist/runtime/voice-runtime.js` 启动（可用 `VOICE_RUNTIME_SCRIPT` 覆盖）。
-> CLI 路径解析：`VOICE_CLI_SCRIPT`（存在则用）> `<cwd>/dist/cli/voice-cli.js` > 由插件位置上溯的 `<仓库根>/dist/cli/voice-cli.js`。
+> CLI 路径解析：`VOICE_CLI_SCRIPT`（存在则用）> `<cwd>/dist/cli/voice-cli.js` > 工具模块同级（`dist/voice/` 或镜像后 `.opencode/plugin/voice/`）的 `../cli/voice-cli.js`。
 
 **情绪与配置**：`tts.*` 见下方「语音配置」；也可用环境变量覆盖（`TTS_PROVIDER` / `TTS_VOICE` / `TTS_RATE` / `TTS_INSTRUCTION` / `TTS_PITCH` / `TTS_VOLUME` / `TTS_FORMAT` / `TTS_SAMPLE_RATE` / `TTS_MODEL`）。
 
@@ -134,7 +151,8 @@ node dist/cli/voice-cli.js speak --text "你好" --emotion happy --background # 
 
 | 键 | 默认值 | 含义 | 环境变量 |
 |---|---|---|---|
-| `language` | `zh` | 文案语言：`zh` / `en`。用于**工具描述**、TUI 槽位/toast、`voice-cli --help`（改后重启 opencode 生效） | `VOICE_LANGUAGE` |
+| `uiLanguage` | `en` | **TUI UI 文案**语言：`zh` / `en`。用于槽位指示、toast、命令标题（改后重启 opencode 生效）；缺省回退旧键 `language` | `VOICE_UI_LANGUAGE`（旧名 `VOICE_LANGUAGE` 兜底） |
+| `toolLanguage` | `en` | **工具文案**语言：`zh` / `en`。用于 `voice_cli` 工具描述（插件加载时本地化）与 `voice-cli --help`；缺省回退旧键 `language` | `VOICE_TOOL_LANGUAGE`（旧名 `VOICE_LANGUAGE` 兜底） |
 | `device` | `""` | 音频输入设备友好名；空 = 自动取第一个输入设备 | `VOICE_DEVICE` |
 | `asr.provider` | `aliyun-qwen` | ASR 预设：`aliyun-qwen`(16k,7类情绪,realtime) / `aliyun-8k`(8k,3类) / `aliyun-v2`(16k,无情绪) | `VOICE_ASR_PROVIDER` |
 | `asr.model` | `""` | 模型名；空 = 按 provider 预设自动选择 | `VOICE_ASR_MODEL` |
@@ -159,15 +177,15 @@ node dist/cli/voice-cli.js speak --text "你好" --emotion happy --background # 
 
 自定义配置目录：环境变量 `EMOTIONS_CONFIG_DIR`（兼容旧名 `VOICE_CONFIG_DIR`，两者同时设置时新名优先）。
 
-**多语言（i18n）**：`language`（`zh` / `en`）控制**工具描述**（插件加载时本地化）、TUI 槽位指示/toast、`voice-cli --help`；词表集中在 `src/lib/i18n.ts`（新增语言只需在 `LANGUAGES` 与 `PHRASES` 各加一项，类型会强制补齐全部键）。
+**多语言（i18n）**：文案语言拆为两个独立键——`uiLanguage`（TUI 槽位指示/toast/命令标题）与 `toolLanguage`（**工具描述**，插件加载时本地化 + `voice-cli --help`）；均 `zh` / `en`（内置默认 `en`）。旧键 `language` 向后兼容：新键缺 → 用 `language` → 再缺用 `en`（环境变量同理：`VOICE_UI_LANGUAGE`/`VOICE_TOOL_LANGUAGE` 缺省时旧名 `VOICE_LANGUAGE` 兜底两者）。词表集中在 `src/lib/i18n.ts`（新增语言只需在 `LANGUAGES` 与 `PHRASES` 各加一项，类型会强制补齐全部键）。
 
-**抗噪**：阿里云无独立降噪参数，抗噪主要靠调高 `vad.threshold`（默认已从 0.2 调到 **0.5**）。`language` 留空走服务端自动语种检测，即可多语言。
+**抗噪**：阿里云无独立降噪参数，抗噪主要靠调高 `vad.threshold`（默认已从 0.2 调到 **0.5**）。`asr.language` 留空走服务端自动语种检测，即可多语言。
 
 ## 已知限制
 
-- **行首半角 `!` 会被 opencode shell 模式拦截**（光标在首字符时回车直接执行 shell，且不配置禁用）。行首请用**全角 `！`**；行尾半角/全角皆可。
-- 残留误伤可能：`? 这是什么`（疑问句）、`666 元`（数字）等仍可能被识别；token 规则已尽量收窄，无法 100% 消除，误判时可改用命令或改写措辞。
-- 无语族认**半角 `.` 与全角 `。`**（两者完全等价，各字符按 1 计：3 个=1/3、4 个=2/3、5 个及以上=3/3；单个不认）；全角省略号 `……` / `…` **不识别**，保持原文。
+- **手动符号入口已移除**：`!!!`/`？？？`/`...`/`666` 不再触发标注；请改用命令（`/angry` 等）。
+- 情绪命令需**真正触发命令**（消息以 `/` 开头）才生效；命令不产出额外模型回合。
+- **npm 安装会拉入 `ffmpeg-static`（≈79 MB 下载）**，见上文「依赖体积」。
 
 ## 开发
 
@@ -178,15 +196,29 @@ npm test             # 构建后跑单元测试（node --test）
 npm run publish:proj # build + 镜像 dist/ → .opencode/plugin/（并指向编译后的 tui.js）
 ```
 
+`publish:proj` 是**本地开发**路径（镜像到本项目 `.opencode/plugin/`，重启 opencode 生效），与下面的 npm 发布是两条互不影响的路径。
+
+### 发布（由维护者执行）
+
+```bash
+npm version patch              # 或 minor / major：升 version 并打 git tag
+npm publish --access public    # scoped 包必须显式 --access public
+```
+
+`prepublishOnly` 会在发布前自动 `npm run build`。发布前可用 `npm pack --dry-run` 校对将入包的产物（本包 `files` = `dist` + `README.md`；`package.json` / `LICENSE` 由 npm 自动带入）。
+
 **产物与发布结构**（顶层只放插件入口，其余进子目录）：
 
 ```
 dist/
-  emotions.js          # server 插件入口（源：src/emotions.ts）
-  tts-tool.js          # server 插件入口（源：src/tts-tool.ts）
+  emotions.js          # 唯一 server 插件入口（源：src/emotions.ts；情绪命令 + voice_cli 工具）
   tui.js               # TUI 插件入口（源：src/tui.tsx，经 Babel 链编译）
   cli/voice-cli.js     # CLI（源：src/cli/voice-cli.ts）
   runtime/voice-runtime.js  # 语音运行时（源：src/runtime/voice-runtime.ts）
-  lib/**
-  voice/**
+  lib/**               # 命令表 / 标注工具 / i18n 等
+  voice/**             # 语音能力（含 voice_cli 工具定义 voice/tool.ts）
 ```
+
+## 许可证
+
+MIT，见 `LICENSE`。`ffmpeg-static` 为独立依赖，按其自身 **GPL-3.0-or-later** 许可分发。

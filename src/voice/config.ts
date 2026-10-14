@@ -8,6 +8,9 @@
  * 读取失败（文件损坏/类型不符）**静默降级到默认值**，绝不影响插件运行。
  * 优先级：环境变量 > 配置文件 > 内置默认。
  *
+ * 文案语言拆为两个独立键：`uiLanguage`（TUI 槽位/toast/命令标题）与 `toolLanguage`（工具描述 + `voice-cli --help`）；
+ * 旧键 `language` 向后兼容——新键缺 → 用 `language` → 再缺用 `en`；环境变量同构（新名缺 → 旧名 → 文件值）。
+ *
  * ASR provider 是「预设」：`aliyun-qwen` 走 OpenAI-realtime 风格协议（16k、7 类情绪）；
  * `aliyun-8k` / `aliyun-v2` 走 DashScope inference 协议（run-task；8k 3 类情绪 / v2 无情绪）。
  * 协议字段依据阿里云百炼官方文档（见 README 与 docs）。
@@ -37,7 +40,11 @@ export const LEGACY_CONFIG_FILE_NAME = "voice.jsonc";
 
 /** 设备名覆盖环境变量。 */
 export const ENV_DEVICE = "VOICE_DEVICE";
-/** UI/工具描述语言覆盖环境变量（zh/en）。 */
+/** TUI 文案语言覆盖环境变量（zh/en）。 */
+export const ENV_UI_LANGUAGE = "VOICE_UI_LANGUAGE";
+/** 工具文案语言覆盖环境变量（zh/en）。 */
+export const ENV_TOOL_LANGUAGE = "VOICE_TOOL_LANGUAGE";
+/** 旧文案语言覆盖环境变量（向后兼容：两个新环境变量名都缺省时兜底两者）。 */
 export const ENV_LANGUAGE = "VOICE_LANGUAGE";
 /** ASR provider 覆盖环境变量。 */
 export const ENV_ASR_PROVIDER = "VOICE_ASR_PROVIDER";
@@ -171,8 +178,10 @@ export interface AsrCredentialsConfig {
 
 /** 完整语音配置。 */
 export interface VoiceConfig {
-  /** 面向用户/模型的文案语言（工具描述、槽位/toast、CLI 帮助）。 */
-  language: Language;
+  /** TUI UI 文案语言（槽位指示、toast、命令标题）。 */
+  uiLanguage: Language;
+  /** 工具文案语言（`voice_cli` 工具描述 + `voice-cli --help`）。 */
+  toolLanguage: Language;
   /** 音频输入设备友好名；空 = 自动取第一个输入设备。 */
   device: string;
   asr: {
@@ -221,7 +230,8 @@ export interface VoiceConfig {
 
 /** 内置默认配置。 */
 export const DEFAULT_VOICE_CONFIG: VoiceConfig = {
-  language: DEFAULT_LANGUAGE,
+  uiLanguage: DEFAULT_LANGUAGE,
+  toolLanguage: DEFAULT_LANGUAGE,
   device: "",
   asr: {
     provider: DEFAULT_ASR_PROVIDER,
@@ -253,8 +263,11 @@ export const DEFAULT_VOICE_CONFIG: VoiceConfig = {
 export const DEFAULT_CONFIG_TEMPLATE = `// emotions.jsonc —— opencode-emotions 语音配置
 // 修改后重启 opencode（或重新按热键）生效。环境变量可覆盖同名项（见 README）。
 {
-  // 面向用户/模型的文案语言：zh（默认）| en。影响工具描述、槽位/toast、CLI 帮助（改后重启 opencode）
-  "language": "zh",
+  // TUI UI 文案语言（槽位指示、toast、命令标题）：en（默认）| zh（改后重启 opencode 生效）
+  "uiLanguage": "en",
+  // 工具文案语言（voice_cli 工具描述 + voice-cli --help）：en（默认）| zh（改后重启 opencode 生效）
+  "toolLanguage": "en",
+  // 旧键 language 已拆成上面两键；两者缺省时回退 language，再缺省用 en（一般无需再写）
   // 音频输入设备友好名；留空 = 自动取第一个输入设备（可用 voice-runtime --list 查看）
   "device": "",
   "asr": {
@@ -498,8 +511,11 @@ function normalizeConfig(raw: unknown): VoiceConfig {
   const vad = isRecord(raw.vad) ? raw.vad : {};
   const tts = isRecord(raw.tts) ? raw.tts : {};
   const credentials = isRecord(asr.credentials) ? asr.credentials : {};
+  // 语言回退链：新键（缺失/非字符串）→ 旧键 language → 内置默认 en；新键给了非法字符串则按 resolveLanguage 归一（→ en）
+  const legacyLanguage = resolveLanguage(asString(raw.language, DEFAULT_VOICE_CONFIG.uiLanguage));
   return {
-    language: resolveLanguage(asString(raw.language, DEFAULT_VOICE_CONFIG.language)),
+    uiLanguage: resolveLanguage(asString(raw.uiLanguage, legacyLanguage)),
+    toolLanguage: resolveLanguage(asString(raw.toolLanguage, legacyLanguage)),
     device: asString(raw.device, DEFAULT_VOICE_CONFIG.device),
     asr: {
       provider: asProvider(asr.provider),
@@ -544,7 +560,8 @@ function normalizeConfig(raw: unknown): VoiceConfig {
  */
 function applyEnvOverrides(config: VoiceConfig, env: NodeJS.ProcessEnv): VoiceConfig {
   const out: VoiceConfig = {
-    language: config.language,
+    uiLanguage: config.uiLanguage,
+    toolLanguage: config.toolLanguage,
     device: config.device,
     asr: { ...config.asr },
     vad: { ...config.vad },
@@ -563,8 +580,12 @@ function applyEnvOverrides(config: VoiceConfig, env: NodeJS.ProcessEnv): VoiceCo
 
   const device = text(ENV_DEVICE);
   if (device !== undefined) out.device = device;
-  const uiLanguage = text(ENV_LANGUAGE);
-  if (uiLanguage !== undefined) out.language = resolveLanguage(uiLanguage);
+  // 旧环境变量 VOICE_LANGUAGE 兜底两者；新名优先级高于旧名
+  const legacyEnvLanguage = text(ENV_LANGUAGE);
+  const ui = text(ENV_UI_LANGUAGE) ?? legacyEnvLanguage;
+  if (ui !== undefined) out.uiLanguage = resolveLanguage(ui);
+  const tool = text(ENV_TOOL_LANGUAGE) ?? legacyEnvLanguage;
+  if (tool !== undefined) out.toolLanguage = resolveLanguage(tool);
   const provider = text(ENV_ASR_PROVIDER);
   if (provider !== undefined) out.asr.provider = asProvider(provider);
   const model = text(ENV_ASR_MODEL);

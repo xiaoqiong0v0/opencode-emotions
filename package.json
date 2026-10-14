@@ -2,7 +2,7 @@
   "name": "@xiaoqiong0v0/opencode-emotions",
   "version": "0.1.0",
   "type": "module",
-  "description": "OpenCode 插件：用极短符号/命令表达情绪，归一化为 emoji(等级/3) 标注写回消息。",
+  "description": "OpenCode plugin: emotion-aware voice I/O — realtime speech-to-text with emotion tagging, plus text-to-speech output.",
   "files": [
     "dist",
     "README.md"
@@ -30,6 +30,14 @@
     "emotions"
   ],
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/xiaoqiong0v0/opencode-emotions.git"
+  },
+  "homepage": "https://github.com/xiaoqiong0v0/opencode-emotions#readme",
+  "bugs": {
+    "url": "https://github.com/xiaoqiong0v0/opencode-emotions/issues"
+  },
   "dependencies": {
     "@xiaoqiong0v0/opencode-plugin-logger": "^1.0.5",
     "ffmpeg-static": "^5.3.0",
