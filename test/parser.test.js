@@ -14,7 +14,18 @@ test("命令模板：固定情绪 + 等级，占位符为 $ARGUMENTS", () => {
   assert.equal(commandTemplate(byName.get("angry")), "😡(2/3) $ARGUMENTS");
   assert.equal(commandTemplate(byName.get("neutral")), "😐 $ARGUMENTS");
   assert.equal(commandTemplate(byName.get("great")), "🤩(3/3) $ARGUMENTS");
+});
+
+test("命令集：仅 9 个精准主命令，无别名", () => {
   assert.equal(EMOTION_COMMANDS.length, 9);
+  assert.deepEqual(
+    EMOTION_COMMANDS.map((c) => c.name),
+    ["annoyed", "angry", "furious", "confused", "speechless", "neutral", "ok", "happy", "great"],
+  );
+  // 别名已从命令定义移除：任何条目都不应带 aliases 字段
+  for (const command of EMOTION_COMMANDS) {
+    assert.equal("aliases" in command, false, `命令 ${command.name} 不应带 aliases`);
+  }
 });
 
 // 无参数命令：模板空参替换后残留尾部空格，钩子用 trimAnnotationTail 清理

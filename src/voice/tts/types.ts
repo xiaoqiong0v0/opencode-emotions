@@ -9,6 +9,7 @@
 
 import type { CredentialFileConfig } from "../credentials.js";
 import { resolveEmotionInstruction } from "./emotion.js";
+import { DEFAULT_STREAM_MIN_CHARS, normalizeStreamMinChars } from "./stream.js";
 
 /** TTS 文件配置切片（来自 `<配置目录>/emotions.jsonc` 的 `tts` 节）。 */
 export interface TtsFileDefaults {
@@ -21,6 +22,8 @@ export interface TtsFileDefaults {
   format?: string;
   sampleRate?: number;
   model?: string;
+  /** 流式送文的最小缓冲阈值（首次发送前需缓冲的字符数；非负整数）。 */
+  streamMinChars?: number;
 }
 
 /** provider 选择环境变量（默认 sapi）。 */
@@ -41,6 +44,8 @@ export const ENV_FORMAT = "TTS_FORMAT";
 export const ENV_SAMPLE_RATE = "TTS_SAMPLE_RATE";
 /** 模型名环境变量（仅 CosyVoice）。 */
 export const ENV_MODEL = "TTS_MODEL";
+/** 流式最小缓冲阈值环境变量（首次发送前需缓冲的字符数）。 */
+export const ENV_STREAM_MIN_CHARS = "TTS_STREAM_MIN_CHARS";
 /** 默认 provider。 */
 export const DEFAULT_PROVIDER = "sapi";
 /** 默认语速。 */
@@ -74,7 +79,7 @@ export interface TtsRequest {
   rate?: number;
   /** 情绪名（happy/sad/…，可为别名）；映射为 CosyVoice 风格指令，sapi 忽略。 */
   emotion?: string;
-  /** provider 覆盖（sapi/aliyun）；省略 = 环境变量/文件配置/默认。 */
+  /** provider 覆盖（sapi/aliyun/termux）；省略 = 环境变量/文件配置/默认。 */
   provider?: string;
 }
 
@@ -95,8 +100,12 @@ export interface ResolvedTtsOptions {
   sampleRate: number;
   /** 模型名（空 = provider 默认）。 */
   model: string;
+  /** 流式送文的最小缓冲阈值（首次发送前需缓冲的字符数；非负整数，默认 5）。 */
+  streamMinChars: number;
   /** 云端凭证配置（仅云 provider 需要；缺省用默认路径/环境变量）。 */
   credentials?: CredentialFileConfig;
+  /** MiMo 专用 API Key（仅 provider=mimo；由 speak() 按 env `MIMO_API_KEY` > `tts.mimoCredentials.apiKey` 解析后传入）。 */
+  mimoApiKey?: string;
 }
 
 /** 某一 provider 支持的参数集合（用于忽略不支持项并记日志）。 */
@@ -133,6 +142,29 @@ export const TTS_PROVIDER_CAPABILITIES: Readonly<Record<string, TtsParamSupport>
     sampleRate: true,
     model: true,
   },
+  termux: {
+    // Android 系统 TTS：仅支持语速（映射到 -r）；音色/音高/风格等由系统决定
+    voice: false,
+    rate: true,
+    volume: false,
+    pitch: false,
+    instruction: false,
+    format: false,
+    sampleRate: false,
+    model: false,
+  },
+  mimo: {
+    // 小米 MiMo（OpenAI 兼容 SSE 流式）：音色走预置列表；rate 无原生参数，
+    // 非 0 时并入 user 风格指令文本（见 mimo.ts resolveMimoParams）；format/sampleRate 固定 pcm16/24000
+    voice: true,
+    rate: true,
+    volume: false,
+    pitch: false,
+    instruction: true,
+    format: false,
+    sampleRate: false,
+    model: true,
+  },
 };
 
 /** 解析后的完整配置（provider + 朗读参数）。 */
@@ -145,12 +177,22 @@ export interface SpeakResult {
   provider: string;
   voice: string;
   rate: number;
+  /** 云 TTS 任务 ID（供外部记录/取消；本地 provider 无）。 */
+  taskId?: string;
+  /** 播放真正结束（成功或失败）时 settle 的 Promise；调用方可 `await` 以保持进程存活。 */
+  done?: Promise<void>;
 }
 
 /** TTS provider 契约。 */
 export interface TtsProvider {
   /** provider 标识（如 sapi / aliyun）。 */
   readonly name: string;
+  /**
+   * 是否支持 **follow 常驻模式**（CLI `speak --follow`：从 stdin 按行读文本，对同一 provider 实例
+   * 连续 speak；EOF 收尾）。仅本地可常驻发声子进程的 provider 实现（现仅 sapi）；
+   * undefined/false 时 CLI `--follow` 报清晰错误，auto-read 走按块 spawn 旧路径。
+   */
+  readonly followSupport?: boolean;
   /**
    * 后台开始朗读：立即返回，不等待播放完成；内部负责打断上一次未完成的朗读。
    * @param options 解析后的朗读参数
@@ -159,6 +201,36 @@ export interface TtsProvider {
   speak(options: ResolvedTtsOptions): SpeakResult;
   /** 停止当前朗读并清理子进程/连接（幂等，可重复调用）。 */
   stop(): void;
+  /**
+   * 当前**真正发声**的子进程 PID（孙进程，如 sapi 的 PowerShell）。
+   *
+   * 时序契约：`speak()` 是**同步返回**的、发声子进程在 `speak()` 内已 spawn ⇒ 调用方在
+   * `speak()` 返回后读一次即可拿到 PID（CLI `registerPlaybackLifecycle` 据此补写 `tts-playback`
+   * 的 `playerPid`，供跨进程打断杀孙进程——Windows `TerminateProcess` 不杀子孙）。
+   * follow 模式下同理：`followStart()` 同步 spawn 常驻发声子进程 ⇒ 返回后 `activePlayerPid()`
+   * 即其 PID（worker CLI 启动时一次写盘登记）。
+   * 缺省不实现＝该 provider 无独立发声子进程（aliyun/mimo 流式 waveOut 靠 stdin EOF 自退，无需登记）。
+   * @returns 子进程 PID；无存活发声子进程时 undefined
+   */
+  activePlayerPid?(): number | undefined;
+  /**
+   * follow 模式：启动常驻发声子进程（同步返回；仅 `followSupport === true` 的 provider 实现）。
+   * 不打断语义由实现负责（sapi：先 `stop()` 杀旧子进程再 spawn）；行文本经 `followLine()` 送入。
+   * @param options 解析后的朗读参数（voice/rate/volume 等；`text` 忽略——正文走 stdin 行）
+   */
+  followStart?(options: ResolvedTtsOptions): void;
+  /**
+   * follow 模式：送入一行待朗读文本（不含换行；写方保证）。
+   * 常驻子进程已死/未启动时抛错（调用方据此停止该消息的朗读）。
+   * @param text 一行文本（非空）
+   */
+  followLine?(text: string): void;
+  /**
+   * follow 模式收尾：关闭常驻子进程的输入流（EOF）并等待其退出（冲刷尾音；有界超时后强杀）。
+   * 幂等：子进程已退出/未启动时立即 resolve。
+   * @returns 常驻子进程退出后 resolve（超时强杀后同样 resolve）
+   */
+  followEnd?(): Promise<void>;
 }
 
 /**
@@ -237,7 +309,22 @@ export function resolveTtsConfig(
   const format = env[ENV_FORMAT]?.trim() || fileDefaults.format?.trim() || DEFAULT_FORMAT;
   const sampleRate = parseNumberEnv(env[ENV_SAMPLE_RATE]) ?? fileDefaults.sampleRate ?? DEFAULT_SAMPLE_RATE;
   const model = env[ENV_MODEL]?.trim() || fileDefaults.model?.trim() || DEFAULT_MODEL;
-  return { provider, text: request.text, voice, rate, instruction, pitch, volume, format, sampleRate, model };
+  const streamMinChars = normalizeStreamMinChars(
+    parseNumberEnv(env[ENV_STREAM_MIN_CHARS]) ?? fileDefaults.streamMinChars ?? DEFAULT_STREAM_MIN_CHARS,
+  );
+  return {
+    provider,
+    text: request.text,
+    voice,
+    rate,
+    instruction,
+    pitch,
+    volume,
+    format,
+    sampleRate,
+    model,
+    streamMinChars,
+  };
 }
 
 /**

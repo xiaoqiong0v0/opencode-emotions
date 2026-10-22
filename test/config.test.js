@@ -15,6 +15,7 @@ import { parseJsonc, stripJsoncComments, stripTrailingCommas } from "../dist/lib
 import {
   ASR_PROVIDER_PRESETS,
   CONFIG_FILE_NAME,
+  DEFAULT_ASR_PROVIDER,
   DEFAULT_CONFIG_TEMPLATE,
   DEFAULT_VOICE_CONFIG,
   ENV_CONFIG_DIR,
@@ -303,13 +304,44 @@ test("loadVoiceConfig：环境变量覆盖文件与默认", () => {
   assert.equal(cfg.tts.rate, -4);
 });
 
-test("resolveAsrProvider：预设协议/采样率/未知回退", () => {
+test("resolveAsrProvider：预设协议/传输/采样率/未知回退", () => {
   assert.equal(ASR_PROVIDER_PRESETS["aliyun-qwen"].protocol, "realtime");
+  assert.equal(ASR_PROVIDER_PRESETS["aliyun-qwen"].transport, "stream");
   assert.equal(ASR_PROVIDER_PRESETS["aliyun-qwen"].model, "qwen3-asr-flash-realtime");
   assert.equal(ASR_PROVIDER_PRESETS["aliyun-8k"].protocol, "inference");
   assert.equal(ASR_PROVIDER_PRESETS["aliyun-8k"].sampleRate, 8000);
   assert.equal(ASR_PROVIDER_PRESETS["aliyun-v2"].extendedV2, true);
+  // 按段（segment）provider：无 WS 方言（protocol 缺省）、同步 HTTP 模型
+  assert.equal(ASR_PROVIDER_PRESETS["aliyun-qwen-file"].transport, "segment");
+  assert.equal(ASR_PROVIDER_PRESETS["aliyun-qwen-file"].protocol, undefined);
+  assert.equal(ASR_PROVIDER_PRESETS["aliyun-qwen-file"].model, "qwen3-asr-flash");
+  assert.equal(ASR_PROVIDER_PRESETS["aliyun-qwen-file"].supportsEmotion, true);
+  assert.equal(ASR_PROVIDER_PRESETS["mimo"].transport, "segment");
+  assert.equal(ASR_PROVIDER_PRESETS["mimo"].model, "mimo-v2.5-asr");
+  assert.equal(ASR_PROVIDER_PRESETS["mimo"].supportsEmotion, false);
+  assert.equal(ASR_PROVIDER_PRESETS["mimo"].supportsLanguageHints, true);
+  assert.equal(DEFAULT_ASR_PROVIDER, "aliyun-qwen", "默认 provider 不因新增按段 provider 而改变");
   assert.equal(resolveAsrProvider("nope").id, "aliyun-qwen");
+  assert.equal(resolveAsrProvider("mimo").id, "mimo");
+  assert.equal(resolveAsrProvider("aliyun-qwen-file").id, "aliyun-qwen-file");
+});
+
+test("asProvider 白名单：新按段 provider 可从配置解析，未知 id 仍回退默认", () => {
+  const dir = tempDir();
+  try {
+    writeFileSync(join(dir, CONFIG_FILE_NAME), `{ "asr": { "provider": "mimo" } }`, "utf8");
+    assert.equal(loadVoiceConfig({ configDir: dir, env: {} }).asr.provider, "mimo", "mimo 在白名单内");
+    writeFileSync(join(dir, CONFIG_FILE_NAME), `{ "asr": { "provider": "aliyun-qwen-file" } }`, "utf8");
+    assert.equal(loadVoiceConfig({ configDir: dir, env: {} }).asr.provider, "aliyun-qwen-file", "aliyun-qwen-file 在白名单内");
+    writeFileSync(join(dir, CONFIG_FILE_NAME), `{ "asr": { "provider": "MiMo" } }`, "utf8");
+    assert.equal(
+      loadVoiceConfig({ configDir: dir, env: {} }).asr.provider,
+      DEFAULT_ASR_PROVIDER,
+      "大小写不匹配仍回退默认（白名单精确匹配）",
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("loadVoiceConfig：新增 ASR/TTS/凭证字段可解析，非法值逐项回退", () => {
@@ -324,7 +356,7 @@ test("loadVoiceConfig：新增 ASR/TTS/凭证字段可解析，非法值逐项�
           "context": "客服话术",
           "credentials": { "path": "C:/creds", "apiKey": "sk-x", "workspaceId": "ws-9" }
         },
-        "tts": { "instruction": "方言：粤语", "pitch": 1.2, "volume": 70, "format": "mp3", "sampleRate": 24000, "model": "cosyvoice-v3-plus" }
+        "tts": { "instruction": "方言：粤语", "pitch": 1.2, "volume": 70, "format": "mp3", "sampleRate": 24000, "model": "cosyvoice-v3-plus", "streamMinChars": 12 }
       }`,
       "utf8",
     );
@@ -339,6 +371,7 @@ test("loadVoiceConfig：新增 ASR/TTS/凭证字段可解析，非法值逐项�
     assert.equal(cfg.tts.format, "mp3");
     assert.equal(cfg.tts.sampleRate, 24000);
     assert.equal(cfg.tts.model, "cosyvoice-v3-plus");
+    assert.equal(cfg.tts.streamMinChars, 12);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -375,6 +408,7 @@ test("loadVoiceConfig：新增环境变量覆盖（语言提示逗号分隔、�
       TTS_FORMAT: "opus",
       TTS_SAMPLE_RATE: "16000",
       TTS_MODEL: "cosyvoice-v3-flash",
+      TTS_STREAM_MIN_CHARS: "7",
     },
   });
   assert.deepEqual(cfg.asr.languageHints, ["en", "zh"]);
@@ -386,6 +420,146 @@ test("loadVoiceConfig：新增环境变量覆盖（语言提示逗号分隔、�
   assert.equal(cfg.tts.format, "opus");
   assert.equal(cfg.tts.sampleRate, 16000);
   assert.equal(cfg.tts.model, "cosyvoice-v3-flash");
+  assert.equal(cfg.tts.streamMinChars, 7);
+});
+
+test("loadVoiceConfig：tts.streamMinChars 默认 5、负数归一为 0、非数字回退默认", () => {
+  assert.equal(DEFAULT_VOICE_CONFIG.tts.streamMinChars, 5);
+  const dir = tempDir();
+  try {
+    writeFileSync(join(dir, CONFIG_FILE_NAME), `{ "tts": { "streamMinChars": -3 } }`, "utf8");
+    assert.equal(loadVoiceConfig({ configDir: dir, env: {} }).tts.streamMinChars, 0, "负数夹到 0");
+    writeFileSync(join(dir, CONFIG_FILE_NAME), `{ "tts": { "streamMinChars": "x" } }`, "utf8");
+    assert.equal(loadVoiceConfig({ configDir: dir, env: {} }).tts.streamMinChars, 5, "非数字回退默认 5");
+    writeFileSync(join(dir, CONFIG_FILE_NAME), `{ "tts": { "streamMinChars": 3.9 } }`, "utf8");
+    assert.equal(loadVoiceConfig({ configDir: dir, env: {} }).tts.streamMinChars, 3, "取整");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("凭证独立：DEFAULT_VOICE_CONFIG 与模板都含 tts.credentials 空块", () => {
+  const empty = { path: "", apiKey: "", workspaceId: "" };
+  assert.deepEqual(DEFAULT_VOICE_CONFIG.tts.credentials, empty, "默认 tts.credentials 为空块");
+  const tpl = parseJsonc(DEFAULT_CONFIG_TEMPLATE);
+  assert.deepEqual(tpl.tts.credentials, empty, "模板 tts.credentials 为空块");
+  assert.deepEqual(tpl.asr.credentials, DEFAULT_VOICE_CONFIG.asr.credentials);
+});
+
+test("MiMo 凭证：DEFAULT/模板含 tts.mimoCredentials 空块；文件解析与 aliyun 凭证互不影响", () => {
+  assert.deepEqual(DEFAULT_VOICE_CONFIG.tts.mimoCredentials, { apiKey: "" });
+  const tpl = parseJsonc(DEFAULT_CONFIG_TEMPLATE);
+  assert.deepEqual(tpl.tts.mimoCredentials, { apiKey: "" }, "模板 mimoCredentials 为空块");
+  const dir = tempDir();
+  try {
+    writeFileSync(
+      join(dir, CONFIG_FILE_NAME),
+      `{ "tts": { "credentials": { "apiKey": "aliyun-key", "workspaceId": "ws" }, "mimoCredentials": { "apiKey": "mimo-key" } } }`,
+      "utf8",
+    );
+    const cfg = loadVoiceConfig({ configDir: dir, env: {} });
+    assert.equal(cfg.tts.mimoCredentials.apiKey, "mimo-key");
+    assert.equal(cfg.tts.credentials.apiKey, "aliyun-key", "aliyun 凭证不受 mimoCredentials 影响");
+    // mimoCredentials 非对象 → 回退默认空块，不影响 aliyun
+    writeFileSync(join(dir, CONFIG_FILE_NAME), `{ "tts": { "mimoCredentials": "oops" } }`, "utf8");
+    const bad = loadVoiceConfig({ configDir: dir, env: {} });
+    assert.deepEqual(bad.tts.mimoCredentials, { apiKey: "" });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("ASR MiMo 凭证：DEFAULT/模板含 asr.mimoCredentials 空块；文件解析与 tts 组互不影响", () => {
+  assert.deepEqual(DEFAULT_VOICE_CONFIG.asr.mimoCredentials, { apiKey: "" });
+  const tpl = parseJsonc(DEFAULT_CONFIG_TEMPLATE);
+  assert.deepEqual(tpl.asr.mimoCredentials, { apiKey: "" }, "模板 asr.mimoCredentials 为空块");
+  const dir = tempDir();
+  try {
+    writeFileSync(
+      join(dir, CONFIG_FILE_NAME),
+      `{ "asr": { "mimoCredentials": { "apiKey": "asr-mimo" } }, "tts": { "mimoCredentials": { "apiKey": "tts-mimo" } } }`,
+      "utf8",
+    );
+    const cfg = loadVoiceConfig({ configDir: dir, env: {} });
+    assert.equal(cfg.asr.mimoCredentials.apiKey, "asr-mimo");
+    assert.equal(cfg.tts.mimoCredentials.apiKey, "tts-mimo", "两组各自独立、互不覆盖");
+    // asr.mimoCredentials 非对象 → 回退默认空块，不影响 tts 组
+    writeFileSync(
+      join(dir, CONFIG_FILE_NAME),
+      `{ "asr": { "mimoCredentials": "oops" }, "tts": { "mimoCredentials": { "apiKey": "tts-mimo" } } }`,
+      "utf8",
+    );
+    const bad = loadVoiceConfig({ configDir: dir, env: {} });
+    assert.deepEqual(bad.asr.mimoCredentials, { apiKey: "" });
+    assert.equal(bad.tts.mimoCredentials.apiKey, "tts-mimo", "ASR 非法不影响 TTS");
+    // 只配 asr 组、tts 组空 → 互不影响
+    writeFileSync(join(dir, CONFIG_FILE_NAME), `{ "asr": { "mimoCredentials": { "apiKey": "asr-only" } } }`, "utf8");
+    const oneSide = loadVoiceConfig({ configDir: dir, env: {} });
+    assert.equal(oneSide.asr.mimoCredentials.apiKey, "asr-only");
+    assert.deepEqual(oneSide.tts.mimoCredentials, { apiKey: "" });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("凭证独立：只配 tts.credentials → TTS 解析到、ASR 保持默认（互不影响）", () => {
+  const dir = tempDir();
+  try {
+    writeFileSync(
+      join(dir, CONFIG_FILE_NAME),
+      `{ "tts": { "credentials": { "path": "T:/tts", "apiKey": "tts-key", "workspaceId": "tts-ws" } } }`,
+      "utf8",
+    );
+    const cfg = loadVoiceConfig({ configDir: dir, env: {} });
+    assert.deepEqual(cfg.tts.credentials, { path: "T:/tts", apiKey: "tts-key", workspaceId: "tts-ws" });
+    assert.deepEqual(cfg.asr.credentials, DEFAULT_VOICE_CONFIG.asr.credentials, "ASR 未配 → 不受 TTS 影响");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("凭证独立：只配 asr.credentials → ASR 解析到、TTS 保持默认（互不影响）", () => {
+  const dir = tempDir();
+  try {
+    writeFileSync(
+      join(dir, CONFIG_FILE_NAME),
+      `{ "asr": { "credentials": { "apiKey": "asr-key", "workspaceId": "asr-ws" } } }`,
+      "utf8",
+    );
+    const cfg = loadVoiceConfig({ configDir: dir, env: {} });
+    assert.equal(cfg.asr.credentials.apiKey, "asr-key");
+    assert.deepEqual(cfg.tts.credentials, DEFAULT_VOICE_CONFIG.tts.credentials, "TTS 未配 → 不受 ASR 影响");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("凭证独立：两侧各配不同值互不覆盖；类型不符分别逐项回退", () => {
+  const dir = tempDir();
+  try {
+    writeFileSync(
+      join(dir, CONFIG_FILE_NAME),
+      `{
+        "asr": { "credentials": { "apiKey": "asr-key", "workspaceId": "asr-ws" } },
+        "tts": { "credentials": { "apiKey": "tts-key", "workspaceId": "tts-ws" } }
+      }`,
+      "utf8",
+    );
+    const cfg = loadVoiceConfig({ configDir: dir, env: {} });
+    assert.deepEqual(cfg.asr.credentials, { path: "", apiKey: "asr-key", workspaceId: "asr-ws" });
+    assert.deepEqual(cfg.tts.credentials, { path: "", apiKey: "tts-key", workspaceId: "tts-ws" });
+    // tts.credentials 给了非对象 → 逐项回退默认，且不影响 asr.credentials
+    writeFileSync(
+      join(dir, CONFIG_FILE_NAME),
+      `{ "asr": { "credentials": { "apiKey": "asr-key" } }, "tts": { "credentials": "oops" } }`,
+      "utf8",
+    );
+    const bad = loadVoiceConfig({ configDir: dir, env: {} });
+    assert.deepEqual(bad.tts.credentials, DEFAULT_VOICE_CONFIG.tts.credentials);
+    assert.equal(bad.asr.credentials.apiKey, "asr-key", "TTS 非法不影响 ASR");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("resolveAsrParams：按 provider 能力过滤并记录被忽略键", () => {

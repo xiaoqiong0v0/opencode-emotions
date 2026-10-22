@@ -14,23 +14,29 @@ import {
   DEFAULT_RATE,
   MAX_RATE,
   MIN_RATE,
+  SAPI_FOLLOW_SCRIPT,
   SAPI_SCRIPT,
   buildSapiEnv,
+  buildSapiFollowEnv,
   clampRate,
   getProvider,
   ignoredTtsParams,
+  resolveFollowSupport,
   resolveTtsConfig,
   speak,
   stopAll,
 } from "../dist/voice/tts/index.js";
 import {
+  buildCosyVoiceCancelTask,
   buildCosyVoiceContinueTask,
   buildCosyVoiceFinishTask,
   buildCosyVoiceRunTask,
   buildTtsUrl,
   normalizeWavHeader,
   resolveCosyVoiceParams,
+  supportsInstruction,
 } from "../dist/voice/tts/aliyun.js";
+import { DEFAULT_STREAM_MIN_CHARS } from "../dist/voice/tts/stream.js";
 import { DEFAULT_VOICE_CONFIG } from "../dist/voice/config.js";
 
 /** 完整的 ResolvedTtsOptions（provider 入参契约）。 */
@@ -45,6 +51,7 @@ function fullOptions(overrides = {}) {
     format: "",
     sampleRate: 0,
     model: "",
+    streamMinChars: 5,
     ...overrides,
   };
 }
@@ -69,6 +76,7 @@ test("resolveTtsConfig：默认值", () => {
   assert.equal(cfg.format, "");
   assert.equal(cfg.sampleRate, 0);
   assert.equal(cfg.model, "");
+  assert.equal(cfg.streamMinChars, DEFAULT_STREAM_MIN_CHARS, "流式最小缓冲阈值默认 5");
   assert.equal(cfg.text, "你好");
 });
 
@@ -247,10 +255,44 @@ test("normalizeWavHeader：修正流式 WAV 的占位长度，幂等且不改入
   assert.throws(() => normalizeWavHeader(Buffer.from("not a wav")), /不是合法/);
 });
 
+test("buildCosyVoiceCancelTask：finish-task + directive=cancel", () => {
+  assert.deepEqual(buildCosyVoiceCancelTask("t"), {
+    header: { action: "finish-task", task_id: "t", streaming: "duplex" },
+    payload: { input: { directive: "cancel" } },
+  });
+});
+
+test("supportsInstruction：仅 v3/v3.5 与 qwen-audio-3.x 支持（v2 不支持）", () => {
+  assert.equal(supportsInstruction("cosyvoice-v2"), false);
+  assert.equal(supportsInstruction("cosyvoice-v3"), true);
+  assert.equal(supportsInstruction("cosyvoice-v3.5-plus"), true);
+  assert.equal(supportsInstruction("cosyvoice-v3-flash"), true);
+  assert.equal(supportsInstruction("qwen-audio-3.1-tts"), true);
+  assert.equal(supportsInstruction(" COSYVOICE-V3 "), true, "大小写/空白不敏感");
+});
+
+test("resolveTtsConfig：streamMinChars 来自环境变量/文件（环境变量优先），负数归一为 0", () => {
+  // 默认
+  assert.equal(resolveTtsConfig({ text: "x" }, {}).streamMinChars, DEFAULT_STREAM_MIN_CHARS);
+  // 文件
+  assert.equal(resolveTtsConfig({ text: "x" }, {}, { streamMinChars: 12 }).streamMinChars, 12);
+  // 环境变量优先于文件
+  assert.equal(
+    resolveTtsConfig({ text: "x" }, { TTS_STREAM_MIN_CHARS: "8" }, { streamMinChars: 12 }).streamMinChars,
+    8,
+  );
+  // 非法/负数：归一（负数→0，非数字→默认）
+  assert.equal(resolveTtsConfig({ text: "x" }, { TTS_STREAM_MIN_CHARS: "-4" }).streamMinChars, 0);
+  assert.equal(resolveTtsConfig({ text: "x" }, { TTS_STREAM_MIN_CHARS: "abc" }).streamMinChars, DEFAULT_STREAM_MIN_CHARS);
+  assert.equal(resolveTtsConfig({ text: "x" }, { TTS_STREAM_MIN_CHARS: "3.9" }).streamMinChars, 3);
+});
+
 test("SAPI：脚本走环境变量、文本 base64 中文可还原、音量条件下发", () => {
   assert.match(SAPI_SCRIPT, /System\.Speech/);
   assert.match(SAPI_SCRIPT, /FromBase64String/);
   assert.match(SAPI_SCRIPT, /\.Volume/);
+  // 普通 speak 脚本仍是「单发」：不含 follow 的 ReadLine 循环
+  assert.doesNotMatch(SAPI_SCRIPT, /ReadLine/);
   const env = buildSapiEnv({ text: "你好，世界", voice: "Microsoft Huihui", rate: 0 }, {});
   assert.equal(Buffer.from(env.OC_TTS_TEXT_B64, "base64").toString("utf8"), "你好，世界");
   assert.equal(env.OC_TTS_VOICE, "Microsoft Huihui");
@@ -261,11 +303,53 @@ test("SAPI：脚本走环境变量、文本 base64 中文可还原、音量条�
   assert.equal(loud.OC_TTS_VOLUME, "100", "音量夹到上界");
 });
 
+test("SAPI follow 脚本：ReadLine 循环 + stdin UTF-8 编码；环境不带文本 b64（正文走 stdin 行）", () => {
+  // 常驻循环：按行读、非空即 Speak（Speak 同步＝天然串行）、EOF（ReadLine $null）退出
+  assert.match(SAPI_FOLLOW_SCRIPT, /ReadLine/);
+  assert.match(SAPI_FOLLOW_SCRIPT, /\$syn\.Speak\(\$line\)/);
+  assert.match(SAPI_FOLLOW_SCRIPT, /InputEncoding/);
+  // 空行不误退出循环（必须 $null 判定，不能让空串 "" 布尔为假终结 while）
+  assert.match(SAPI_FOLLOW_SCRIPT, /\$null -ne/);
+  // follow 环境只有音色/语速/音量，无文本 env（无注入面）
+  const env = buildSapiFollowEnv(fullOptions({ voice: "Microsoft Huihui", rate: 1, volume: 80 }), {});
+  assert.equal("OC_TTS_TEXT_B64" in env, false, "follow 不传文本 env");
+  assert.equal(env.OC_TTS_VOICE, "Microsoft Huihui");
+  assert.equal(env.OC_TTS_RATE, "1");
+  assert.equal(env.OC_TTS_VOLUME, "80");
+});
+
+test("provider follow 能力位：仅 sapi 为 true（aliyun/mimo/termux 不实现）", () => {
+  assert.equal(getProvider("sapi").followSupport, true);
+  assert.equal(getProvider("aliyun").followSupport, undefined);
+  assert.equal(getProvider("mimo").followSupport, undefined);
+  assert.equal(getProvider("termux").followSupport, undefined);
+  // sapi 实现 follow 三件套；其它 provider 不实现
+  assert.equal(typeof getProvider("sapi").followStart, "function");
+  assert.equal(typeof getProvider("sapi").followLine, "function");
+  assert.equal(typeof getProvider("sapi").followEnd, "function");
+  assert.equal(typeof getProvider("aliyun").followStart, "undefined");
+  // resolveFollowSupport：按解析链判定（env TTS_PROVIDER），失败降级 false
+  assert.equal(resolveFollowSupport({ TTS_PROVIDER: "sapi" }), true);
+  assert.equal(resolveFollowSupport({ TTS_PROVIDER: "aliyun" }), false);
+  assert.equal(resolveFollowSupport({ TTS_PROVIDER: "nope" }), false, "未知 provider 降级 false");
+});
+
 test("provider 注册表：按名缓存、未知抛错", () => {
   assert.equal(getProvider("sapi").name, "sapi");
   assert.equal(getProvider("aliyun").name, "aliyun");
+  assert.equal(getProvider("mimo").name, "mimo");
   assert.equal(getProvider("sapi"), getProvider("sapi"));
   assert.throws(() => getProvider("nope"), /未知 TTS provider/);
+});
+
+test("TtsProvider.activePlayerPid：sapi 实现（空闲 undefined）；流式 provider 不实现（不登记孙进程）", () => {
+  // sapi：spawn PowerShell 发声 → 暴露子进程 PID 供 tts-playback 写 playerPid（跨进程打断杀孙进程）
+  const sapi = getProvider("sapi");
+  assert.equal(typeof sapi.activePlayerPid, "function", "sapi 实现 activePlayerPid");
+  assert.equal(sapi.activePlayerPid(), undefined, "未 speak 时无存活子进程 → undefined");
+  // aliyun/mimo 走流式 waveOut（stdin EOF 自退），无独立发声子进程可登记 → 不实现该方法
+  assert.equal(typeof getProvider("aliyun").activePlayerPid, "undefined");
+  assert.equal(typeof getProvider("mimo").activePlayerPid, "undefined");
 });
 
 test("speak 错误路径：未知 provider 抛错、不抛给会话（由工具层兜底）", () => {
@@ -279,4 +363,29 @@ test("speak 错误路径：未知 provider 抛错、不抛给会话（由工具�
 test("AliyunProvider：空文本抛错、stop 幂等（不触网）", () => {
   assert.throws(() => new AliyunProvider().speak(fullOptions({ text: "   " })), /text 不能为空/);
   assert.doesNotThrow(() => new AliyunProvider().stop());
+});
+
+test("speak 接线：转发 config.tts.credentials（不是 asr.credentials）给 provider", () => {
+  // 用注入配置 + 打桩 provider.speak 捕获入参，验证凭证来源，不触网、不真实播放
+  const config = structuredClone(DEFAULT_VOICE_CONFIG);
+  config.tts.provider = "aliyun";
+  config.asr.credentials = { path: "asr-path", apiKey: "asr-key", workspaceId: "asr-ws" };
+  config.tts.credentials = { path: "tts-path", apiKey: "tts-key", workspaceId: "tts-ws" };
+  config.tts.streamMinChars = 9;
+
+  const provider = getProvider("aliyun");
+  const original = provider.speak;
+  let captured;
+  provider.speak = (options) => {
+    captured = options;
+    return { provider: "aliyun", voice: "", rate: 0 };
+  };
+  try {
+    speak({ text: "测试" }, { env: {}, config });
+  } finally {
+    provider.speak = original;
+  }
+  assert.deepEqual(captured.credentials, config.tts.credentials, "TTS 用自己独立的 tts.credentials");
+  assert.notDeepEqual(captured.credentials, config.asr.credentials, "不再复用 asr.credentials");
+  assert.equal(captured.streamMinChars, 9, "转发 tts.streamMinChars 给 provider");
 });

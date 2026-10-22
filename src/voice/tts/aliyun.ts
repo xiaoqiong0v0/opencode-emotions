@@ -1,32 +1,36 @@
 /**
- * 阿里云百炼 **CosyVoice** TTS provider（WebSocket `run-task` 协议）。
+ * 阿里云百炼 **CosyVoice** TTS provider（WebSocket `run-task` 协议）——**流式**实现。
  *
  * 接入方式（官方当前推荐，见 `docs/设计-语音输入注入.md` §11）：
  *   `wss://{workspace}.cn-beijing.maas.aliyuncs.com/api-ws/v1/inference`
  *   握手头 `Authorization: Bearer <apiKey>` + `X-DashScope-WorkSpace: <workspace>`；
- *   流程：`run-task`（参数：text_type/voice/format/sample_rate/volume/rate/pitch/instruction）
- *   → 收 `task-started` → `continue-task`（正文）→ `finish-task` → 收二进制音频帧 → `task-finished`。
+ *   流程：`run-task` → 收 `task-started` → **多条 `continue-task`（增量送入正文）** → `finish-task`
+ *   → 二进制音频帧**边到边播** → `task-finished`。
  *
- * 播放：把合成结果落临时 WAV（非 wav 用 ffmpeg 转码；流式 WAV 头长度字段经 `normalizeWavHeader` 修正），
- * 用 PowerShell `System.Media.SoundPlayer` 同步播放；
- * 播放进程可被 `stop()` 打断。**仅 Windows 支持播放**（非 Windows 抛清晰错误）。
+ * 流式播放（`docs/设计-语音输入注入.md` §15）：
+ * - 合成固定 `format=pcm`（裸 s16le 单声道），不做「整段合成→落盘→播」；
+ * - **纯流式送文**（`stream.ts` 的 `createStreamChunker`）：**不做句切分**，缓冲到 ≥ `tts.streamMinChars`
+ *   才首次 `continue-task`，之后随到随发；仅单条/累计超服务端上限才硬切；
+ * - 音频帧到达即交给 `audio-sink.ts`：优先写流式播放器 stdin（零落盘）；无流式播放器时
+ *   回退「按句边界临时 WAV 顺序播放」（见 `audio-sink.ts`，**此处才用 `splitSentences`**）；
+ * - **取消**：`finish-task` 且 `payload.input.directive="cancel"` → 立即停、丢弃后续音频；同连接可再 `run-task`。
  *
  * 安全：凭证只读、绝不打印；错误文本统一经 `redact()` 脱敏。并发/打断契约见 docs/ASYNC.md 交互点 ⑩。
  */
 
-import { spawn, type ChildProcess } from "node:child_process";
 import { randomBytes, randomUUID } from "node:crypto";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 
 import createLogger from "@xiaoqiong0v0/opencode-plugin-logger";
 import type { Logger } from "@xiaoqiong0v0/opencode-plugin-logger";
 import WebSocket from "ws";
 
 import { redact, resolveCredentials, type CredentialFileConfig, type Credentials } from "../credentials.js";
-import { decodeToWav } from "../ffmpeg.js";
+import { createAudioSink, selectAudioStrategy, type AudioSink } from "./audio-sink.js";
+import { splitSentences } from "./sentences.js";
+import { createStreamChunker, normalizeStreamMinChars, DEFAULT_STREAM_MIN_CHARS, MAX_CONTINUE_CHARS, MAX_TOTAL_CHARS } from "./stream.js";
 import type { ResolvedTtsOptions, SpeakResult, TtsProvider } from "./types.js";
+
+export { MAX_CONTINUE_CHARS, MAX_TOTAL_CHARS } from "./stream.js";
 /** provider 标识。 */
 export const ALIYUN_PROVIDER_NAME = "aliyun";
 /** 默认 CosyVoice 模型（官方在售；可被 `tts.model` 覆盖）。 */
@@ -39,8 +43,12 @@ export const TTS_URL_TEMPLATE = "wss://{workspace}.cn-beijing.maas.aliyuncs.com/
 export const TTS_FORMATS: readonly string[] = ["pcm", "wav", "mp3", "opus"];
 /** CosyVoice 支持的采样率。 */
 export const TTS_SAMPLE_RATES: readonly number[] = [8000, 16000, 22050, 24000, 44100, 48000];
-/** 默认输出格式（wav 便于本机直接播放）。 */
+/**
+ * 默认输出格式（历史口径；生产流式路径固定 `STREAM_FORMAT=pcm`，本值仅参与「忽略 format」比较、不再驱动落盘格式）。
+ */
 export const DEFAULT_FORMAT = "wav";
+/** 流式合成固定使用的输出格式（裸 PCM，供 stdin 播放器/low-latency）。 */
+export const STREAM_FORMAT = "pcm";
 /** 默认采样率。 */
 export const DEFAULT_SAMPLE_RATE = 22050;
 /** 默认音量。 */
@@ -57,14 +65,8 @@ export const MIN_PITCH = 0.5;
 export const MAX_PITCH = 2.0;
 /** 合成整体超时（毫秒）。 */
 export const SYNTH_TIMEOUT_MS = 30000;
-/** PowerShell 可执行文件候选（按顺序回退）。 */
-const PLAYER_BIN_CANDIDATES = ["pwsh", "powershell"] as const;
-/** 传给播放子进程的 WAV 路径环境变量。 */
-const ENV_WAV_PATH = "OC_TTS_WAV";
-/** SoundPlayer 播放脚本（WAV 路径走环境变量，无注入面）。 */
-const PLAYER_SCRIPT = `$ErrorActionPreference='Stop'; (New-Object System.Media.SoundPlayer $env:${ENV_WAV_PATH}).PlaySync()`;
-/** 播放参数。 */
-const PLAYER_ARGS = ["-NoProfile", "-NonInteractive", "-Command", PLAYER_SCRIPT];
+/** 支持 `instruction` 风格指令的模型前缀（v3/v3.5 与 qwen-audio-3.x；v2 不支持）。 */
+export const INSTRUCTION_MODEL_PREFIXES: readonly string[] = ["cosyvoice-v3", "qwen-audio-3"];
 
 /** 解析后的 CosyVoice 合成参数。 */
 export interface CosyVoiceParams {
@@ -97,6 +99,17 @@ function clamp(value: number, min: number, max: number): number {
  */
 export function buildTtsUrl(workspace: string): string {
   return TTS_URL_TEMPLATE.replace("{workspace}", workspace);
+}
+
+/**
+ * 该模型是否支持 `instruction`（风格/情感/方言指令）。
+ * 官方：仅 cosyvoice-v3 / v3.5 与 qwen-audio-3.x 支持；**cosyvoice-v2 不支持**。
+ * @param model 模型名
+ * @returns 支持 true
+ */
+export function supportsInstruction(model: string): boolean {
+  const normalized = model.trim().toLowerCase();
+  return INSTRUCTION_MODEL_PREFIXES.some((prefix) => normalized.startsWith(prefix));
 }
 
 /**
@@ -175,11 +188,24 @@ export function buildCosyVoiceFinishTask(taskId: string): Record<string, unknown
 }
 
 /**
+ * 构造 `finish-task` + `directive:"cancel"` 取消消息（纯函数）。
+ * 服务端收到后**立即停止**合成并丢弃后续音频；同一连接可再次 `run-task`（北京 CosyVoice v2+）。
+ * @param taskId 任务 ID
+ * @returns 完整消息体
+ */
+export function buildCosyVoiceCancelTask(taskId: string): Record<string, unknown> {
+  return {
+    header: { action: "finish-task", task_id: taskId, streaming: "duplex" },
+    payload: { input: { directive: "cancel" } },
+  };
+}
+
+/**
  * 修正流式 WAV 的 RIFF/`data` 块长度字段（纯函数）。
  *
- * 背景：CosyVoice 返回的是**流式 WAV**，其 RIFF 总长与 `data` 块长度是占位值（约 2GB），
- * 而 `System.Media.SoundPlayer` 不会因此报错，只会按占位长度读到"立刻 EOF"，从而**静默不出声**
- * （实测：原样 WAV PlaySync 仅阻塞 11ms，修正头后 784ms）。本函数按实际字节数重写两处长度。
+ * 说明：流式路径改走**裸 PCM**（不再落 WAV），本函数仅保留给历史/全量 WAV 路径与兼容用途；
+ * 对正常 WAV 幂等。背景：CosyVoice 的流式 WAV 头部长度是占位值（约 2GB），
+ * `System.Media.SoundPlayer` 会据此静默不出声，故按实际字节数重写两处长度。
  * @param buf 完整 WAV 字节
  * @returns 头部长度已修正的新 WAV 字节（不改动入参）
  * @throws Error 不是合法 WAV（缺少 RIFF/WAVE 标识）
@@ -203,254 +229,373 @@ export function normalizeWavHeader(buf: Buffer): Buffer {
   return out;
 }
 
-/** 阿里云 CosyVoice TTS provider（单实例；新 speak 打断旧朗读）。 */
-export class AliyunProvider implements TtsProvider {
-  readonly name = ALIYUN_PROVIDER_NAME;
-  private readonly log: Logger = createLogger("tts-aliyun");
+/** 服务端连接/事件回调。 */
+interface SessionHandlers {
+  onAudio: (chunk: Buffer) => void;
+}
+
+/**
+ * 一次 CosyVoice 流式会话（`run-task` → `continue-task`* → `finish-task`，音频帧回调解出）。
+ * 单实例单连接；`cancel()` 发 `directive=cancel` 并关闭连接。
+ */
+class CosyVoiceSession {
   private ws: WebSocket | null = null;
-  private player: ChildProcess | null = null;
-  private tmpDir: string | null = null;
-  private activeToken = "";
+  private started = false;
+  private settled = false;
+  private timer: NodeJS.Timeout | null = null;
+  private startResolve: (() => void) | null = null;
+  private startReject: ((err: Error) => void) | null = null;
+  private doneResolve: (() => void) | null = null;
+  private doneReject: ((err: Error) => void) | null = null;
+  private readonly donePromise: Promise<void>;
 
   /**
-   * 后台合成并播放：立即返回（不等待合成/播放完成）；内部先打断上一次。
-   * @param options 解析后的朗读参数（含凭证配置）
-   * @returns 本次朗读的启动结果
-   * @throws Error 平台不支持 / 文本为空 / 凭证缺失 / 配置非法
-   */
-  speak(options: ResolvedTtsOptions): SpeakResult {
-    if (process.platform !== "win32") {
-      throw new Error("aliyun(CosyVoice) 播放仅支持 Windows；其它平台请改用 sapi 或本地播放器");
-    }
-    if (options.text.trim().length === 0) {
-      throw new Error("text 不能为空");
-    }
-    const params = resolveCosyVoiceParams(options);
-    const credentials = resolveCredentials({ config: options.credentials as CredentialFileConfig | undefined });
-    this.stop();
-    const token = randomBytes(8).toString("hex");
-    this.activeToken = token;
-    void this.run(options.text, params, credentials, token).catch((err: unknown) => {
-      this.log.error("CosyVoice 合成/播放失败", err instanceof Error ? err : String(err));
-    });
-    return { provider: this.name, voice: params.voice, rate: params.rate };
-  }
-
-  /** 打断：关闭连接、杀掉播放进程、删除临时目录（幂等）。 */
-  stop(): void {
-    this.activeToken = "";
-    const ws = this.ws;
-    this.ws = null;
-    if (ws) {
-      try {
-        if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) ws.close();
-      } catch {
-        // 关闭阶段异常忽略
-      }
-    }
-    const player = this.player;
-    this.player = null;
-    if (player && player.exitCode === null) {
-      try {
-        player.kill();
-      } catch (err) {
-        this.log.warn("停止 CosyVoice 播放进程失败", err as Error);
-      }
-    }
-    this.cleanupTemp();
-  }
-
-  /**
-   * 完整流程：合成 → 转码（非 wav）→ 落盘 → 播放。
-   * @param text 文本
+   * @param taskId 任务 ID
    * @param params 合成参数
    * @param credentials 凭证
-   * @param token 本次调用令牌（被打断则中止）
+   * @param handlers 音频回调
+   * @param log 日志器
    */
-  private async run(text: string, params: CosyVoiceParams, credentials: Credentials, token: string): Promise<void> {
-    const taskId = randomUUID();
-    const audio = await this.synthesize(taskId, text, params, credentials);
-    if (this.activeToken !== token) return;
-    if (audio.length === 0) {
-      throw new Error("CosyVoice 未返回音频数据（服务端可能返回了空结果或 task-failed）");
+  constructor(
+    private readonly taskId: string,
+    private readonly params: CosyVoiceParams,
+    private readonly credentials: Credentials,
+    private readonly handlers: SessionHandlers,
+    private readonly log: Logger,
+  ) {
+    this.donePromise = new Promise<void>((resolveDone, rejectDone) => {
+      this.doneResolve = resolveDone;
+      this.doneReject = rejectDone;
+    });
+  }
+
+  /** 建立连接并发 `run-task`，在收到 `task-started` 后 resolve。 */
+  start(): Promise<void> {
+    return new Promise<void>((resolveStart, rejectStart) => {
+      this.startResolve = resolveStart;
+      this.startReject = rejectStart;
+      let ws: WebSocket;
+      try {
+        ws = new WebSocket(buildTtsUrl(this.credentials.workspace), {
+          headers: {
+            Authorization: `Bearer ${this.credentials.apiKey}`,
+            "X-DashScope-WorkSpace": this.credentials.workspace,
+          },
+        });
+      } catch (err) {
+        this.fail(this.redactError(err));
+        return;
+      }
+      this.ws = ws;
+      this.timer = setTimeout(() => this.fail(new Error(`CosyVoice 合成超时（${SYNTH_TIMEOUT_MS}ms）`)), SYNTH_TIMEOUT_MS);
+      ws.on("open", () => this.send(buildCosyVoiceRunTask({ taskId: this.taskId, ...this.params })));
+      ws.on("message", (data: WebSocket.RawData, isBinary: boolean) => this.handleMessage(data, isBinary));
+      ws.on("error", (err: Error) => this.fail(this.redactError(err)));
+      ws.on("close", () => {
+        if (!this.settled) this.fail(new Error("CosyVoice 连接提前关闭"));
+      });
+    });
+  }
+
+  /** 发送一条 `continue-task`（承载增量正文）。 */
+  pushText(text: string): void {
+    this.send(buildCosyVoiceContinueTask(this.taskId, text));
+  }
+
+  /** 发送 `finish-task`（正文送完）。 */
+  finish(): void {
+    this.send(buildCosyVoiceFinishTask(this.taskId));
+  }
+
+  /** 播放真正结束（`task-finished` 或失败）时 settle。 */
+  done(): Promise<void> {
+    return this.donePromise;
+  }
+
+  /** 取消：发 `directive=cancel` 并关闭连接（幂等；settle 为正常结束）。 */
+  cancel(): void {
+    if (!this.settled) {
+      const ws = this.ws;
+      if (this.started && ws && ws.readyState === WebSocket.OPEN) this.send(buildCosyVoiceCancelTask(this.taskId));
+      this.settled = true;
+      this.clearTimer();
+      this.startResolve?.();
+      this.doneResolve?.();
     }
-    const raw = params.format === "wav" ? audio : await decodeToWav(audio, params.format, params.sampleRate);
-    if (this.activeToken !== token) return;
-    // 直接透传的流式 WAV 头部长度是占位值，SoundPlayer 会据此静默不出声，须先修正
-    const file = this.writeTemp(normalizeWavHeader(raw));
-    if (this.activeToken !== token) {
-      this.cleanupTemp();
+    this.close();
+  }
+
+  /** 处理一条服务端消息。 */
+  private handleMessage(data: WebSocket.RawData, isBinary: boolean): void {
+    if (isBinary) {
+      if (this.settled) return;
+      try {
+        this.handlers.onAudio(Buffer.isBuffer(data) ? data : Buffer.from(data as ArrayBuffer));
+      } catch (err) {
+        this.log.warn("CosyVoice 音频帧写出失败", err as Error);
+      }
       return;
     }
-    this.play(file);
+    let message: ServerMessage;
+    try {
+      message = JSON.parse(data.toString()) as ServerMessage;
+    } catch {
+      return;
+    }
+    switch (message.header?.event) {
+      case "task-started":
+        this.started = true;
+        this.clearTimer();
+        this.startResolve?.();
+        this.startResolve = null;
+        this.startReject = null;
+        break;
+      case "task-finished":
+        this.finishSuccess();
+        break;
+      case "task-failed":
+        this.fail(this.redactError(new Error(`CosyVoice 合成失败：${message.header?.error_message ?? "未知错误"}`)));
+        break;
+      default:
+        break;
+    }
   }
 
-  /**
-   * 建立 WebSocket 并完成一次 CosyVoice 合成，返回云端音频字节。
-   * @param taskId 任务 ID
-   * @param text 文本
-   * @param params 合成参数
-   * @param credentials 凭证
-   * @returns 合成音频字节
-   */
-  private synthesize(
-    taskId: string,
-    text: string,
-    params: CosyVoiceParams,
-    credentials: Credentials,
-  ): Promise<Buffer> {
-    return new Promise<Buffer>((resolveSynth, rejectSynth) => {
-      const chunks: Buffer[] = [];
-      let settled = false;
-      const ws = new WebSocket(buildTtsUrl(credentials.workspace), {
-        headers: {
-          Authorization: `Bearer ${credentials.apiKey}`,
-          "X-DashScope-WorkSpace": credentials.workspace,
-        },
-      });
-      this.ws = ws;
-      const finish = (error?: Error, audio?: Buffer): void => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        if (this.ws === ws) this.ws = null;
-        try {
-          ws.close();
-        } catch {
-          // 忽略
-        }
-        if (error) rejectSynth(error);
-        else resolveSynth(audio ?? Buffer.alloc(0));
-      };
-      const timer = setTimeout(() => finish(new Error(`CosyVoice 合成超时（${SYNTH_TIMEOUT_MS}ms）`)), SYNTH_TIMEOUT_MS);
+  /** 成功结束：settle done，关闭连接。 */
+  private finishSuccess(): void {
+    if (this.settled) return;
+    this.settled = true;
+    this.clearTimer();
+    this.doneResolve?.();
+    this.close();
+  }
 
-      ws.on("open", () => {
-        this.send(ws, buildCosyVoiceRunTask({ taskId, ...params }));
-      });
-      ws.on("message", (data: WebSocket.RawData, isBinary: boolean) => {
-        if (isBinary) {
-          chunks.push(Buffer.isBuffer(data) ? data : Buffer.from(data as ArrayBuffer));
-          return;
-        }
-        let message: ServerMessage;
-        try {
-          message = JSON.parse(data.toString()) as ServerMessage;
-        } catch {
-          return;
-        }
-        switch (message.header?.event) {
-          case "task-started":
-            this.send(ws, buildCosyVoiceContinueTask(taskId, text));
-            this.send(ws, buildCosyVoiceFinishTask(taskId));
-            break;
-          case "task-finished":
-            finish(undefined, Buffer.concat(chunks));
-            break;
-          case "task-failed":
-            finish(
-              new Error(
-                redact(`CosyVoice 合成失败：${message.header?.error_message ?? "未知错误"}`, credentials.apiKey),
-              ),
-            );
-            break;
-          default:
-            break;
-        }
-      });
-      ws.on("error", (err: Error) => finish(new Error(redact(err.message, credentials.apiKey))));
-      ws.on("close", () => {
-        if (!settled) finish(new Error("CosyVoice 连接提前关闭"));
-      });
-    });
+  /** 失败：若尚未 `task-started` 则 reject `start()`（并 resolve done，避免未处理拒绝）。 */
+  private fail(err: Error): void {
+    if (this.settled) return;
+    this.settled = true;
+    this.clearTimer();
+    this.close();
+    if (!this.started) {
+      this.doneResolve?.();
+      this.startReject?.(err);
+      this.startResolve = null;
+      this.startReject = null;
+    } else {
+      this.doneReject?.(err);
+    }
   }
 
   /** 发送一条 JSON 文本帧（连接不可用时忽略）。 */
-  private send(ws: WebSocket, body: Record<string, unknown>): void {
-    if (ws.readyState !== WebSocket.OPEN) return;
+  private send(body: Record<string, unknown>): void {
+    const ws = this.ws;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
     ws.send(JSON.stringify(body));
   }
 
-  /**
-   * 把 WAV 字节写入专属临时目录。
-   * @param wav WAV 字节
-   * @returns WAV 文件绝对路径
-   */
-  private writeTemp(wav: Buffer): string {
-    const dir = mkdtempSync(join(tmpdir(), "oc-tts-"));
-    this.tmpDir = dir;
-    const file = join(dir, "speech.wav");
-    writeFileSync(file, wav);
-    return file;
-  }
-
-  /**
-   * 用 PowerShell `System.Media.SoundPlayer` 后台播放（可被 stop 打断）。
-   * @param file WAV 文件路径
-   */
-  private play(file: string): void {
-    this.spawnPlayer(0, file);
-  }
-
-  /**
-   * 按候选顺序启动播放进程；`ENOENT` 时回退下一个候选。
-   * @param index 当前候选下标
-   * @param file WAV 文件路径
-   */
-  private spawnPlayer(index: number, file: string): void {
-    const bin = PLAYER_BIN_CANDIDATES[index];
-    if (bin === undefined) {
-      this.log.error("未找到可用 PowerShell（powershell / pwsh），无法播放 CosyVoice 音频");
-      this.cleanupTemp();
-      return;
-    }
-    let child: ChildProcess;
+  /** 关闭连接。 */
+  private close(): void {
+    const ws = this.ws;
+    this.ws = null;
+    if (!ws) return;
     try {
-      child = spawn(bin, PLAYER_ARGS, {
-        env: { ...process.env, [ENV_WAV_PATH]: file },
-        stdio: ["ignore", "ignore", "pipe"],
-        windowsHide: true,
-      });
-    } catch (err) {
-      this.log.error(`启动 ${bin} 失败`, err as Error);
-      this.cleanupTemp();
-      return;
+      if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) ws.close();
+    } catch {
+      // 关闭阶段异常忽略
     }
-    this.player = child;
-    let stderr = "";
-    child.stderr?.on("data", (chunk: Buffer) => {
-      const line = String(chunk).trim();
-      if (line.length === 0) return;
-      stderr = `${stderr}${line}\n`;
-      this.log.warn(`aliyun tts stderr: ${line}`);
-    });
-    child.on("error", (err: NodeJS.ErrnoException) => {
-      if (this.player === child) this.player = null;
-      if (err.code === "ENOENT" && index + 1 < PLAYER_BIN_CANDIDATES.length) {
-        this.spawnPlayer(index + 1, file);
-        return;
-      }
-      this.log.error(`CosyVoice 播放进程异常（${bin}）`, err);
-      this.cleanupTemp();
-    });
-    child.on("exit", (code: number | null) => {
-      if (this.player === child) this.player = null;
-      // 非 0 退出码说明播放入口失败（此前会被静默忽略）；记日志以便排查
-      if (code !== null && code !== 0) {
-        this.log.error(`CosyVoice 播放进程（${bin}）退出码=${code}`, stderr.trim() || undefined);
-      }
-      this.cleanupTemp();
-    });
   }
 
-  /** 删除当前临时目录（幂等）。 */
-  private cleanupTemp(): void {
-    const dir = this.tmpDir;
-    this.tmpDir = null;
-    if (!dir) return;
-    try {
-      rmSync(dir, { recursive: true, force: true });
-    } catch (err) {
-      this.log.warn("清理 CosyVoice 临时目录失败", err as Error);
+  /** 清除超时定时器。 */
+  private clearTimer(): void {
+    if (this.timer) {
+      clearTimeout(this.timer);
+      this.timer = null;
     }
+  }
+
+  /** 脱敏任意异常。 */
+  private redactError(err: unknown): Error {
+    const message = err instanceof Error ? err.message : String(err);
+    return new Error(redact(message, this.credentials.apiKey));
+  }
+}
+
+/** 阿里云 CosyVoice TTS provider（流式；单实例，新 speak 打断旧朗读）。 */
+export class AliyunProvider implements TtsProvider {
+  readonly name = ALIYUN_PROVIDER_NAME;
+  private readonly log: Logger = createLogger("tts-aliyun");
+  private session: CosyVoiceSession | null = null;
+  private sink: AudioSink | null = null;
+  private params: CosyVoiceParams | null = null;
+  private credentials: Credentials | null = null;
+  private activeToken = "";
+  /** 本次朗读的流式最小缓冲阈值（首次 `continue-task` 前需缓冲的字符数）。 */
+  private streamMinChars = DEFAULT_STREAM_MIN_CHARS;
+
+  /**
+   * 后台流式合成并播放：立即返回（不等待播放完成）；内部先打断上一次。
+   * @param options 解析后的朗读参数（含凭证配置）
+   * @returns 本次朗读的启动结果（含 `taskId` 与 `done`）
+   * @throws Error 无可用播放路径 / 文本为空 / 凭证缺失 / 文本过长
+   */
+  speak(options: ResolvedTtsOptions): SpeakResult {
+    if (options.text.trim().length === 0) {
+      throw new Error("text 不能为空");
+    }
+    const resolved = resolveCosyVoiceParams(options);
+    const params: CosyVoiceParams = { ...resolved, format: STREAM_FORMAT };
+    // 据实校验：v2 等不支持 instruction 的模型，忽略风格指令（记一条日志，不报错）
+    if (params.instruction && !supportsInstruction(params.model)) {
+      this.log.info(`模型 ${params.model} 不支持 instruction，已忽略风格指令`);
+      params.instruction = "";
+    }
+    if (resolved.format !== STREAM_FORMAT && resolved.format !== "wav") {
+      this.log.info(`流式合成固定使用 ${STREAM_FORMAT}，已忽略 format=${resolved.format}`);
+    }
+    const credentials = resolveCredentials({
+      config: options.credentials as CredentialFileConfig | undefined,
+      section: "tts",
+      providerLabel: "阿里云 TTS",
+    });
+    // 播放路径在发起时**同步**选定：无任何可用路径立刻抛清晰错误（不静默）
+    const strategy = selectAudioStrategy({ sampleRate: params.sampleRate });
+    this.stop();
+    const token = randomBytes(8).toString("hex");
+    this.activeToken = token;
+    this.params = params;
+    this.credentials = credentials;
+    this.streamMinChars = normalizeStreamMinChars(options.streamMinChars);
+    const sink = createAudioSink(strategy, params.sampleRate, this.log);
+    this.sink = sink;
+    const done = this.run(options.text, token).catch((err: unknown) => {
+      this.log.error("CosyVoice 合成/播放失败", err instanceof Error ? err : String(err));
+    });
+    return { provider: this.name, voice: params.voice, rate: params.rate, taskId: randomUUID(), done };
+  }
+
+  /** 打断：取消会话（`directive=cancel`）、关闭连接、中断播放（幂等）。 */
+  stop(): void {
+    this.activeToken = "";
+    const session = this.session;
+    this.session = null;
+    if (session) session.cancel();
+    const sink = this.sink;
+    this.sink = null;
+    if (sink) sink.abort();
+    this.params = null;
+    this.credentials = null;
+  }
+
+  /**
+   * 完整流程（按播放策略分派）：连接 → 送文 → finish → 等待 `task-finished` → 等播放结束。
+   * @param text 正文
+   * @param token 本次调用令牌（被打断则中止）
+   */
+  private async run(text: string, token: string): Promise<void> {
+    const sink = this.sink;
+    const params = this.params;
+    const credentials = this.credentials;
+    if (!sink || !params || !credentials) return;
+    try {
+      if (sink.kind === "stream") {
+        await this.runStream(text, token, params, credentials, sink);
+      } else {
+        await this.runSegmented(text, token, params, credentials, sink);
+      }
+    } catch (err) {
+      sink.abort();
+      throw err;
+    }
+  }
+
+  /**
+   * **流式路径**（有 stdin 播放器）：单会话、**纯流式送文**（不做句切分），音频帧到达即写 sink
+   * （零落盘、低首包延迟）。
+   *
+   * 送文口径（`createStreamChunker`）：首次发送前缓冲到 ≥ {@link streamMinChars}，之后随到随发；
+   * 仅单条超 `MAX_CONTINUE_CHARS` / 累计超 `MAX_TOTAL_CHARS` 才硬切（正常不会触发）。
+   * 注：本路径的正文由**调用方一次性给出**（CLI `speak`）；真正的「边生成边送」在 `auto-read.ts`
+   * ——它为每个增量各起一次 CLI，阈值在彼处生效；此处用同一分块器保证口径一致。
+   * @param text 正文
+   * @param token 令牌
+   * @param params 合成参数
+   * @param credentials 凭证
+   * @param sink 流式 sink
+   */
+  private async runStream(
+    text: string,
+    token: string,
+    params: CosyVoiceParams,
+    credentials: Credentials,
+    sink: AudioSink,
+  ): Promise<void> {
+    if (text.length > MAX_TOTAL_CHARS) {
+      throw new Error(`文本过长（${text.length} 字 > 上限 ${MAX_TOTAL_CHARS} 字）`);
+    }
+    const session = this.newSession(params, credentials, sink);
+    this.session = session;
+    await session.start();
+    if (this.activeToken !== token) return;
+    const chunker = createStreamChunker({ minChars: this.streamMinChars, maxChars: MAX_CONTINUE_CHARS });
+    const chunks = [...chunker.push(text), ...chunker.flush()];
+    for (const chunk of chunks) {
+      if (this.activeToken !== token) return;
+      session.pushText(chunk);
+    }
+    session.finish();
+    await session.done();
+    if (this.activeToken !== token) return;
+    await sink.end();
+  }
+
+  /**
+   * **分段路径**（无 stdin 播放器）：**一句一会话**——每句合成完毕（`task-finished`）即
+   * `sink.boundary()` 落成一段，**段边界 = 句边界**（减少段间间隙）；上一段播放期间可继续合成下一句。
+   * @param text 正文
+   * @param token 令牌
+   * @param params 合成参数
+   * @param credentials 凭证
+   * @param sink 分段 sink
+   */
+  private async runSegmented(
+    text: string,
+    token: string,
+    params: CosyVoiceParams,
+    credentials: Credentials,
+    sink: AudioSink,
+  ): Promise<void> {
+    const { sentences, tail } = splitSentences(text);
+    const pieces = tail.length > 0 ? [...sentences, tail] : sentences;
+    for (const piece of pieces) {
+      if (this.activeToken !== token) return;
+      const session = this.newSession(params, credentials, sink);
+      this.session = session;
+      await session.start();
+      if (this.activeToken !== token) return;
+      session.pushText(piece);
+      session.finish();
+      await session.done();
+      if (this.activeToken !== token) return;
+      sink.boundary();
+    }
+    if (this.activeToken !== token) return;
+    await sink.end();
+  }
+
+  /**
+   * 新建一次 CosyVoice 会话（音频帧写入给定 sink）。
+   * @param params 合成参数
+   * @param credentials 凭证
+   * @param sink 音频落地
+   * @returns 会话实例
+   */
+  private newSession(params: CosyVoiceParams, credentials: Credentials, sink: AudioSink): CosyVoiceSession {
+    return new CosyVoiceSession(
+      randomUUID(),
+      params,
+      credentials,
+      { onAudio: (chunk: Buffer) => sink.write(chunk) },
+      this.log,
+    );
   }
 }

@@ -4,5 +4,6 @@ dist/
 .io/
 *.log
 
-# 本地加载用的产物拷贝（由 dist/ 生成，不入库）
+# 本地加载用的产物拷贝（由 dist/ 生成，不入库）与 TUI 插件配置（publish:proj 会重建，不入库）
 .opencode/plugin/
+.opencode/tui.json

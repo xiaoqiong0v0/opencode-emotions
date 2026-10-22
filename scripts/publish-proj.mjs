@@ -6,7 +6,7 @@
  * 约定（与 `dist/` 结构一一对应）：
  * - `.opencode/plugin/` **顶层只允许真插件入口**（`emotions.js` / `tui.js`）；
  *   opencode 会把该目录顶层的每个 `.js` 当插件自动 import，故 CLI / 运行时等非插件产物一律进子目录。
- *   `emotions.js` 是**唯一 server 入口**（情绪命令 + `voice_cli` 工具），另有 `tui.js`（TUI 插件）。
+ *   `emotions.js` 是**唯一 server 入口**（情绪命令 + `emotions_cli` 工具），另有 `tui.js`（TUI 插件）。
  * - 子目录（`cli/` `runtime/` `lib/` `voice/`）不被自动扫描，可安全承载依赖。
  *
  * 行为：
@@ -39,7 +39,7 @@ const ALLOWED_DIRS = ["cli", "runtime", "lib", "voice"];
 /** TUI 插件入口（相对 `tui.json` 所在的 `.opencode/` 目录）。 */
 const TUI_ENTRY_SPEC = "./plugin/tui.js";
 /** 必须存在的子目录产物（结构回归哨兵）。 */
-const REQUIRED_SUBDIR_FILES = [join("cli", "voice-cli.js"), join("runtime", "voice-runtime.js")];
+const REQUIRED_SUBDIR_FILES = [join("cli", "emotions-cli.js"), join("runtime", "voice-runtime.js")];
 
 /**
  * 校验某目录顶层结构：顶层文件必须是白名单插件入口，顶层目录必须来自白名单。

@@ -7,6 +7,7 @@
  * 事件类型（`type` 判别）：
  * - `ready`：运行时已连上 ASR（附带模型名）；
  * - `final`：一句最终识别结果（注入/追加的数据源）；
+ * - `level`：麦克风电平（采集期间的节流上行，`level ∈ [0,1]`，供槽位盲文音量列渲染）；
  * - `error`：运行时错误（已脱敏）；
  * - `done` ：运行时结束（正常或异常）。
  */
@@ -25,6 +26,7 @@ export interface RuntimeFinal {
 export type RuntimeEvent =
   | { type: "ready"; model: string }
   | { type: "final"; text: string; emotion: string; annotation: string }
+  | { type: "level"; level: number }
   | { type: "error"; message: string }
   | { type: "done" };
 
@@ -74,6 +76,11 @@ export function parseEventLine(line: string): RuntimeEvent | null {
         emotion: asString(data.emotion) ?? "",
         annotation: asString(data.annotation) ?? "",
       };
+    }
+    case "level": {
+      // 电平事件：level 必须是**有限数值**；非数值 / NaN / Infinity ⇒ 丢弃整条事件（返回 null，绝不抛）
+      if (typeof data.level !== "number" || !Number.isFinite(data.level)) return null;
+      return { type: "level", level: data.level };
     }
     case "error":
       return { type: "error", message: asString(data.message) ?? "未知错误" };

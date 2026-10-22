@@ -49,7 +49,7 @@ TUI 插件（语音输入 UI + 热键）——`tui.json`：
 
 ## 依赖体积（含 `ffmpeg-static`）
 
-- **`ffmpeg-static`（写在 `dependencies`）**：npm 安装时会**下载**一个预编译 ffmpeg 二进制到 `node_modules/ffmpeg-static`（Windows `ffmpeg.exe` 实测 **≈ 79 MB**），用于语音采集与云 TTS 转码。代价是首次安装的网络流量与磁盘占用；可用环境变量 `FFMPEG_BIN` 指向系统自带 ffmpeg 以绕开随附二进制。
+- **`ffmpeg-static`（写在 `dependencies`）**：npm 安装时会**下载**一个预编译 ffmpeg 二进制到 `node_modules/ffmpeg-static`（Windows `ffmpeg.exe` 实测 **≈ 79 MB**），用于语音采集（及 Termux 分块录音转码）。云 TTS 走**流式 raw PCM**，不再用它转码。代价是首次安装的网络流量与磁盘占用；可用环境变量 `FFMPEG_BIN` 指向系统自带 ffmpeg 以绕开随附二进制。
 - `ffmpeg-static` 自身按 **GPL-3.0-or-later** 分发（与本包 MIT 许可相互独立）。
 - `ws`：ASR/TTS 的 WebSocket 客户端（体积小）。
 
@@ -59,17 +59,17 @@ TUI 插件（语音输入 UI + 热键）——`tui.json`：
 
 消息以 `/` 触发命令，命令输出即为标注（可接你写的正文）：
 
-| 命令 | 别名 | 标注 |
-|---|---|---|
-| `/annoyed` | `/meh` | 😠(1/3) |
-| `/angry` | `/mad` | 😡(2/3) |
-| `/furious` | `/rage` | 🤬(3/3) |
-| `/confused` | `/puzzled` | 🤔(2/3) |
-| `/speechless` | `/sigh` | 😑(2/3) |
-| `/neutral` | `/calm` | 😐 |
-| `/ok` | `/fine` `/okay` | 🙂(1/3) |
-| `/happy` | `/good` `/nice` | 😊(2/3) |
-| `/great` | `/awesome` | 🤩(3/3) |
+| 命令 | 标注 |
+|---|---|
+| `/annoyed` | 😠(1/3) |
+| `/angry` | 😡(2/3) |
+| `/furious` | 🤬(3/3) |
+| `/confused` | 🤔(2/3) |
+| `/speechless` | 😑(2/3) |
+| `/neutral` | 😐 |
+| `/ok` | 🙂(1/3) |
+| `/happy` | 😊(2/3) |
+| `/great` | 🤩(3/3) |
 
 例：`/angry 需求又改了` → `😡(2/3) 需求又改了`；无参数时只产生标注本身（`/great` → `🤩(3/3)`）。
 
@@ -77,41 +77,46 @@ TUI 插件（语音输入 UI + 热键）——`tui.json`：
 
 ## 语音输入（TUI 插件）
 
-TUI 插件在会话输入框右侧渲染一个状态指示（`🎙 ● 注入 F8/F9`），并用两个**点按**热键控制连续语音输入：
+TUI 插件在会话输入框右侧渲染一个状态指示（`🎙 [meter] ↧F8/⤉F9 🔊 F10`，总宽恒 **18** 列、中英一致不抖）——`🎙 ` 段**永远静态**（恒 3 列、中性 `accent`，只做「这里是语音功能」的标记；2026-10-22 第十三批起**不再做任何 emoji 帧轮播/变色动画**，因为 emoji 的字形与进格宽度由终端/字体决定，换字形会跳位、不居中），其右侧是**恒定 1 列的盲文音量列**承载全部语音状态动画（盲文 U+2800–U+28FF 各终端同宽、可着色）：**关**=空白、**连接中**（F8/F9 已开但 ASR 还没连上）=spinner 转动（「还在连、别急着说」）、**在听**=纵向电平条 6 档（`⠁⠃⠇⠏⠟⠿`，由**真实麦克风电平**驱动 ⇒ **有音频输入才动**）；`↧`=输入/`F8`、`⤉`=注入/`F9`，**图标紧贴键位成组**，**没有模式文字**（2026-10-21 用户指令：先删「注入/输入」文字段、同日删 ●/○ 状态圆圈段、同日又恢复 `🎙` 并把与 `F8` 重叠的 `⇥` 换成 `↧`）——当前模式由**哪一组「图标+键位」整组高亮**表达；末端 `🔊 F10` 段颜色表达自动朗读状态：**亮=开、灰=关**），并用**点按**热键控制语音输入与自动朗读：
 
 | 热键 | 模式 | 行为 |
 |---|---|---|
-| `F8` | 注入 | 识别结果作为**新消息**发进当前会话（带 `🎙` 标记 + 情绪标注） |
-| `F9` | 输入 | 识别结果**追加进输入框**，由你编辑后发送 |
+| `F8` | 输入 | 识别结果**追加进输入框**，由你编辑后发送 |
+| `F9` | 注入 | 识别结果作为**新消息**发进当前会话（带 `🎙` 标记 + 情绪标注） |
+| `F10` | 自动朗读（**双态**） | **正在播放**（本会话或无主）时按键 = **只中断播放、开关不动**（toast「已中断播放（朗读开关状态未变）」，不写状态文件、指示灯原样）；**无播放**时才开/关**当前会话**的助手回复**自动朗读**（分会话开关，模型不可切换，独占此热键），关闭同时**立即停止**正在朗读的那段，开启只影响后续回复、不补读历史；**子会话（subagent）不支持**——按 F10 时 toast 提示且不写状态；状态在槽位**末端 `🔊 F10` 段**以颜色指示（亮=开、灰=关，响应式跟随当前会话，仅状态、非模式） |
 
-两模式互斥；都关闭时停止后台语音运行时。ASR 依赖 DashScope 凭证与 ffmpeg，识别出的情绪映射为同一 `emoji(等级/3)` 标注。TUI 槽位/热键的 API **官方未公开**、跨版本可能变（详见 `docs/设计-语音输入注入.md`）。
+`F8`/`F9` 两模式互斥，都关闭时停止后台语音运行时；`F10` 独立控制自动朗读（只写共享状态文件 + 停止播放，不影响语音运行时；槽位末端 `🔊 F10` 段只做状态显示，文本恒定、不影响宽度恒定契约）。ASR 依赖 DashScope 凭证与 ffmpeg，识别出的情绪映射为同一 `emoji(等级/3)` 标注。TUI 槽位/热键的 API **官方未公开**、跨版本可能变（详见 `docs/设计-语音输入注入.md`）。
 
-## 语音输出（`voice_cli` 工具 / `voice-cli` 命令）
+## 语音输出（`emotions_cli` 工具 / `emotions-cli` 命令）
 
-由**唯一的 server 插件入口** `emotions`（`dist/emotions.js`）通过 `tool` 钩子提供 **CLI 风格**工具 `voice_cli`（工具定义在 `src/voice/tool.ts`）：模型在用户要求「说出来 / 念出来 / 朗读 / 用语音回答」时主动调用，把文字合成语音并对用户播放。
-工具只接受一个参数 `args`（完整 CLI 参数串），内部执行 `node dist/cli/voice-cli.js <args>`（PATH 上找不到 `node` 时回退 `process.execPath`）。
+由**唯一的 server 插件入口** `emotions`（`dist/emotions.js`）通过 `tool` 钩子提供 **CLI 风格**工具 `emotions_cli`（工具定义在 `src/voice/tool.ts`）：模型在用户要求「说出来 / 念出来 / 朗读 / 用语音回答」时主动调用，把文字合成语音并对用户播放。工具名与 CLI 均对齐包名 `opencode-emotions`，避免与其它插件重名。
+工具只接受一个参数 `args`（完整 CLI 参数串），内部执行 `node dist/cli/emotions-cli.js <args>`（PATH 上找不到 `node` 时回退 `process.execPath`）。
 
-> 为什么由 server 插件提供：`@opencode-ai/plugin/tui` 的 `TuiPluginModule` 声明 `server?: never`，TUI 插件无法注册工具；工具只能由 `{ id, server }` 的 server 插件提供。现与情绪命令**合并进同一个 server 入口**——一个 npm 包只解析一个 server 入口（`exports["./server"]` / `main`），合并后 npm 安装时命令与 `voice_cli` **都生效**。
+> 为什么由 server 插件提供：`@opencode-ai/plugin/tui` 的 `TuiPluginModule` 声明 `server?: never`，TUI 插件无法注册工具；工具只能由 `{ id, server }` 的 server 插件提供。现与情绪命令**合并进同一个 server 入口**——一个 npm 包只解析一个 server 入口（`exports["./server"]` / `main`），合并后 npm 安装时命令与 `emotions_cli` **都生效**。
 
-**`voice_cli` 工具契约**（`args` 为命令串）：
+**`emotions_cli` 工具契约**（`args` 为命令串）：
 
 | 子命令 | 说明 |
 |---|---|
-| `speak --text <t> [--emotion <e>] [--voice <v>] [--rate <n>] [--provider <p>]` | 合成并播放（工具会自动补 `--background`，立即返回、后台播放） |
+| `speak --text <t> [--emotion <e>] [--voice <v>] [--rate <n>] [--provider <p>]` | 合成并播放（工具会自动补 `--background`，立即返回、后台播放）；也可 `--text-file <path>` 从文件读正文 |
 | `devices` | 列出音频输入设备 |
 | `status` | 查看解析后的配置（含 `uiLanguage`/`toolLanguage`） |
 | `help`（或省略 `args`） | 显示用法 |
 
+> **自动朗读开关不在此**：它由 TUI 的 `F10` 热键独占切换，模型不能经此工具/CLI 开关（无旁路）。
+> **F10 开启时 `speak` 被拦截（2026-10-22）**：该会话自动朗读开着时，工具调用 `speak`（含 `--follow`/`--background`）
+> **不会播放**——server 读同一份每会话状态文件后直接返回「当前已开启自动朗读，已跳过语音播放」，防与自动朗读叠播；`help`/`devices`/`status` 不受影响。
+
 例：`speak --text "你好" --emotion happy`、`devices`、`status`、`help`。
 
-**直接用 CLI**（`npm run build` 后；也可 `npm run voice-cli -- <args>`）：
+**直接用 CLI**（`npm run build` 后；也可 `npm run emotions-cli -- <args>`）：
 
 ```bash
-node dist/cli/voice-cli.js help
-node dist/cli/voice-cli.js status
-node dist/cli/voice-cli.js devices
-node dist/cli/voice-cli.js speak --text "你好" --emotion happy              # 前台播放（等到播完）
-node dist/cli/voice-cli.js speak --text "你好" --emotion happy --background # 后台播放，立即返回
+node dist/cli/emotions-cli.js help
+node dist/cli/emotions-cli.js status
+node dist/cli/emotions-cli.js devices
+node dist/cli/emotions-cli.js speak --text "你好" --emotion happy              # 前台播放（等到播完）
+node dist/cli/emotions-cli.js speak --text "你好" --emotion happy --background # 后台播放，立即返回
 ```
 
 **情绪（`--emotion`）**：映射为 CosyVoice 的 `instruction`（`sapi` 忽略）。取值/别名与指令对照见 `docs/设计-语音输入注入.md` §13.1；`neutral` 或省略 = 不加风格指令。
@@ -120,24 +125,59 @@ node dist/cli/voice-cli.js speak --text "你好" --emotion happy --background # 
 
 | `dist/` 顶层 | 说明 | 镜像后 |
 |---|---|---|
-| `emotions.js` | **唯一 server 插件入口**（情绪命令 + `voice_cli` 工具） | `.opencode/plugin/emotions.js` |
+| `emotions.js` | **唯一 server 插件入口**（情绪命令 + `emotions_cli` 工具 + 自动朗读事件钩子） | `.opencode/plugin/emotions.js` |
 | `tui.js` | TUI 插件入口（由 `src/tui.tsx` 编译） | `.opencode/plugin/tui.js` |
-| `cli/voice-cli.js` | CLI（非插件） | `.opencode/plugin/cli/` |
+| `cli/emotions-cli.js` | CLI（非插件） | `.opencode/plugin/cli/` |
 | `runtime/voice-runtime.js` | 语音运行时（非插件） | `.opencode/plugin/runtime/` |
 | `lib/**`、`voice/**` | 依赖 | 对应子目录 |
 
-> **顶层只放真插件**：opencode 会把 `.opencode/plugin/` 顶层的**每个 `.js`** 当插件自动 import；CLI、语音运行时等非插件产物一律进子目录（`cli/`、`runtime/`），子目录不被扫描。`publish:proj` **断言顶层只有插件入口**——出现 `voice-cli.js` / `voice-runtime.js` 之类会立即报错退出（防回归）。
+> **顶层只放真插件**：opencode 会把 `.opencode/plugin/` 顶层的**每个 `.js`** 当插件自动 import；CLI、语音运行时等非插件产物一律进子目录（`cli/`、`runtime/`），子目录不被扫描。`publish:proj` **断言顶层只有插件入口**——出现 `emotions-cli.js` / `voice-runtime.js` 之类会立即报错退出（防回归）。
 > `tui.js` 由**宿主同款 Babel 链**（`babel-preset-solid` + `@babel/preset-typescript`，见 `scripts/build-tui.mjs`）编译：Solid 编译会把 JSX 包成 `createElement` / `insert` / `setProp` + `effect` 的**响应式**结构，而 `tsc` 的 `jsx()` 产物不会包裹 props/children（会失去响应式），故 `.tsx` **不进主 `tsc`**。产物保留裸 `@opentui/solid` / `solid-js` import，由宿主加载时重写为运行时模块 id。
-> 语音运行时由 TUI 插件从 `<cwd>/dist/runtime/voice-runtime.js` 启动（可用 `VOICE_RUNTIME_SCRIPT` 覆盖）。
-> CLI 路径解析：`VOICE_CLI_SCRIPT`（存在则用）> `<cwd>/dist/cli/voice-cli.js` > 工具模块同级（`dist/voice/` 或镜像后 `.opencode/plugin/voice/`）的 `../cli/voice-cli.js`。
+> 语音运行时脚本路径解析：`VOICE_RUNTIME_SCRIPT`（显式覆盖，优先）> **插件产物自身位置**同级 `runtime/voice-runtime.js`（`dist/` 与镜像后 `.opencode/plugin/` 同构，由 `import.meta.url` 推出）> `<cwd>/dist/runtime/voice-runtime.js`（兜底）。**不再以 cwd 为主口径**——opencode 的 cwd 是用户启动目录（家目录启动即拼出不存在的路径，runtime 秒退 code=1）；解析结果不存在时直接报错并带上完整绝对路径与全部候选。
+> CLI 路径解析：`EMOTIONS_CLI_SCRIPT`（存在则用；旧名 `VOICE_CLI_SCRIPT` 兼容）> `<cwd>/dist/cli/emotions-cli.js` > 工具模块同级（`dist/voice/` 或镜像后 `.opencode/plugin/voice/`）的 `../cli/emotions-cli.js`。
 
-**情绪与配置**：`tts.*` 见下方「语音配置」；也可用环境变量覆盖（`TTS_PROVIDER` / `TTS_VOICE` / `TTS_RATE` / `TTS_INSTRUCTION` / `TTS_PITCH` / `TTS_VOLUME` / `TTS_FORMAT` / `TTS_SAMPLE_RATE` / `TTS_MODEL`）。
+**情绪与配置**：`tts.*` 见下方「语音配置」；也可用环境变量覆盖（`TTS_PROVIDER` / `TTS_VOICE` / `TTS_RATE` / `TTS_INSTRUCTION` / `TTS_PITCH` / `TTS_VOLUME` / `TTS_FORMAT` / `TTS_SAMPLE_RATE` / `TTS_MODEL` / `TTS_STREAM_MIN_CHARS` / `TTS_PLAYER` / `MIMO_API_KEY`）。
 
 **provider**：
-- `sapi`（默认）：本机 Windows SAPI，仅支持 `voice` / `rate` / `volume`；`instruction` / `pitch` / `format` / `sampleRate` / `model` 会被**忽略并记一条日志**。
-- `aliyun`：阿里云百炼 **CosyVoice**（WebSocket `run-task`），支持 `voice` / `rate` / `pitch` / `volume` / `format` / `sampleRate` / `instruction`（风格/情感/方言）等；默认模型 `cosyvoice-v2`、默认音色 `longxiaochun_v2`（**模型与音色版本须一致**：v2 模型配 v2 音色、v3 配 v3，混用报 `418`）。**凭证复用 `asr.credentials`**（同一 DashScope 账号），播放仅 Windows。
+- `sapi`（默认）：本机 Windows SAPI，仅支持 `voice` / `rate` / `volume`；`instruction` / `pitch` / `format` / `sampleRate` / `model` 会被**忽略并记一条日志**。**仅 Windows**（非 Windows 会明确报错，不会静默无声）。
+- `aliyun`：阿里云百炼 **CosyVoice**（WebSocket `run-task`），支持 `voice` / `rate` / `pitch` / `volume` / `format` / `sampleRate` / `instruction`（风格/情感/方言）等；默认模型 `cosyvoice-v2`、默认音色 `longxiaochun_v2`（**模型与音色版本须一致**：v2 模型配 v2 音色、v3 配 v3，混用报 `418`）。**凭证用 `tts.credentials`**（与 `asr.credentials` 各自独立、可只配其一；同一 DashScope 账号时两侧填同样的值即可）。**合成跨平台，播放走跨平台播放器抽象**（见下）。
+  - **流式（低首包延迟）**：不再「整段合成→落盘→播」，而是**纯流式送文**——正文**增量**送入多条 `continue-task`（**不做句切分**，交由 CosyVoice 服务端分句），**音频帧到达即播**（raw PCM 写播放器 stdin）。**首次送文前先缓冲到 ≥ `tts.streamMinChars` 字**（默认 5，防开头卡顿），达标后**随到随发**；仅单条超 2 万 / 累计超 20 万（服务端约束）才硬切（正常不触发）。流式路径固定 `format=pcm`（`tts.format` 的非 pcm/wav 值会被忽略并记日志），采样率取 `tts.sampleRate`。
+  - **`instruction` 版本限制（据实校验）**：风格/情感/方言指令**仅 `cosyvoice-v3`/`v3.5` 与 `qwen-audio-3.x` 支持**；默认的 `cosyvoice-v2` **不支持**，配置了也会被忽略并记一条日志（不报错）。
+  - **取消**：`finish-task` 且 `payload.input.directive="cancel"` → 立即停并丢弃后续音频；同连接可复用。
+- `mimo`：小米 **MiMo TTS**（OpenAI 兼容 `POST /v1/chat/completions`，SSE 流式；模型默认 `mimo-v2.5-tts`、音色默认 `冰糖`，预置音色含 `mimo_default`/冰糖/茉莉/苏打/白桦/Mia/Chloe/Milo/Dean）。**单请求、全量文本**：`role:"assistant"` 放目标文本、`role:"user"` 放风格指令（`--emotion`/`tts.instruction` 映射的中文指令；`rate` 非 0 时并入「请用稍快/稍慢的语速说」），`audio.format` 固定 `pcm16`、**流式输出 PCM16LE 24kHz 单声道**，音频帧到达即写 AudioSink（与 aliyun 同一播放抽象）。`pitch`/`volume`/`format`/`sampleRate` 被忽略并记日志。**凭证用 `tts.mimoCredentials.apiKey`**（或环境变量 `MIMO_API_KEY`；与 aliyun 的 `tts.credentials` 相互独立、无需 workspace）。合成跨平台；**当前限时免费**。
+
+**音频落地（合成的音频如何放出声）**：`aliyun` 流式音频帧到达后交给 **AudioSink**（`src/voice/tts/audio-sink.ts`），按可用性择一：
+
+1. **流式（首选，零落盘）**：`src/voice/tts/stream-player.ts` 里能吃 **stdin 裸 PCM** 的播放器——**Windows 内置 waveOut 播放器**（`pwsh`+`Add-Type` 内联 C# 调 winmm `waveOutOpen`/`Write`/`Reset`/`Close`，自实现**小缓冲有界队列**（≈40ms/块 × 最多 4 块 ≈ **160ms 预读上限**）**连续无间隙**、零外部依赖、不再依赖 ffplay；CLI 被杀后 stdin EOF 只把已排队的 ≈160ms 播完即静音退出，消长尾音）→ 其次 `ffplay`；Linux `aplay -f S16_LE -r <sr> -c1 -t raw -` → `paplay --raw …`；Termux / macOS `play`(sox) → `ffplay`。音频帧**到达即写入其 stdin**。
+2. **分段回退**：找不到流式播放器时，用按平台择一的**文件播放器**（下表）——**段边界 = 句边界**：每句音频收完后落成一段（补 44 字节 WAV 头写临时文件后**顺序播放**；上一段播放期间继续合成下一句，减少间隙）。
+
+| 平台 | 文件播放器候选（分段回退用，取第一个可用） | 探测方式 |
+|---|---|---|
+| Windows | PowerShell `SoundPlayer`（`pwsh` 优先，回退 `powershell`） | PATH 上找 `pwsh`/`powershell` |
+| macOS | `afplay` | PATH 探测 |
+| Termux | `play-audio`（绝对路径 `$PREFIX/bin/play-audio`，默认前缀 `/data/data/com.termux/files/usr`），带 `-s <stream>` | `TERMUX_VERSION` 非空 或 `PREFIX` 含 `com.termux` 或平台 `android`；按绝对路径判定可执行 |
+| Linux | `/usr/bin/paplay` → `/usr/bin/aplay` | 按绝对路径探测（存在且可执行） |
+
+可用环境变量 **`TTS_PLAYER`** 显式覆盖：填**流式** id（`waveout`/`winmm`/`aplay`/`paplay`/`sox`/`play`/`ffplay`）走流式；填文件型 id（如 `play-audio`/`soundplayer`/`afplay`）则强制走**分段回退**。音频流由 **`TTS_STREAM`** 控制（仅 Termux `play-audio` 用到：`media`/`alarm`/`notification`/`ring`/`system`/`voice`，默认 `media`）。**流式与分段都不可用时**会报清晰错误（列出已尝试候选与可安装的包，Termux 缺失时明确提示 `pkg install play-audio`），**不会静默无声**。
+
+**打断（barge-in，立即静音）**：**用户一发送消息**（server 插件 `chat.message`）**或按 `F8`/`F9` 语音输入**（TUI 插件）时，立刻停止正在播放的 TTS。机制：播放进程（CLI `speak` / 分离的 `__play`）启动时把 `{ pid, provider, taskId, startedAt }` **原子写**到 `~/.opencode/plugins-cache/opencode-emotions/tts-playback`；打断方读该文件后**只按记录的 PID** 终止——先 `SIGTERM`，有界超时（1.5s）后仍存活再 `SIGKILL`；进程退出/播完自动清理。**只允许按 PID 终止本插件自己派生的进程**（`pid>1`、非自身、未超 30 分钟 TTL），**严禁按进程名/模式杀**；找不到/已退出静默降级。被 `SIGTERM` 的播放进程会向云 TTS 发 `directive=cancel` 再退出。
 
 **音色**：SAPI 优先用 `pwsh`（PowerShell 7）——它能选择全部 OneCore 音色（`Microsoft Huihui` / `Microsoft Kangkang` / `Microsoft Yaoyao`）；仅有 Windows PowerShell 5.1 时只认 Desktop 音色（如 `Microsoft Huihui Desktop`），选不到时回落到默认音色。连读会打断上一条（同一时刻只播一条）。
+
+## 自动朗读（F10）
+
+助手回复边生成边自动朗读（`type==="text"` 的可见正文，排除 reasoning）；开关**按会话独立**、由用户用热键控制。
+
+- **分会话开关（F10 双态，2026-10-22）**：由 TUI 的 **`F10` 热键**控制**当前会话**——**本会话（或无主）正在播放**时按键 = **只中断播放、开关不切**（`isInterruptablePlaybackActive` 判活 → `stopPlayback({ sessionID })` + toast，不写状态文件、指示灯原样）；**无播放**时才点按切换开/关（一个会话的开关**不影响**其它会话/窗口）。模型与 `emotions-cli` 均**不能**切换——CLI 已无 `auto_tts` 子命令、`emotions_cli` 工具也不含该能力，**无旁路**（F10 开着时模型 `speak` 还会被**拦截跳过**，见上节工具说明）。`F10` 关闭时**立即停止**正在朗读的那段（复用按 PID 的 `stopPlayback()`）；开启只影响后续回复，**不**补读历史。**键重复抑制**：按住 F10 被 OS 连发按键事件时，一次物理按压只切换一次（尾沿静默 700ms；否则一次按住会产生偶数次翻转、净效果=关，即「按了状态不变」根因）。
+- **子会话不自动朗读**：子会话（subagent 任务会话）**不支持**自动朗读——server 侧按 sessionID 单飞取 `Session.parentID` 判定并硬跳过（无论开关开没开都不读）；TUI 侧按 F10 时 toast 提示「子会话不自动朗读」且不写状态。
+- **重启不保留 → 每会话首见懒重置（2026-10-21 起）**：本 TUI 进程**首次见到某会话**时（指示灯求值 / F10 按下两触点）才删**该会话目录**（`auto-tts` + `auto-tts-seen`）——重启（新进程首见）= 自动朗读回到关；**后开窗口只重置它自己首见的会话，不会清掉其它窗口已激活的开关**（旧「init 清整个会话数据根」在多窗口场景会误删先开窗口的开关，已作废；`resetAutoTtsState()` 全量清保留但生产不再调用）。
+- **状态落盘（每会话一个文件夹，对齐 file-tool）**：`~/.opencode/plugins-cache/opencode-emotions/<sessionID>/auto-tts`，内容为极简单值 **`on` / `off`**（一目录一会话，缺文件=关）；去重在 `<sessionID>/auto-tts-seen`。**原子写**（临时文件 + rename），读写失败一律降级（读→关、写失败由 F10 toast 提示）。因写开关的 **TUI 进程**与消费开关的 **server 插件进程**是两个进程，开关必须落共享文件才能被插件读到。
+- **谁来读、何时触发**：由 **server 插件**（`dist/emotions.js`）的 `event` 钩子消费两类事件**边生成边送 TTS**（2026-10-20 修正：opencode 的文本流式增量走 **`message.part.delta`**，`message.part.updated` 仅 text-start/text-end 各一次）——**`message.part.delta`** 按 `partID` 增量追加（delta payload 无类型，靠 text-start 快照登记的 `partID→type` 过滤 `reasoning` 等）、**`message.part.updated`** 作全量快照校准；用**同一「阈值 + 增量」口径**（`tts.streamMinChars`，默认 5）：**缓冲到阈值才首次派生 CLI 朗读，此后每个增量各派生一次**（**不做句切分**，交给服务端分句）；同一消息的朗读**串行**播放（避免新增量打断旧的），**每次派生前再读一次该会话的开关**——`F10` 关闭后队列里待播的下一段不再派生（与「立即停播」共同保证关掉即停；delta 高频路径读开关走 300ms TTL 缓存）。只读 `type==="text"` 的 part（排除 `reasoning`/thinking、`synthetic`、`ignored`），并用 `message.updated` 建立 `messageID→role` 表**只读 assistant**（避免读到用户消息；**角色未知时惰性补取一次** `info.role`，被角色门挡过的 part 置 tainted、其 delta 全丢，由快照兜底无重复；摘要消息不读）。**子会话硬跳过**：按 sessionID 单飞取 `Session.parentID` 判定（缓存），是子会话则无论开关开没开都不读。消息**完成**时补读未达阈值的缓冲并置去重，并打**每消息一条**诊断汇总（`自动朗读汇总：… session=… path=stream|fallback|skip …`）；**未观察到 part 更新**的消息在完成时回退「整段读」（用 `client.session.message(...)` 取回 parts）。
+- **怎么读**：复用 CLI——派生 `node dist/cli/emotions-cli.js speak --text-file <临时文件>`（正文写临时文件、argv 数组传参，**不拼 shell 字符串**；派生 bin 默认 PATH 上的 `node`，env `VOICE_NODE_BIN` 可覆盖——**不用** `process.execPath`，server 插件进程里那是 `opencode.exe`）；子进程 stderr 接管，非零退出或有 stderr 时 `log.warn` 带片段（不再静默无声）；同一块增量的音频本身走上面的**流式**路径。同一条消息按 **消息 id 去重**（内存 + 持久化每会话 `<sessionID>/auto-tts-seen`，防插件重启/事件重放重复朗读）。
+- **打断**：用户发消息时（`chat.message`）清空待读队列并停掉当前播放；被打断后**后续增量继续/重开**。
+- **跨平台播放**：同上方「音频落地」表（受 `TTS_PLAYER` 控制）。
+- **Termux 限制**：见「已知限制」。
+
 
 ## 语音配置（`emotions.jsonc`）
 
@@ -147,37 +187,43 @@ node dist/cli/voice-cli.js speak --text "你好" --emotion happy --background # 
 **旧名兼容**：旧配置名 `voice.jsonc` 仍可用——若 `emotions.jsonc` 不存在而 `voice.jsonc` 存在，则把旧文件**原样复制**为 `emotions.jsonc`（**旧文件保留不删**，用户已改的值不动）。
 
 **优先级**：命令行参数 > 环境变量 > `emotions.jsonc` > 内置默认。
-**凭证优先级**：环境变量（`DASHSCOPE_API_KEY` / `DASHSCOPE_WORKSPACE_ID`）> 配置 `asr.credentials.apiKey`/`workspaceId` > 凭证文件 `asr.credentials.path` > 默认 `<cwd>/.tmp/aliyun`（凭证只读、绝不打印）。
+**凭证优先级（两侧各自独立、互不影响）**：`asr.credentials` 只供阿里系 ASR（含按段 `aliyun-qwen-file`）、`tts.credentials` 只供阿里云 TTS；每一侧的解析链均为 环境变量（`DASHSCOPE_API_KEY` / `DASHSCOPE_WORKSPACE_ID`）> 该侧 `credentials.apiKey`/`workspaceId` > 该侧 `credentials.path` 凭证文件 > 默认 `<cwd>/.tmp/aliyun`（凭证只读、绝不打印）。**可只配其一**：只想用 TTS 时配 `tts.credentials`（或留空靠环境变量）即可，无需再动 `asr.credentials`。**MiMo 也两侧各自独立**（无 workspace，各读各组、不跨兄弟组回退）：ASR `provider=mimo` 走环境变量 `MIMO_API_KEY` > `asr.mimoCredentials.apiKey`；TTS `provider=mimo` 走环境变量 `MIMO_API_KEY` > `tts.mimoCredentials.apiKey`。
 
 | 键 | 默认值 | 含义 | 环境变量 |
 |---|---|---|---|
 | `uiLanguage` | `en` | **TUI UI 文案**语言：`zh` / `en`。用于槽位指示、toast、命令标题（改后重启 opencode 生效）；缺省回退旧键 `language` | `VOICE_UI_LANGUAGE`（旧名 `VOICE_LANGUAGE` 兜底） |
-| `toolLanguage` | `en` | **工具文案**语言：`zh` / `en`。用于 `voice_cli` 工具描述（插件加载时本地化）与 `voice-cli --help`；缺省回退旧键 `language` | `VOICE_TOOL_LANGUAGE`（旧名 `VOICE_LANGUAGE` 兜底） |
+| `toolLanguage` | `en` | **工具文案**语言：`zh` / `en`。用于 `emotions_cli` 工具描述（插件加载时本地化）与 `emotions-cli --help`；缺省回退旧键 `language` | `VOICE_TOOL_LANGUAGE`（旧名 `VOICE_LANGUAGE` 兜底） |
 | `device` | `""` | 音频输入设备友好名；空 = 自动取第一个输入设备 | `VOICE_DEVICE` |
-| `asr.provider` | `aliyun-qwen` | ASR 预设：`aliyun-qwen`(16k,7类情绪,realtime) / `aliyun-8k`(8k,3类) / `aliyun-v2`(16k,无情绪) | `VOICE_ASR_PROVIDER` |
+| `asr.provider` | `aliyun-qwen` | ASR 预设，分两类传输——**stream**（WebSocket 实时）：`aliyun-qwen`(realtime,16k,7类情绪) / `aliyun-8k`(inference,8k,3类) / `aliyun-v2`(inference,16k,无情绪)；**segment**（整段音频→HTTP→文本，本地能量静音切段）：`aliyun-qwen-file`(qwen3-asr-flash 同步,16k,7类情绪) / `mimo`(mimo-v2.5-asr,16k,无情绪) | `VOICE_ASR_PROVIDER` |
 | `asr.model` | `""` | 模型名；空 = 按 provider 预设自动选择 | `VOICE_ASR_MODEL` |
-| `asr.language` | `""` | 识别语言；**空 = 自动识别（多语言）**。可选 `zh/yue/en/ja/ko/de/fr/ru/...`（所有 provider 支持） | `VOICE_ASR_LANGUAGE` |
-| `asr.languageHints` | `[]` | 语言提示（paraformer `language_hints`）；**仅 `aliyun-8k`/`aliyun-v2` 支持**，其余忽略 | `VOICE_ASR_LANGUAGE_HINTS`（逗号分隔） |
+| `asr.language` | `""` | 识别语言；**空 = 自动识别（多语言）**。可选 `zh/yue/en/ja/ko/de/fr/ru/...`（stream 与 `aliyun-qwen-file` 按此表；`mimo` 仅收 zh/en，其余映射为 auto） | `VOICE_ASR_LANGUAGE` |
+| `asr.languageHints` | `[]` | 语言提示：paraformer `language_hints`（**仅 `aliyun-8k`/`aliyun-v2`**）；`mimo` 用于 zh/en 单值映射（含 zh→zh、含 en→en、否则 auto）；其余忽略 | `VOICE_ASR_LANGUAGE_HINTS`（逗号分隔） |
 | `asr.vocabularyId` | `""` | 热词表 ID（paraformer `vocabulary_id`，需先用 VocabularyService 预建且 `target_model` 一致）；**仅 `aliyun-8k`/`aliyun-v2` 支持**，其余忽略 | `VOICE_ASR_VOCABULARY_ID` |
 | `asr.context` | `""` | 领域上下文/语料（run-task `input.context`）；**当前无 provider 支持，始终忽略**（qwen3-asr-flash-realtime 与 paraformer 均不支持） | `VOICE_ASR_CONTEXT` |
-| `asr.credentials.path` | `""` | 凭证文件（1 行 workspaceid / 2 行 apikey）；空 = 默认 `<cwd>/.tmp/aliyun` | `VOICE_ALIYUN_CREDENTIALS`（兼容旧名 `ALIYUN_CREDENTIALS`） |
-| `asr.credentials.apiKey` | `""` | 直接给出的 API Key（**云 TTS 复用同一凭证**） | `DASHSCOPE_API_KEY` |
-| `asr.credentials.workspaceId` | `""` | 直接给出的业务空间 ID | `DASHSCOPE_WORKSPACE_ID` |
+| `asr.credentials.path` | `""` | **ASR 专用**凭证文件（1 行 workspaceid / 2 行 apikey）；空 = 默认 `<cwd>/.tmp/aliyun` | `VOICE_ALIYUN_CREDENTIALS`（兼容旧名 `ALIYUN_CREDENTIALS`） |
+| `asr.credentials.apiKey` | `""` | **仅 ASR 用**；直接给出的 API Key（与 `tts.credentials` 各自独立） | `DASHSCOPE_API_KEY` |
+| `asr.credentials.workspaceId` | `""` | **仅 ASR 用**；直接给出的业务空间 ID | `DASHSCOPE_WORKSPACE_ID` |
+| `asr.mimoCredentials.apiKey` | `""` | **仅 mimo ASR 用**；MiMo API Key（无需 workspace；与 `tts.mimoCredentials` 相互独立，留空回退环境变量） | `MIMO_API_KEY` |
 | `vad.threshold` | `0.5` | 语音活动检测阈值 `[-1,1]`；**越高越抗噪**、越低越灵敏（易误触发） | `VOICE_VAD_THRESHOLD` |
 | `vad.silenceDurationMs` | `800` | 句尾静音判定毫秒 `[200,6000]` | `VOICE_VAD_SILENCE_MS` |
-| `tts.provider` | `sapi` | 合成后端：`sapi`(本机 Windows SAPI) / `aliyun`(阿里云 CosyVoice) | `TTS_PROVIDER` |
-| `tts.voice` | `""` | 音色名；空 = provider 默认（sapi 系统默认 / aliyun `longxiaochun_v2`） | `TTS_VOICE` |
-| `tts.rate` | `0` | 语速；`sapi` `[-10,10]`（0 中性）、`aliyun` `[0.5,2]`（0 = 未指定 → 1.0） | `TTS_RATE` |
-| `tts.instruction` | `""` | 风格/情感/方言指令（≤100 字）；**仅 `aliyun` 支持**，sapi 忽略 | `TTS_INSTRUCTION` |
-| `tts.pitch` | `0` | 音高 `[0.5,2]`（0 = 未指定 → 1.0）；**仅 `aliyun` 支持**，sapi 忽略 | `TTS_PITCH` |
-| `tts.volume` | `0` | 音量 `[0,100]`（0 = 未指定 → provider 默认）；sapi / aliyun 均支持 | `TTS_VOLUME` |
-| `tts.format` | `""` | 输出格式 `pcm/wav/mp3/opus`（空 = wav）；**仅 `aliyun` 支持**，sapi 忽略 | `TTS_FORMAT` |
-| `tts.sampleRate` | `0` | 采样率 `8000/16000/22050/24000/44100/48000`（0 = 22050）；**仅 `aliyun` 支持**，sapi 忽略 | `TTS_SAMPLE_RATE` |
-| `tts.model` | `""` | 云 TTS 模型名（空 = `cosyvoice-v2`）；**仅 `aliyun` 支持**，sapi 忽略 | `TTS_MODEL` |
+| `tts.provider` | `sapi` | 合成后端：`sapi`(本机 Windows SAPI) / `aliyun`(阿里云 CosyVoice) / `termux`(Termux 系统 TTS) / `mimo`(小米 MiMo) | `TTS_PROVIDER` |
+| `tts.voice` | `""` | 音色名；空 = provider 默认（sapi 系统默认 / aliyun `longxiaochun_v2` / mimo `冰糖`） | `TTS_VOICE` |
+| `tts.rate` | `0` | 语速；`sapi` `[-10,10]`（0 中性）、`aliyun` `[0.5,2]`（0 = 未指定 → 1.0）；`mimo` 无原生参数，非 0 时并入风格指令（稍快/稍慢） | `TTS_RATE` |
+| `tts.instruction` | `""` | 风格/情感/方言指令（≤100 字）；`aliyun` 仅 `cosyvoice-v3`/`v3.5`、`qwen-audio-3.x` 支持（v2 忽略并记日志）；`mimo` 作为 `role:"user"` 风格指令下发；sapi 忽略 | `TTS_INSTRUCTION` |
+| `tts.pitch` | `0` | 音高 `[0.5,2]`（0 = 未指定 → 1.0）；**仅 `aliyun` 支持**，sapi/mimo 忽略 | `TTS_PITCH` |
+| `tts.volume` | `0` | 音量 `[0,100]`（0 = 未指定 → provider 默认）；sapi / aliyun 均支持，mimo 忽略 | `TTS_VOLUME` |
+| `tts.format` | `""` | 输出格式 `pcm/wav/mp3/opus`（空 = wav）；**仅 `aliyun` 支持**，sapi/mimo 忽略（mimo 流式固定 `pcm16`）。**aliyun 流式路径固定用 `pcm`**，非 pcm/wav 值被忽略并记日志 | `TTS_FORMAT` |
+| `tts.sampleRate` | `0` | 采样率 `8000/16000/22050/24000/44100/48000`（0 = 22050）；**仅 `aliyun` 支持**，sapi/mimo 忽略（mimo 固定 24000） | `TTS_SAMPLE_RATE` |
+| `tts.model` | `""` | 云 TTS 模型名（空 = `cosyvoice-v2` / mimo `mimo-v2.5-tts`）；aliyun / mimo 支持，sapi 忽略 | `TTS_MODEL` |
+| `tts.streamMinChars` | `5` | 流式送文**最小缓冲阈值**：首次向 CosyVoice 送 `continue-task` 前需缓冲的字符数（非负整数，负数/非数字回退默认）；防开头卡顿。**仅 `aliyun` 流式与自动朗读（F10）增量生效**（mimo 为单请求全量文本，不受影响） | `TTS_STREAM_MIN_CHARS` |
+| `tts.credentials.path` | `""` | **TTS 专用**凭证文件（1 行 workspaceid / 2 行 apikey）；空 = 默认 `<cwd>/.tmp/aliyun`（与 `asr.credentials` 各自独立；**仅 aliyun 用**） | `VOICE_ALIYUN_CREDENTIALS`（兼容旧名 `ALIYUN_CREDENTIALS`） |
+| `tts.credentials.apiKey` | `""` | **仅 aliyun TTS 用**；直接给出的 API Key（留空回退环境变量与默认凭证文件，不受 `asr.credentials` 影响） | `DASHSCOPE_API_KEY` |
+| `tts.credentials.workspaceId` | `""` | **仅 aliyun TTS 用**；直接给出的业务空间 ID | `DASHSCOPE_WORKSPACE_ID` |
+| `tts.mimoCredentials.apiKey` | `""` | **仅 mimo TTS 用**；MiMo API Key（无需 workspace；与 aliyun 凭证及 `asr.mimoCredentials` 相互独立，留空回退环境变量） | `MIMO_API_KEY` |
 
 自定义配置目录：环境变量 `EMOTIONS_CONFIG_DIR`（兼容旧名 `VOICE_CONFIG_DIR`，两者同时设置时新名优先）。
 
-**多语言（i18n）**：文案语言拆为两个独立键——`uiLanguage`（TUI 槽位指示/toast/命令标题）与 `toolLanguage`（**工具描述**，插件加载时本地化 + `voice-cli --help`）；均 `zh` / `en`（内置默认 `en`）。旧键 `language` 向后兼容：新键缺 → 用 `language` → 再缺用 `en`（环境变量同理：`VOICE_UI_LANGUAGE`/`VOICE_TOOL_LANGUAGE` 缺省时旧名 `VOICE_LANGUAGE` 兜底两者）。词表集中在 `src/lib/i18n.ts`（新增语言只需在 `LANGUAGES` 与 `PHRASES` 各加一项，类型会强制补齐全部键）。
+**多语言（i18n）**：文案语言拆为两个独立键——`uiLanguage`（TUI 槽位指示/toast/命令标题）与 `toolLanguage`（**工具描述**，插件加载时本地化 + `emotions-cli --help`）；均 `zh` / `en`（内置默认 `en`）。旧键 `language` 向后兼容：新键缺 → 用 `language` → 再缺用 `en`（环境变量同理：`VOICE_UI_LANGUAGE`/`VOICE_TOOL_LANGUAGE` 缺省时旧名 `VOICE_LANGUAGE` 兜底两者）。词表集中在 `src/lib/i18n.ts`（新增语言只需在 `LANGUAGES` 与 `PHRASES` 各加一项，类型会强制补齐全部键）。
 
 **抗噪**：阿里云无独立降噪参数，抗噪主要靠调高 `vad.threshold`（默认已从 0.2 调到 **0.5**）。`asr.language` 留空走服务端自动语种检测，即可多语言。
 
@@ -186,6 +232,13 @@ node dist/cli/voice-cli.js speak --text "你好" --emotion happy --background # 
 - **手动符号入口已移除**：`!!!`/`？？？`/`...`/`666` 不再触发标注；请改用命令（`/angry` 等）。
 - 情绪命令需**真正触发命令**（消息以 `/` 开头）才生效；命令不产出额外模型回合。
 - **npm 安装会拉入 `ffmpeg-static`（≈79 MB 下载）**，见上文「依赖体积」。
+- **TTS 平台差异**：`sapi` provider **仅 Windows**；`aliyun`（CosyVoice）**合成**跨平台。**播放**优先走流式（stdin raw PCM：**Windows 内置 waveOut**、Linux `aplay`/`paplay`、Termux/macOS `sox play`、通用 `ffplay`）；找不到流式播放器时回退**按句分段临时 WAV 顺序播放**（段边界=句边界；Windows SoundPlayer / Termux `play-audio` / macOS `afplay` / Linux `paplay`·`aplay`）。可用 `TTS_PLAYER` 覆盖（流式 id 走流式、文件型 id 强制分段）、`TTS_STREAM` 设音频流。**两条路径都没有时**会报清晰错误，不会静默无声。
+  - **Windows**：默认用**内置 waveOut 流式播放器**（`pwsh`/`powershell` + winmm，无 `ffplay` 依赖）；`pwsh` 缺失时回退 `powershell`。若 `pwsh`/`powershell` 都不可用则回退 SoundPlayer **分段**（段边界=句边界，间隙更少）。
+  - **Termux**：`play-audio` 只能放文件、不能流式 → 有 `sox`(play) 走流式，否则回退分段。
+- **Termux 限制**：
+  - **采集（ASR）不可用**：`ffmpeg-static` 是 **Linux x64 预编译**二进制，在 Termux（Android/aarch64）跑不起来；需装 Termux 自带的 `ffmpeg` 或 `sox`，并用 `FFMPEG_BIN` 指向它（或在 PATH 上放一个名为 `ffmpeg` 的可执行文件）。`devices` 子命令同样依赖 ffmpeg。
+  - **播放走 `play-audio`**：`pkg install play-audio` 后可用（绝对路径 `$PREFIX/bin/play-audio`）；缺失时报清晰错误并提示安装命令。音频流由 `TTS_STREAM` 控制（默认 `media`）。
+  - `sapi` 在 Termux 上必然报错（非 Windows）；请用 `aliyun`（CosyVoice）。
 
 ## 开发
 
@@ -211,12 +264,14 @@ npm publish --access public    # scoped 包必须显式 --access public
 
 ```
 dist/
-  emotions.js          # 唯一 server 插件入口（源：src/emotions.ts；情绪命令 + voice_cli 工具）
+  emotions.js          # 唯一 server 插件入口（源：src/emotions.ts；情绪命令 + emotions_cli 工具 + 自动朗读事件钩子）
   tui.js               # TUI 插件入口（源：src/tui.tsx，经 Babel 链编译）
-  cli/voice-cli.js     # CLI（源：src/cli/voice-cli.ts）
+  cli/emotions-cli.js  # CLI（源：src/cli/emotions-cli.ts）
   runtime/voice-runtime.js  # 语音运行时（源：src/runtime/voice-runtime.ts）
   lib/**               # 命令表 / 标注工具 / i18n 等
-  voice/**             # 语音能力（含 voice_cli 工具定义 voice/tool.ts）
+  voice/**             # 语音能力（emotions_cli 工具 voice/tool.ts、自动朗读 voice/auto-read.ts、
+                       #   流式播放器 voice/tts/stream-player.ts、音频落地 voice/tts/audio-sink.ts、
+                       #   文件播放器 voice/tts/player.ts、播放状态/打断 voice/playback-state.ts）
 ```
 
 ## 许可证

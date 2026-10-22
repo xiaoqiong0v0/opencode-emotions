@@ -1,12 +1,17 @@
 /**
- * 阿里云百炼（DashScope）凭证解析：凭证文件读取、脱敏、以及「环境变量 > 配置 > 默认路径」的优先级合并。
+ * 阿里云百炼（DashScope）/ MiMo 凭证解析：凭证文件读取、脱敏、以及「环境变量 > 配置 > 默认路径」的优先级合并。
  *
  * 安全约定：**凭证只读，绝不打印/回显**；对外错误文本统一经 `redact()` 抹除密钥。
  * 凭证文件兼容「第 1 行 workspaceid、第 2 行 apikey」的既有格式（空行忽略）。
+ * 缺失时的报错是**面向用户的配置引导**（缺什么、去哪配、怎么配）：带
+ * `voiceConfigPath()` 真实绝对路径 + 配置键 + 环境变量名（文案模板见 `guidance.ts`）。
  */
 
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
+
+import { voiceConfigPath } from "./config.js";
+import { credentialGuidance } from "./guidance.js";
 
 /** 凭证。 */
 export interface Credentials {
@@ -18,6 +23,8 @@ export interface Credentials {
 
 /** API Key 环境变量（最高优先级）。 */
 export const ENV_API_KEY = "DASHSCOPE_API_KEY";
+/** MiMo API Key 环境变量（仅 provider=mimo；最高优先级）。 */
+export const ENV_MIMO_API_KEY = "MIMO_API_KEY";
 /** 业务空间 ID 环境变量。 */
 export const ENV_WORKSPACE_ID = "DASHSCOPE_WORKSPACE_ID";
 /** 凭证文件路径环境变量（优先）。 */
@@ -27,7 +34,22 @@ export const LEGACY_ENV_CREDENTIALS_PATH = "ALIYUN_CREDENTIALS";
 /** 默认凭证文件相对当前工作目录的路径段。 */
 export const DEFAULT_CREDENTIALS_SEGMENTS = [".tmp", "aliyun"] as const;
 
-/** emotions.jsonc 的 `asr.credentials` 节。 */
+/**
+ * 计算错误引导里展示的配置文件路径：显式传入优先，缺省用 `voiceConfigPath()`（失败降级为文件名）。
+ * @param explicit 调用方显式传入的路径（可空）
+ * @returns 配置文件绝对路径（或降级占位）
+ */
+function resolveConfigFile(explicit?: string): string {
+  const trimmed = explicit?.trim();
+  if (trimmed) return trimmed;
+  try {
+    return voiceConfigPath();
+  } catch {
+    return "emotions.jsonc";
+  }
+}
+
+/** emotions.jsonc 的凭证节（`asr.credentials` 或 `tts.credentials`，二者形状相同、各自独立）。 */
 export interface CredentialFileConfig {
   /** 凭证文件路径；空 = 用默认路径。 */
   path?: string;
@@ -39,7 +61,7 @@ export interface CredentialFileConfig {
 
 /** resolveCredentials 的选项。 */
 export interface ResolveCredentialsOptions {
-  /** 配置中的 `asr.credentials` 节。 */
+  /** 传入的凭证配置（`asr.credentials` 或 `tts.credentials` 之一；两侧各自调用、互不影响）。 */
   config?: CredentialFileConfig;
   /** 环境变量表（默认 process.env，可注入便于测试）。 */
   env?: NodeJS.ProcessEnv;
@@ -49,6 +71,12 @@ export interface ResolveCredentialsOptions {
   defaultPath?: string;
   /** 文件读取器（测试可注入以隔离 IO）。 */
   readFile?: (path: string) => Credentials;
+  /** 错误引导里的 provider 标签（如 `aliyun-qwen`；缺省「阿里云」）。 */
+  providerLabel?: string;
+  /** 配置节名（`asr` / `tts`），决定错误引导里展示的配置键前缀（缺省 `asr`）。 */
+  section?: "asr" | "tts";
+  /** 错误引导里的配置文件路径（缺省 `voiceConfigPath()`）。 */
+  configFile?: string;
 }
 
 /** 取非空去空白字符串，否则 undefined。 */
@@ -137,16 +165,88 @@ export function resolveCredentials(options: ResolveCredentialsOptions = {}): Cre
 
   const apiKey = directApiKey ?? fileCreds?.apiKey ?? "";
   const workspace = directWorkspace ?? fileCreds?.workspace ?? "";
-  const hint = fileError ? `（凭证文件读取失败：${fileError}）` : "";
+  const providerLabel = options.providerLabel ?? "阿里云";
+  const section = options.section ?? "asr";
+  const configFile = resolveConfigFile(options.configFile);
+  const hint = fileError ? `凭证文件读取失败：${fileError}` : undefined;
   if (!apiKey) {
     throw new Error(
-      `未找到 API Key：请配置 asr.credentials（apiKey/path）或设置环境变量 ${ENV_API_KEY}${hint}`,
+      credentialGuidance({
+        providerLabel,
+        configFile,
+        configKeys: [`${section}.credentials.apiKey`],
+        envNames: [ENV_API_KEY],
+        fileHint: hint,
+      }),
     );
   }
   if (!workspace) {
     throw new Error(
-      `未找到 workspaceId：请配置 asr.credentials（workspaceId/path）或设置环境变量 ${ENV_WORKSPACE_ID}${hint}`,
+      credentialGuidance({
+        providerLabel,
+        configFile,
+        configKeys: [`${section}.credentials.workspaceId`],
+        envNames: [ENV_WORKSPACE_ID],
+        fileHint: hint,
+      }),
     );
   }
   return { apiKey, workspace };
+}
+
+/** MiMo 凭证配置路径（TTS 侧默认提示文案；ASR 侧用 {@link ASR_MIMO_CREDENTIALS_CONFIG_PATH}）。 */
+export const DEFAULT_MIMO_CREDENTIALS_CONFIG_PATH = "tts.mimoCredentials.apiKey";
+/** MiMo 凭证配置路径（ASR 侧提示文案，与 TTS 侧相互独立）。 */
+export const ASR_MIMO_CREDENTIALS_CONFIG_PATH = "asr.mimoCredentials.apiKey";
+
+/**
+ * 构造「MiMo API Key 缺失」的引导错误。
+ *
+ * `resolveMimoApiKey` 与 `MiMoProvider.speak`（speak 已解析后的兜底）**共用本单源文案**，
+ * 避免两处模板漂移。
+ * @param configKey 配置键路径（缺省 TTS 侧 `tts.mimoCredentials.apiKey`）
+ * @param configFile 配置文件路径（缺省 `voiceConfigPath()`）
+ * @returns 待抛出的 Error（信息不含密钥）
+ */
+export function mimoKeyMissingError(
+  configKey: string = DEFAULT_MIMO_CREDENTIALS_CONFIG_PATH,
+  configFile?: string,
+): Error {
+  return new Error(
+    credentialGuidance({
+      providerLabel: "MiMo",
+      configFile: resolveConfigFile(configFile),
+      configKeys: [configKey],
+      envNames: [ENV_MIMO_API_KEY],
+    }),
+  );
+}
+
+/** resolveMimoApiKey 的选项。 */
+export interface ResolveMimoApiKeyOptions {
+  /** 传入的 MiMo 凭证配置（`asr.mimoCredentials` 或 `tts.mimoCredentials` 之一；只需 apiKey，无 workspace）。 */
+  config?: { apiKey?: string };
+  /** 环境变量表（默认 process.env，可注入便于测试）。 */
+  env?: NodeJS.ProcessEnv;
+  /** 错误提示里的配置**键**路径（缺省 `tts.mimoCredentials.apiKey`；ASR 调用方传 `asr.mimoCredentials.apiKey`）。 */
+  configPath?: string;
+  /** 错误提示里的配置**文件**路径（缺省 `voiceConfigPath()`）。 */
+  configFile?: string;
+}
+
+/**
+ * 解析 MiMo API Key：**环境变量 > 配置**（键路径由 `configPath` 指定），无 workspace 要求。
+ * ASR/TTS 各传自己那组 `mimoCredentials`（两组相互独立、互不回退）；与阿里云 `resolveCredentials` 相互独立。
+ * @param options 解析选项
+ * @returns MiMo API Key
+ * @throws Error 两级都缺失时抛错（信息不含密钥，带 `voiceConfigPath()` 真实路径 + 配置键 + 环境变量引导）
+ */
+export function resolveMimoApiKey(options: ResolveMimoApiKeyOptions = {}): string {
+  const env = options.env ?? process.env;
+  const apiKey = trimOrUndefined(env[ENV_MIMO_API_KEY]) ?? trimOrUndefined(options.config?.apiKey);
+  if (!apiKey) {
+    const configKey = options.configPath ?? DEFAULT_MIMO_CREDENTIALS_CONFIG_PATH;
+    throw mimoKeyMissingError(configKey, options.configFile);
+  }
+  return apiKey;
 }

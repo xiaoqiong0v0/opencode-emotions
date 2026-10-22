@@ -9,14 +9,88 @@ import createLogger from "@xiaoqiong0v0/opencode-plugin-logger";
 import type { Logger } from "@xiaoqiong0v0/opencode-plugin-logger";
 
 import { loadVoiceConfig, type VoiceConfig } from "../config.js";
+import { resolveMimoApiKey } from "../credentials.js";
 import { AliyunProvider } from "./aliyun.js";
+import { MiMoProvider } from "./mimo.js";
 import { SapiProvider } from "./sapi.js";
-import { ignoredTtsParams, resolveTtsConfig, type SpeakResult, type TtsProvider, type TtsRequest } from "./types.js";
+import { TermuxProvider } from "./termux.js";
+import { ignoredTtsParams, resolveTtsConfig, DEFAULT_VOICE_LABEL, type SpeakResult, type TtsProvider, type TtsRequest } from "./types.js";
 
 export * from "./types.js";
 export * from "./emotion.js";
-export { SAPI_SCRIPT, SapiProvider, buildSapiEnv } from "./sapi.js";
-export { AliyunProvider } from "./aliyun.js";
+export { FOLLOW_EXIT_TIMEOUT_MS, SAPI_FOLLOW_SCRIPT, SAPI_SCRIPT, SapiProvider, buildSapiEnv, buildSapiFollowEnv } from "./sapi.js";
+export {
+  AliyunProvider,
+  buildCosyVoiceCancelTask,
+  buildCosyVoiceContinueTask,
+  buildCosyVoiceFinishTask,
+  buildCosyVoiceRunTask,
+  buildTtsUrl,
+  normalizeWavHeader,
+  resolveCosyVoiceParams,
+  supportsInstruction,
+  MAX_CONTINUE_CHARS,
+  MAX_TOTAL_CHARS,
+  STREAM_FORMAT,
+} from "./aliyun.js";
+export {
+  DEFAULT_MIMO_MODEL,
+  DEFAULT_MIMO_VOICE,
+  MIMO_API_URL,
+  MIMO_PROVIDER_NAME,
+  MIMO_SAMPLE_RATE,
+  MIMO_STREAM_FORMAT,
+  MiMoProvider,
+  buildMimoMessages,
+  buildMimoRequestBody,
+  extractMimoAudioPcm,
+  resolveMimoParams,
+  streamMimoPcm,
+  type MimoMessage,
+  type MimoParams,
+  type StreamMimoPcmOptions,
+} from "./mimo.js";
+export {
+  createStreamChunker,
+  normalizeStreamMinChars,
+  DEFAULT_STREAM_MIN_CHARS,
+  type StreamChunker,
+  type StreamChunkerOptions,
+} from "./stream.js";
+export { TermuxProvider, buildTermuxTtsArgs, mapTermuxRate, TERMUX_TTS_BIN } from "./termux.js";
+export {
+  DEFAULT_TTS_STREAM,
+  ENV_TTS_PLAYER,
+  ENV_TTS_STREAM,
+  commandExists,
+  isTermux,
+  selectPlayer,
+  type PlayerCommand,
+  type SelectedPlayer,
+  type SelectPlayerOptions,
+} from "./player.js";
+export {
+  buildWavHeader,
+  createAudioSink,
+  selectAudioStrategy,
+  MAX_SEGMENT_SECONDS,
+  PCM_BITS,
+  PCM_CHANNELS,
+  WAV_HEADER_BYTES,
+  type AudioSink,
+  type AudioStrategy,
+  type SelectAudioStrategyOptions,
+} from "./audio-sink.js";
+export { splitSentences, type SentenceSplit } from "./sentences.js";
+export {
+  buildWaveOutScript,
+  selectStreamPlayer,
+  STREAM_PLAYER_IDS,
+  WAVEOUT_SCRIPT,
+  type SelectedStreamPlayer,
+  type SelectStreamPlayerOptions,
+  type StreamCommand,
+} from "./stream-player.js";
 
 const log: Logger = createLogger("tts");
 
@@ -43,8 +117,12 @@ function createProvider(name: string): TtsProvider {
       return new SapiProvider();
     case "aliyun":
       return new AliyunProvider();
+    case "termux":
+      return new TermuxProvider();
+    case "mimo":
+      return new MiMoProvider();
     default:
-      throw new Error(`未知 TTS provider：${name}（可用：sapi、aliyun）`);
+      throw new Error(`未知 TTS provider：${name}（可用：sapi、aliyun、termux、mimo）`);
   }
 }
 
@@ -59,6 +137,24 @@ export function getProvider(name: string): TtsProvider {
   const created = createProvider(name);
   registry.set(name, created);
   return created;
+}
+
+/**
+ * 按当前解析链（env → config → 默认）判定 provider 是否支持 follow 常驻模式。
+ * 供生产接线（server 插件把结果传给 auto-read 决定 spawn worker 还是按块 spawn CLI）。
+ * 解析失败一律按 false 降级（回旧路径，不阻塞朗读）。
+ * @param env 环境变量表（默认 process.env）
+ * @param config 预加载配置；缺省读 emotions.jsonc
+ * @returns 支持 follow 返回 true
+ */
+export function resolveFollowSupport(env: NodeJS.ProcessEnv = process.env, config?: VoiceConfig): boolean {
+  try {
+    const cfg = config ?? loadVoiceConfig({ env });
+    const resolved = resolveTtsConfig({ text: "" }, env, cfg.tts);
+    return getProvider(resolved.provider).followSupport === true;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -78,8 +174,11 @@ export function speak(request: TtsRequest, options: SpeakOptions = {}): SpeakRes
     log.info(`provider=${resolved.provider} 忽略不支持的参数：${ignored.join(", ")}`);
   }
   log.info(
-    `speak provider=${resolved.provider} voice=${resolved.voice || "默认"} rate=${resolved.rate} len=${resolved.text.length}`,
+    `speak provider=${resolved.provider} voice=${resolved.voice || DEFAULT_VOICE_LABEL} rate=${resolved.rate} len=${resolved.text.length}`,
   );
+  // MiMo 专用凭证：仅 provider=mimo 时按 env MIMO_API_KEY > tts.mimoCredentials.apiKey 解析（缺失即抛清晰错误）
+  const mimoApiKey =
+    resolved.provider === "mimo" ? resolveMimoApiKey({ env, config: config.tts.mimoCredentials }) : undefined;
   return provider.speak({
     text: resolved.text,
     voice: resolved.voice,
@@ -90,7 +189,9 @@ export function speak(request: TtsRequest, options: SpeakOptions = {}): SpeakRes
     format: resolved.format,
     sampleRate: resolved.sampleRate,
     model: resolved.model,
-    credentials: config.asr.credentials,
+    streamMinChars: resolved.streamMinChars,
+    credentials: config.tts.credentials,
+    mimoApiKey,
   });
 }
 

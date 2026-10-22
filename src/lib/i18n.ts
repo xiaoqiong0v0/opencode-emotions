@@ -3,7 +3,7 @@
  *
  * 语言来自 `<配置目录>/emotions.jsonc`，拆为两个独立键（默认均 `en`，旧键 `language` 兜底两者）：
  * - `uiLanguage` → TUI 槽位指示、toast、命令标题等**面向用户的 UI 文案**；
- * - `toolLanguage` → server 插件在**加载时**本地化工具描述（注册给模型）与 `voice-cli --help`。
+ * - `toolLanguage` → server 插件在**加载时**本地化工具描述（注册给模型）与 `emotions-cli --help`。
  *
  * 约定：所有面向用户/模型的文案**必须集中在本表**，禁止在调用处散落硬编码；
  * 带变量的文案用 `{name}` 占位符，经 `format()` 填充。
@@ -48,9 +48,11 @@ export interface ToolPhrases {
   description: string;
   /** `args` 参数说明。 */
   args: string;
+  /** 模型 `speak` 被拦截（该会话自动朗读开启中，跳过语音播放）的返回文案。 */
+  speakSkippedAutoRead: string;
 }
 
-/** voice-cli 文案。 */
+/** emotions-cli 文案。 */
 export interface CliPhrases {
   /** `help` 全文。 */
   help: string;
@@ -58,18 +60,14 @@ export interface CliPhrases {
   speakStarted: string;
   /** 朗读失败前缀（占位符：message）。 */
   speakFailed: string;
+  /** 朗读跳过：正文为空（不报错、不派生播放）。 */
+  speakSkipped: string;
+  /** `--follow` 被不支持的 provider 拒绝（占位符：provider）。 */
+  followUnsupported: string;
   /** 无音频输入设备。 */
   noDevices: string;
   /** 设备列表标题。 */
   devicesHeader: string;
-}
-
-/** 槽位指示文案。 */
-export interface SlotPhrases {
-  /** 模式「注入」。 */
-  modeInject: string;
-  /** 模式「输入」。 */
-  modeInput: string;
 }
 
 /** 模式标签（完整名，用于 toast/命令标题）。 */
@@ -96,6 +94,16 @@ export interface ToastPhrases {
   modeOn: string;
   modeOff: string;
   startFailed: string;
+  /** 自动朗读已开启（F10）。 */
+  autoReadOn: string;
+  /** 自动朗读已关闭（F10，同时停止正在朗读的一段）。 */
+  autoReadOff: string;
+  /** 自动朗读开关写入失败（F10）。 */
+  autoReadFailed: string;
+  /** 当前会话是子会话（subagent），不支持自动朗读（F10 按下时提示）。 */
+  autoReadChildSession: string;
+  /** F10 双态中断：本次按键只中断正在播放的朗读、开关状态未变（2026-10-22）。 */
+  autoReadInterrupted: string;
 }
 
 /** 命令（keymap command）文案。 */
@@ -104,13 +112,16 @@ export interface CommandPhrases {
   injectDesc: string;
   inputTitle: string;
   inputDesc: string;
+  /** 自动朗读开关命令标题（占位符：key=热键显示名）。 */
+  autoTtsTitle: string;
+  /** 自动朗读开关命令说明。 */
+  autoTtsDesc: string;
 }
 
 /** 单语言的完整文案表。 */
 export interface Phrases {
   tool: ToolPhrases;
   cli: CliPhrases;
-  slot: SlotPhrases;
   label: LabelPhrases;
   toast: ToastPhrases;
   command: CommandPhrases;
@@ -120,14 +131,20 @@ export interface Phrases {
 const HELP_ZH = [
   "语音 CLI（opencode-emotions）",
   "",
-  "用法：voice-cli <命令> [选项]",
+  "用法：emotions-cli <命令> [选项]",
   "",
   "命令：",
-  "  speak --text <文本> [--emotion <情绪>] [--voice <音色>] [--rate <语速>] [--provider <sapi|aliyun>] [--background]",
+  "  speak --text <文本> [--emotion <情绪>] [--voice <音色>] [--rate <语速>] [--provider <sapi|aliyun|termux|mimo>] [--background]",
   "        合成语音并播放；--background 立即返回（后台播放）。",
+  "        也可用 --text-file <路径> 从文件读取正文（长文本/避免拼命令行）。",
+  "  speak --follow [--emotion <情绪>] [--voice <音色>] [--rate <语速>] [--provider <sapi|...>]",
+  "        常驻模式：从 stdin 按行读 UTF-8 文本连续朗读（每行一块，空行跳过），EOF 收尾退出；",
+  "        与 --text/--text-file 互斥；provider 需支持 follow（目前 sapi）。",
   "  devices  列出本机音频输入设备",
   "  status   查看解析后的语音配置（含语言）",
   "  help     显示本帮助",
+  "",
+  "注：自动朗读开关由 TUI 的 F10 热键独占（模型不可经本 CLI 切换）。",
   "",
   "情绪（--emotion，映射为 CosyVoice 风格指令；sapi 忽略）：",
   "  happy | sad | angry | fearful | disgusted | surprised | confused | speechless | neutral",
@@ -135,21 +152,29 @@ const HELP_ZH = [
   "        great / excited / good / nice / ok / fine、calm / plain、fear / afraid、disgust、surprise",
   "  neutral 或省略 = 不加风格指令",
   "",
-  "配置：<配置目录>/emotions.jsonc（tts.*、uiLanguage/toolLanguage）；环境变量 TTS_*、VOICE_UI_LANGUAGE/VOICE_TOOL_LANGUAGE（旧名 VOICE_LANGUAGE 兜底两者）可覆盖。",
+  "播放器（aliyun 合成后）：Windows SoundPlayer；Linux /usr/bin/paplay→/usr/bin/aplay；Termux play-audio（$PREFIX/bin，绝对路径探测）；",
+  "  macOS afplay；可用环境变量 TTS_PLAYER 显式指定，TTS_STREAM 设置 Termux 音频流（media/alarm/notification/ring/system/voice，默认 media）。",
+  "配置：<配置目录>/emotions.jsonc（tts.*、uiLanguage/toolLanguage；tts.streamMinChars = 流式首段最小缓冲字符数，默认 5）；环境变量 TTS_*（含 TTS_STREAM_MIN_CHARS）、VOICE_UI_LANGUAGE/VOICE_TOOL_LANGUAGE（旧名 VOICE_LANGUAGE 兜底两者）可覆盖。",
 ].join("\n");
 
 /** 英文帮助文本。 */
 const HELP_EN = [
   "Voice CLI (opencode-emotions)",
   "",
-  "Usage: voice-cli <command> [options]",
+  "Usage: emotions-cli <command> [options]",
   "",
   "Commands:",
-  "  speak --text <text> [--emotion <name>] [--voice <name>] [--rate <n>] [--provider <sapi|aliyun>] [--background]",
+  "  speak --text <text> [--emotion <name>] [--voice <name>] [--rate <n>] [--provider <sapi|aliyun|termux|mimo>] [--background]",
   "        Synthesize and play; --background returns immediately (plays in background).",
+  "        Also --text-file <path> to read the body from a file (long text / no command line).",
+  "  speak --follow [--emotion <name>] [--voice <name>] [--rate <n>] [--provider <sapi|...>]",
+  "        Follow mode: read UTF-8 lines from stdin and speak them continuously (one chunk per line, blank lines skipped),",
+  "        exits on EOF; mutually exclusive with --text/--text-file; the provider must support follow (currently sapi).",
   "  devices  List local audio input devices",
   "  status   Show resolved voice config (incl. language)",
   "  help     Show this help",
+  "",
+  "Note: the auto-read toggle is owned by the TUI F10 hotkey (the model cannot switch it via this CLI).",
   "",
   "Emotions (--emotion, mapped to a CosyVoice style instruction; ignored by sapi):",
   "  happy | sad | angry | fearful | disgusted | surprised | confused | speechless | neutral",
@@ -157,7 +182,9 @@ const HELP_EN = [
   "           great / excited / good / nice / ok / fine, calm / plain, fear / afraid, disgust, surprise",
   "  neutral or omitted = no style instruction",
   "",
-  "Config: <config-dir>/emotions.jsonc (tts.*, uiLanguage/toolLanguage); env TTS_* and VOICE_UI_LANGUAGE/VOICE_TOOL_LANGUAGE (legacy VOICE_LANGUAGE as fallback for both) override.",
+  "Player (after aliyun synthesis): Windows SoundPlayer; Linux /usr/bin/paplay -> /usr/bin/aplay; Termux play-audio ($PREFIX/bin, absolute-path probe);",
+  "  macOS afplay; override with env TTS_PLAYER; set Termux audio stream with TTS_STREAM (media/alarm/notification/ring/system/voice, default media).",
+  "Config: <config-dir>/emotions.jsonc (tts.*, uiLanguage/toolLanguage; tts.streamMinChars = min chars buffered before the first streamed chunk, default 5); env TTS_* (incl. TTS_STREAM_MIN_CHARS) and VOICE_UI_LANGUAGE/VOICE_TOOL_LANGUAGE (legacy VOICE_LANGUAGE as fallback for both) override.",
 ].join("\n");
 
 /** 全语言文案表（键必须与 `Phrases` 完全一致，缺键由类型检查拦截）。 */
@@ -168,17 +195,20 @@ export const PHRASES: Readonly<Record<Language, Phrases>> = {
         "语音 CLI：把文字合成为语音播放（speak）、列出音频输入设备（devices）、查看当前配置（status）。" +
         '当用户要求「说出来 / 念出来 / 朗读 / 用语音回答」时，调用 `speak --text "<文本>"`' +
         "（可用 `--emotion <情绪>` 指定语气、`--voice <音色>`、`--rate <语速>`）。" +
+        "自动朗读由用户在 TUI 用 F10 热键开关，模型不可切换。" +
         "`args` 为完整 CLI 参数串；省略或传 `help` 显示用法。",
       args: 'CLI 参数串，例如 `speak --text "你好" --emotion happy`；也可用 `devices` / `status` / `help`。省略则显示用法。',
+      speakSkippedAutoRead: "当前已开启自动朗读，已跳过语音播放",
     },
     cli: {
       help: HELP_ZH,
       speakStarted: "已开始朗读（provider={provider}, voice={voice}, rate={rate}, emotion={emotion}）",
       speakFailed: "朗读失败：{message}",
+      speakSkipped: "朗读跳过：文本为空",
+      followUnsupported: "朗读失败：provider={provider} 不支持 --follow 常驻模式（当前仅 sapi 支持）",
       noDevices: "未发现音频输入设备（Windows 需 ffmpeg dshow 可用）",
       devicesHeader: "音频输入设备：",
     },
-    slot: { modeInject: "注入", modeInput: "输入" },
     label: { inject: "语音注入", input: "语音输入" },
     toast: {
       title: "语音",
@@ -195,12 +225,19 @@ export const PHRASES: Readonly<Record<Language, Phrases>> = {
       modeOn: "{label}已开启（正在监听）",
       modeOff: "{label}已关闭",
       startFailed: "启动语音运行时失败：{message}",
+      autoReadOn: "自动朗读：开（后续助手回复将自动朗读）",
+      autoReadOff: "自动朗读：关（已停止当前朗读）",
+      autoReadFailed: "切换自动朗读失败（无法写入状态文件）",
+      autoReadChildSession: "子会话不自动朗读",
+      autoReadInterrupted: "已中断播放（朗读开关状态未变）",
     },
     command: {
       injectTitle: "语音：注入开关 ({key})",
       injectDesc: "识别结果作为新消息注入当前会话",
       inputTitle: "语音：输入开关 ({key})",
       inputDesc: "识别结果追加到输入框，自行编辑后发送",
+      autoTtsTitle: "语音：自动朗读开关 ({key})",
+      autoTtsDesc: "开：后续助手回复自动朗读；关：立即停止当前朗读（模型不可切换，仅此热键控制）",
     },
   },
   en: {
@@ -209,17 +246,20 @@ export const PHRASES: Readonly<Record<Language, Phrases>> = {
         "Voice CLI: synthesize text to speech (speak), list audio input devices (devices), show resolved config (status). " +
         'When the user asks to read something aloud / answer with voice, call `speak --text "<text>"` ' +
         "(optionally `--emotion <name>`, `--voice <name>`, `--rate <n>`). " +
+        "Auto-read is toggled by the user via the TUI F10 hotkey; the model cannot switch it. " +
         "`args` is the raw CLI argument string; omit it or pass `help` to see usage.",
       args: 'Raw CLI argument string, e.g. `speak --text "hello" --emotion happy`; also `devices` / `status` / `help`. Omit to show usage.',
+      speakSkippedAutoRead: "Auto-read is on; speech playback skipped",
     },
     cli: {
       help: HELP_EN,
       speakStarted: "Started speaking (provider={provider}, voice={voice}, rate={rate}, emotion={emotion})",
       speakFailed: "Speech failed: {message}",
+      speakSkipped: "Skipped speaking: empty text",
+      followUnsupported: "Speech failed: provider={provider} does not support --follow mode (only sapi does)",
       noDevices: "No audio input device found (Windows requires ffmpeg dshow)",
       devicesHeader: "Audio input devices:",
     },
-    slot: { modeInject: "Inject", modeInput: "Input" },
     label: { inject: "Voice inject", input: "Voice input" },
     toast: {
       title: "Voice",
@@ -236,12 +276,19 @@ export const PHRASES: Readonly<Record<Language, Phrases>> = {
       modeOn: "{label} enabled (listening)",
       modeOff: "{label} disabled",
       startFailed: "Failed to start voice runtime: {message}",
+      autoReadOn: "Auto-read: on (assistant replies will be read aloud)",
+      autoReadOff: "Auto-read: off (stopped current playback)",
+      autoReadFailed: "Failed to toggle auto-read (cannot write state file)",
+      autoReadChildSession: "Auto-read is disabled for subagent (child) sessions",
+      autoReadInterrupted: "Playback interrupted (auto-read toggle unchanged)",
     },
     command: {
       injectTitle: "Voice: inject toggle ({key})",
       injectDesc: "Inject the transcript as a new message into the current session",
       inputTitle: "Voice: input toggle ({key})",
       inputDesc: "Append the transcript to the prompt for editing",
+      autoTtsTitle: "Voice: auto-read toggle ({key})",
+      autoTtsDesc: "On: read future assistant replies; Off: stop current playback now (F10 only; the model cannot switch it)",
     },
   },
 };

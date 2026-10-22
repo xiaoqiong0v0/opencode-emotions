@@ -1,7 +1,7 @@
 /**
- * `voice-cli` 的参数解析（纯函数，可离线单测）。
+ * `emotions-cli` 的参数解析（纯函数，可离线单测）。
  *
- * 与入口 `src/cli/voice-cli.ts` 分离，便于测试；只做「字符串数组 → 结构化命令」，
+ * 与入口 `src/cli/emotions-cli.ts` 分离，便于测试；只做「字符串数组 → 结构化命令」，
  * 不触 IO、不执行业务。支持 `--flag value` 与 `--flag=value` 两种写法。
  */
 
@@ -9,14 +9,21 @@
 export type CliCommand =
   | {
       kind: "speak";
-      /** 待朗读文本（已去空白；空串视为缺失，由执行层报错）。 */
+      /** 内联文本（已去空白）；与 `textFile` 二选一（都缺则报错；`follow` 时二者必须都缺）。 */
       text: string;
+      /** 文本文件路径（优先于 `text`；用于长文本/避免命令行注入）。 */
+      textFile?: string;
       emotion?: string;
       voice?: string;
       rate?: number;
       provider?: string;
       /** 是否后台播放（立即返回）。 */
       background: boolean;
+      /**
+       * 是否 follow 常驻模式：从 stdin 按行读 UTF-8 文本连续朗读（每行一块），EOF 收尾退出。
+       * 与 `--text`/`--text-file`/`--background` 互斥；provider 不支持 follow 时运行时报清晰错误。
+       */
+      follow: boolean;
     }
   | { kind: "devices" }
   | { kind: "status" }
@@ -24,16 +31,6 @@ export type CliCommand =
   /** 内部子命令：由 `speak --background` 以分离进程再调用，前台执行真正的合成+播放。 */
   | { kind: "play" }
   | { kind: "error"; message: string };
-
-/** `speak` 选项名（供帮助/文档参考）。 */
-export const SPEAK_FLAGS: readonly string[] = [
-  "--text <text>",
-  "--emotion <name>",
-  "--voice <name>",
-  "--rate <n>",
-  "--provider <sapi|aliyun>",
-  "--background",
-];
 
 /** 需要取值的选项短名 → 长名。 */
 const VALUE_ALIASES: Readonly<Record<string, string>> = {
@@ -71,11 +68,13 @@ function isFlagLike(token: string): boolean {
 /** 解析 `speak` 的参数。 */
 function parseSpeak(tokens: readonly string[]): CliCommand {
   let text: string | undefined;
+  let textFile: string | undefined;
   let emotion: string | undefined;
   let voice: string | undefined;
   let provider: string | undefined;
   let rate: number | undefined;
   let background = false;
+  let follow = false;
 
   for (let i = 0; i < tokens.length; i += 1) {
     const { name: rawName, value: inlineValue } = splitFlag(tokens[i]);
@@ -90,6 +89,9 @@ function parseSpeak(tokens: readonly string[]): CliCommand {
     switch (name) {
       case "--text":
         text = takeValue();
+        break;
+      case "--text-file":
+        textFile = takeValue();
         break;
       case "--emotion":
         emotion = takeValue();
@@ -111,6 +113,9 @@ function parseSpeak(tokens: readonly string[]): CliCommand {
       case "--background":
         background = true;
         break;
+      case "--follow":
+        follow = true;
+        break;
       default:
         // 未识别选项：忽略（容错），不报错
         break;
@@ -118,8 +123,26 @@ function parseSpeak(tokens: readonly string[]): CliCommand {
   }
 
   const trimmed = (text ?? "").trim();
-  if (trimmed.length === 0) return { kind: "error", message: "speak 需要 --text <文本>" };
-  const command: CliCommand = { kind: "speak", text: trimmed, background };
+  const file = textFile?.trim();
+  if (follow) {
+    // follow 模式正文走 stdin 行：与 --text/--text-file/--background 互斥（--background 载荷是单段文本）
+    if (trimmed.length > 0) return { kind: "error", message: "--follow 与 --text 互斥（正文从 stdin 按行读取）" };
+    if (file !== undefined && file.length > 0) {
+      return { kind: "error", message: "--follow 与 --text-file 互斥（正文从 stdin 按行读取）" };
+    }
+    if (background) return { kind: "error", message: "--follow 与 --background 互斥（follow 自身即常驻前台）" };
+    const followCommand: CliCommand = { kind: "speak", text: "", background: false, follow: true };
+    if (emotion !== undefined && emotion.trim().length > 0) followCommand.emotion = emotion.trim();
+    if (voice !== undefined && voice.trim().length > 0) followCommand.voice = voice.trim();
+    if (provider !== undefined && provider.trim().length > 0) followCommand.provider = provider.trim();
+    if (rate !== undefined) followCommand.rate = rate;
+    return followCommand;
+  }
+  if (trimmed.length === 0 && (file === undefined || file.length === 0)) {
+    return { kind: "error", message: "speak 需要 --text <文本> / --text-file <路径> 或 --follow" };
+  }
+  const command: CliCommand = { kind: "speak", text: trimmed, background, follow: false };
+  if (file !== undefined && file.length > 0) command.textFile = file;
   if (emotion !== undefined && emotion.trim().length > 0) command.emotion = emotion.trim();
   if (voice !== undefined && voice.trim().length > 0) command.voice = voice.trim();
   if (provider !== undefined && provider.trim().length > 0) command.provider = provider.trim();

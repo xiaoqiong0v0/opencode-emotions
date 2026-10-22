@@ -1,11 +1,17 @@
 /**
- * WAV 读取与格式转换（纯 Node，不依赖 ffmpeg）。
+ * WAV 读取、封装与格式转换（纯 Node，不依赖 ffmpeg）。
  *
- * 用途：非交互自测时把一段 WAV 文件读成 ASR 客户端要求的
- * 16kHz/单声道/16bit PCM 字节流。仅支持未压缩 PCM 的 WAV。
+ * 用途：
+ * - 读：非交互自测时把一段 WAV 文件读成 ASR 客户端要求的
+ *   16kHz/单声道/16bit PCM 字节流（仅支持未压缩 PCM 的 WAV）。
+ * - 写：`buildWavHeader`/`buildWav` 把裸 s16le PCM 打包成标准 WAV
+ *   （按段 ASR 上传 data URL 用；头构造逻辑原先在 `tts/audio-sink.ts`，统一收敛到本模块）。
  */
 
 import { readFileSync } from "node:fs";
+
+/** 一个 WAV 头（PCM）的字节数。 */
+export const WAV_HEADER_BYTES = 44;
 
 /** 解析出的 WAV 内容。 */
 export interface WavData {
@@ -82,6 +88,44 @@ export function readWavAsPcm16(path: string, targetRate: number): Buffer {
 export function silencePcm(milliseconds: number, sampleRate: number): Buffer {
   const samples = Math.max(0, Math.floor((milliseconds * sampleRate) / 1000));
   return Buffer.alloc(samples * 2);
+}
+
+/**
+ * 构造标准 PCM WAV 头（44 字节，小端）。
+ * @param dataLength 数据区字节数
+ * @param sampleRate 采样率（Hz）
+ * @param channels 声道数（默认单声道）
+ * @param bits 位深（默认 16）
+ * @returns 44 字节 WAV 头
+ */
+export function buildWavHeader(dataLength: number, sampleRate: number, channels = 1, bits = 16): Buffer {
+  const blockAlign = (channels * bits) / 8;
+  const byteRate = sampleRate * blockAlign;
+  const header = Buffer.alloc(WAV_HEADER_BYTES);
+  header.write("RIFF", 0, "ascii");
+  header.writeUInt32LE(36 + dataLength, 4);
+  header.write("WAVE", 8, "ascii");
+  header.write("fmt ", 12, "ascii");
+  header.writeUInt32LE(16, 16);
+  header.writeUInt16LE(1, 20); // PCM
+  header.writeUInt16LE(channels, 22);
+  header.writeUInt32LE(sampleRate, 24);
+  header.writeUInt32LE(byteRate, 28);
+  header.writeUInt16LE(blockAlign, 32);
+  header.writeUInt16LE(bits, 34);
+  header.write("data", 36, "ascii");
+  header.writeUInt32LE(dataLength, 40);
+  return header;
+}
+
+/**
+ * 把裸 s16le 单声道 PCM 打包为完整 WAV 文件字节（16bit）。
+ * @param pcm s16le 字节流
+ * @param sampleRate 采样率（Hz）
+ * @returns 完整 WAV 字节（44 字节头 + data）
+ */
+export function buildWav(pcm: Buffer, sampleRate: number): Buffer {
+  return Buffer.concat([buildWavHeader(pcm.length, sampleRate), pcm]);
 }
 
 /**

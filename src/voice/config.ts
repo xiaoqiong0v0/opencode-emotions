@@ -8,12 +8,14 @@
  * 读取失败（文件损坏/类型不符）**静默降级到默认值**，绝不影响插件运行。
  * 优先级：环境变量 > 配置文件 > 内置默认。
  *
- * 文案语言拆为两个独立键：`uiLanguage`（TUI 槽位/toast/命令标题）与 `toolLanguage`（工具描述 + `voice-cli --help`）；
+ * 文案语言拆为两个独立键：`uiLanguage`（TUI 槽位/toast/命令标题）与 `toolLanguage`（工具描述 + `emotions-cli --help`）；
  * 旧键 `language` 向后兼容——新键缺 → 用 `language` → 再缺用 `en`；环境变量同构（新名缺 → 旧名 → 文件值）。
  *
- * ASR provider 是「预设」：`aliyun-qwen` 走 OpenAI-realtime 风格协议（16k、7 类情绪）；
- * `aliyun-8k` / `aliyun-v2` 走 DashScope inference 协议（run-task；8k 3 类情绪 / v2 无情绪）。
- * 协议字段依据阿里云百炼官方文档（见 README 与 docs）。
+ * ASR provider 是「预设」：分**两类传输**——`stream`（WebSocket 实时，含两种方言：
+ * `aliyun-qwen` 走 OpenAI-realtime 风格、16k、7 类情绪；`aliyun-8k`/`aliyun-v2` 走 DashScope inference
+ * run-task、8k 3 类 / v2 无情绪）与 `segment`（整段音频→HTTP→文本：
+ * `aliyun-qwen-file` = qwen3-asr-flash 同步 OpenAI 兼容、16k、7 类情绪；`mimo` = mimo-v2.5-asr、无情绪）。
+ * 协议/端点字段依据阿里云百炼与 MiMo 官方文档（见 README 与 docs）。
  */
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -22,9 +24,20 @@ import { dirname, join } from "node:path";
 import { resolveConfigDir } from "../lib/config-dir.js";
 import { DEFAULT_LANGUAGE, resolveLanguage, type Language } from "../lib/i18n.js";
 import { parseJsonc } from "../lib/jsonc.js";
+import { DEFAULT_STREAM_MIN_CHARS } from "./tts/stream.js";
 import {
   DEFAULT_PROVIDER as DEFAULT_TTS_PROVIDER,
   DEFAULT_RATE as DEFAULT_TTS_RATE,
+  ENV_FORMAT as TTS_ENV_FORMAT,
+  ENV_INSTRUCTION as TTS_ENV_INSTRUCTION,
+  ENV_MODEL as TTS_ENV_MODEL,
+  ENV_PITCH as TTS_ENV_PITCH,
+  ENV_PROVIDER as TTS_ENV_PROVIDER,
+  ENV_RATE as TTS_ENV_RATE,
+  ENV_SAMPLE_RATE as TTS_ENV_SAMPLE_RATE,
+  ENV_STREAM_MIN_CHARS as TTS_ENV_STREAM_MIN_CHARS,
+  ENV_VOICE as TTS_ENV_VOICE,
+  ENV_VOLUME as TTS_ENV_VOLUME,
   MAX_RATE as TTS_RATE_MAX,
   MIN_RATE as TTS_RATE_MIN,
 } from "./tts/types.js";
@@ -64,21 +77,26 @@ export const ENV_ASR_VOCABULARY_ID = "VOICE_ASR_VOCABULARY_ID";
 export const ENV_ASR_CONTEXT = "VOICE_ASR_CONTEXT";
 
 /** ASR provider 标识。 */
-export type AsrProviderId = "aliyun-qwen" | "aliyun-8k" | "aliyun-v2";
-/** ASR 传输协议：realtime（qwen）/ inference（paraformer run-task）。 */
+export type AsrProviderId = "aliyun-qwen" | "aliyun-8k" | "aliyun-v2" | "aliyun-qwen-file" | "mimo";
+/** ASR 传输协议（仅 stream 使用）：realtime（qwen）/ inference（paraformer run-task）。 */
 export type AsrProtocol = "realtime" | "inference";
+/** ASR 传输分类：stream=WebSocket 实时（两方言）；segment=整段音频→HTTP→文本。 */
+export type AsrTransport = "stream" | "segment";
 
-/** provider 预设（协议/默认模型/采样率/是否带情绪）。 */
+/** provider 预设（传输/协议/默认模型/采样率/是否带情绪）。 */
 export interface AsrProviderPreset {
   id: AsrProviderId;
-  protocol: AsrProtocol;
+  /** 传输分类（stream 走 WS 方言；segment 走按段 HTTP）。 */
+  transport: AsrTransport;
+  /** WS 方言；仅 transport=stream 的 provider 有值。 */
+  protocol?: AsrProtocol;
   model: string;
   sampleRate: number;
-  /** 是否返回情绪标签（qwen 7 类 / 8k-v2 3 类）。 */
+  /** 是否返回情绪标签（qwen 系 7 类 / 8k-v2 3 类；mimo 无）。 */
   supportsEmotion: boolean;
   /** 是否支持 paraformer v2 专有参数（max_sentence_silence 等）。 */
   extendedV2: boolean;
-  /** 是否支持 `language_hints`（paraformer 系）。 */
+  /** 是否支持 `language_hints`（paraformer 系；mimo 用于 zh/en 单值映射）。 */
   supportsLanguageHints: boolean;
   /** 是否支持热词表 `vocabulary_id`（paraformer 系）。 */
   supportsVocabulary: boolean;
@@ -90,6 +108,7 @@ export interface AsrProviderPreset {
 export const ASR_PROVIDER_PRESETS: Readonly<Record<AsrProviderId, AsrProviderPreset>> = {
   "aliyun-qwen": {
     id: "aliyun-qwen",
+    transport: "stream",
     protocol: "realtime",
     model: "qwen3-asr-flash-realtime",
     sampleRate: 16000,
@@ -101,6 +120,7 @@ export const ASR_PROVIDER_PRESETS: Readonly<Record<AsrProviderId, AsrProviderPre
   },
   "aliyun-8k": {
     id: "aliyun-8k",
+    transport: "stream",
     protocol: "inference",
     model: "paraformer-realtime-8k-v2",
     sampleRate: 8000,
@@ -112,6 +132,7 @@ export const ASR_PROVIDER_PRESETS: Readonly<Record<AsrProviderId, AsrProviderPre
   },
   "aliyun-v2": {
     id: "aliyun-v2",
+    transport: "stream",
     protocol: "inference",
     model: "paraformer-realtime-v2",
     sampleRate: 16000,
@@ -119,6 +140,28 @@ export const ASR_PROVIDER_PRESETS: Readonly<Record<AsrProviderId, AsrProviderPre
     extendedV2: true,
     supportsLanguageHints: true,
     supportsVocabulary: true,
+    supportsContext: false,
+  },
+  "aliyun-qwen-file": {
+    id: "aliyun-qwen-file",
+    transport: "segment",
+    model: "qwen3-asr-flash",
+    sampleRate: 16000,
+    supportsEmotion: true,
+    extendedV2: false,
+    supportsLanguageHints: false,
+    supportsVocabulary: false,
+    supportsContext: false,
+  },
+  "mimo": {
+    id: "mimo",
+    transport: "segment",
+    model: "mimo-v2.5-asr",
+    sampleRate: 16000,
+    supportsEmotion: false,
+    extendedV2: false,
+    supportsLanguageHints: true,
+    supportsVocabulary: false,
     supportsContext: false,
   },
 };
@@ -137,8 +180,6 @@ export const VAD_THRESHOLD_MAX = 1;
 /** VAD 句尾静音范围（毫秒）。 */
 export const VAD_SILENCE_MIN = 200;
 export const VAD_SILENCE_MAX = 6000;
-/** ASR 语言提示默认（空 = 不下发）。 */
-export const DEFAULT_ASR_LANGUAGE_HINTS: readonly string[] = [];
 /** ASR 热词表 ID 默认（空 = 不下发）。 */
 export const DEFAULT_ASR_VOCABULARY_ID = "";
 /** ASR 领域上下文默认（空 = 不下发）。 */
@@ -155,19 +196,17 @@ export const DEFAULT_TTS_FORMAT = "";
 export const DEFAULT_TTS_SAMPLE_RATE = 0;
 /** 云 TTS 模型名默认（空 = provider 默认，如 cosyvoice-v2）。 */
 export const DEFAULT_TTS_MODEL = "";
-
-/** 单条识别语言合法值（qwen3-asr-flash-realtime 文档）。空串表示自动识别。 */
-export const ASR_LANGUAGES: readonly string[] = [
-  "zh", "yue", "en", "ja", "ko", "de", "fr", "ru", "es", "pt", "it", "ar",
-  "hi", "id", "th", "tr", "uk", "vi", "cs", "da", "fil", "fi", "is", "ms",
-  "no", "pl", "sv",
-];
+/** 流式送文最小缓冲阈值默认（首次发送前需缓冲的字符数；非负整数）。 */
+export const DEFAULT_TTS_STREAM_MIN_CHARS = DEFAULT_STREAM_MIN_CHARS;
 
 /** paraformer `language_hints` 支持的子集（不支持的语种将不下发该提示）。 */
 export const PARAFORMER_LANGUAGES: readonly string[] = ["zh", "en", "ja", "yue", "ko", "de", "fr", "ru"];
 
-/** ASR 凭证配置（解析优先级见 `resolveCredentials`）。 */
-export interface AsrCredentialsConfig {
+/**
+ * 云端凭证配置（ASR、TTS 各持一份，形状相同但**相互独立**；解析优先级见 `resolveCredentials`）。
+ * 某一侧留空即回退到环境变量（`DASHSCOPE_API_KEY`/`DASHSCOPE_WORKSPACE_ID`）与默认凭证文件，不受另一侧配置影响。
+ */
+export interface CredentialsConfig {
   /** 凭证文件路径（1 行 workspaceid / 2 行 apikey）；空 = 用默认路径。 */
   path: string;
   /** 直接给出的 API Key（低于环境变量、高于凭证文件）。 */
@@ -180,7 +219,7 @@ export interface AsrCredentialsConfig {
 export interface VoiceConfig {
   /** TUI UI 文案语言（槽位指示、toast、命令标题）。 */
   uiLanguage: Language;
-  /** 工具文案语言（`voice_cli` 工具描述 + `voice-cli --help`）。 */
+  /** 工具文案语言（`emotions_cli` 工具描述 + `emotions-cli --help`）。 */
   toolLanguage: Language;
   /** 音频输入设备友好名；空 = 自动取第一个输入设备。 */
   device: string;
@@ -197,8 +236,10 @@ export interface VoiceConfig {
     vocabularyId: string;
     /** 领域上下文/语料（inference `input.context`）；当前无 provider 支持，会忽略。 */
     context: string;
-    /** 云端凭证。 */
-    credentials: AsrCredentialsConfig;
+    /** 云端凭证（**仅 ASR 用**；与 `tts.credentials` 各自独立）。 */
+    credentials: CredentialsConfig;
+    /** MiMo ASR 凭证（**仅 provider=mimo**；与 `tts.mimoCredentials` 相互独立，只需 apiKey、无 workspace）。 */
+    mimoCredentials: { apiKey: string };
   };
   vad: {
     /** 语音活动检测阈值 [-1,1]。 */
@@ -207,7 +248,7 @@ export interface VoiceConfig {
     silenceDurationMs: number;
   };
   tts: {
-    /** 合成后端。 */
+    /** 合成后端：sapi（Windows）| aliyun（CosyVoice）| termux（Termux 系统 TTS）。 */
     provider: string;
     /** 音色名；空 = 系统默认。 */
     voice: string;
@@ -225,6 +266,12 @@ export interface VoiceConfig {
     sampleRate: number;
     /** 模型名；空 = provider 默认（CosyVoice = cosyvoice-v2）。 */
     model: string;
+    /** 流式送文最小缓冲阈值（首次发送前需缓冲的字符数；非负整数，默认 5）。 */
+    streamMinChars: number;
+    /** 云端凭证（**仅 TTS 用**；与 `asr.credentials` 各自独立，留空回退环境变量与默认凭证文件）。 */
+    credentials: CredentialsConfig;
+    /** MiMo TTS 凭证（**仅 provider=mimo**；与 aliyun 的 `credentials` 相互独立，只需 apiKey、无 workspace）。 */
+    mimoCredentials: { apiKey: string };
   };
 }
 
@@ -241,6 +288,7 @@ export const DEFAULT_VOICE_CONFIG: VoiceConfig = {
     vocabularyId: DEFAULT_ASR_VOCABULARY_ID,
     context: DEFAULT_ASR_CONTEXT,
     credentials: { path: "", apiKey: "", workspaceId: "" },
+    mimoCredentials: { apiKey: "" },
   },
   vad: { threshold: DEFAULT_VAD_THRESHOLD, silenceDurationMs: DEFAULT_VAD_SILENCE_MS },
   tts: {
@@ -253,6 +301,9 @@ export const DEFAULT_VOICE_CONFIG: VoiceConfig = {
     format: DEFAULT_TTS_FORMAT,
     sampleRate: DEFAULT_TTS_SAMPLE_RATE,
     model: DEFAULT_TTS_MODEL,
+    streamMinChars: DEFAULT_TTS_STREAM_MIN_CHARS,
+    credentials: { path: "", apiKey: "", workspaceId: "" },
+    mimoCredentials: { apiKey: "" },
   },
 };
 
@@ -265,29 +316,36 @@ export const DEFAULT_CONFIG_TEMPLATE = `// emotions.jsonc —— opencode-emotio
 {
   // TUI UI 文案语言（槽位指示、toast、命令标题）：en（默认）| zh（改后重启 opencode 生效）
   "uiLanguage": "en",
-  // 工具文案语言（voice_cli 工具描述 + voice-cli --help）：en（默认）| zh（改后重启 opencode 生效）
+  // 工具文案语言（emotions_cli 工具描述 + emotions-cli --help）：en（默认）| zh（改后重启 opencode 生效）
   "toolLanguage": "en",
   // 旧键 language 已拆成上面两键；两者缺省时回退 language，再缺省用 en（一般无需再写）
   // 音频输入设备友好名；留空 = 自动取第一个输入设备（可用 voice-runtime --list 查看）
   "device": "",
   "asr": {
-    // aliyun-qwen(默认,16k,7类情绪) | aliyun-8k(8k,3类) | aliyun-v2(16k,无情绪)
+    // aliyun-qwen(默认,stream,16k,7类情绪) | aliyun-8k(stream,8k,3类) | aliyun-v2(stream,16k,无情绪)
+    // | aliyun-qwen-file(按段,16k,7类情绪) | mimo(按段,16k,无情绪)
     "provider": "aliyun-qwen",
     // 模型名；留空 = 按 provider 预设自动选择
     "model": "",
     // 识别语言；留空 = 自动识别（多语言）。可选 zh/yue/en/ja/ko/de/fr/ru ...
     "language": "",
-    // 语言提示（paraformer language_hints）；仅 aliyun-8k / aliyun-v2 支持，其余忽略
+    // 语言提示（paraformer language_hints）；仅 aliyun-8k / aliyun-v2 / mimo 支持，其余忽略
     "languageHints": [],
     // 热词表 ID（paraformer vocabulary_id）；仅 aliyun-8k / aliyun-v2 支持，其余忽略
     "vocabularyId": "",
     // 领域上下文/语料（run-task input.context）；当前无 provider 支持，始终忽略
     "context": "",
-    // 云端凭证；优先级：环境变量(DASHSCOPE_API_KEY/DASHSCOPE_WORKSPACE_ID) > 此处 apiKey/workspaceId > path 文件 > 默认 .tmp/aliyun
+    // ASR 专用凭证；与 tts.credentials **各自独立**（可只配其一）。
+    // 优先级：环境变量(DASHSCOPE_API_KEY/DASHSCOPE_WORKSPACE_ID) > 此处 apiKey/workspaceId > path 文件 > 默认 .tmp/aliyun
     "credentials": {
       "path": "",
       "apiKey": "",
       "workspaceId": ""
+    },
+    // MiMo（按段）ASR 凭证（仅 provider=mimo；与 tts.mimoCredentials 相互独立，只需 apiKey、无 workspace）。
+    // 留空即回退：环境变量 MIMO_API_KEY > 此处 apiKey
+    "mimoCredentials": {
+      "apiKey": ""
     }
   },
   "vad": {
@@ -297,24 +355,38 @@ export const DEFAULT_CONFIG_TEMPLATE = `// emotions.jsonc —— opencode-emotio
     "silenceDurationMs": 800
   },
   "tts": {
-    // sapi(默认,本机 Windows SAPI) | aliyun(阿里云 CosyVoice)
+    // sapi(默认,本机 Windows SAPI) | aliyun(阿里云 CosyVoice) | termux(Termux 系统 TTS，termux-tts-speak) | mimo(小米 MiMo，OpenAI 兼容 SSE 流式)
     "provider": "sapi",
-    // 音色名；留空 = provider 默认
+    // 音色名；留空 = provider 默认（mimo 中文场景默认「冰糖」）
     "voice": "",
-    // 语速；sapi [-10,10]（0 中性），aliyun CosyVoice [0.5,2]（0 = 未指定 → 1.0）
+    // 语速；sapi [-10,10]（0 中性），aliyun CosyVoice [0.5,2]（0 = 未指定 → 1.0）；mimo 无原生参数，非 0 时并入风格指令
     "rate": 0,
-    // 风格/情感/方言指令（仅 aliyun CosyVoice；sapi 忽略）
+    // 风格/情感/方言指令（仅 aliyun CosyVoice 与 mimo；sapi 忽略）
     "instruction": "",
-    // 音高 [0.5,2]（仅 aliyun CosyVoice；0 = 未指定 → 1.0；sapi 忽略）
+    // 音高 [0.5,2]（仅 aliyun CosyVoice；0 = 未指定 → 1.0；sapi/mimo 忽略）
     "pitch": 0,
     // 音量 [0,100]（0 = 未指定 → provider 默认）
     "volume": 0,
-    // 输出格式（仅 aliyun CosyVoice：pcm/wav/mp3/opus；留空 = wav）
+    // 输出格式（仅 aliyun CosyVoice：pcm/wav/mp3/opus；留空 = wav；mimo 流式固定 pcm16，忽略此项）
     "format": "",
-    // 采样率（仅 aliyun CosyVoice：8000/16000/22050/24000/44100/48000；0 = 22050）
+    // 采样率（仅 aliyun CosyVoice：8000/16000/22050/24000/44100/48000；0 = 22050；mimo 固定 24000，忽略此项）
     "sampleRate": 0,
-    // 云 TTS 模型名；留空 = provider 默认（CosyVoice = cosyvoice-v2）
-    "model": ""
+    // 云 TTS 模型名；留空 = provider 默认（CosyVoice = cosyvoice-v2，mimo = mimo-v2.5-tts）
+    "model": "",
+    // 流式送文最小缓冲阈值（首次发送前需缓冲的字符数，非负整数；默认 5）——避免开头一两个字就建连/送文造成卡顿
+    "streamMinChars": 5,
+    // TTS 专用凭证；与 asr.credentials **各自独立**（可只配其一）。
+    // 留空即回退：环境变量(DASHSCOPE_API_KEY/DASHSCOPE_WORKSPACE_ID) > 此处 apiKey/workspaceId > path 文件 > 默认 .tmp/aliyun
+    "credentials": {
+      "path": "",
+      "apiKey": "",
+      "workspaceId": ""
+    },
+    // MiMo TTS 凭证（仅 provider=mimo；与 aliyun 的 tts.credentials 相互独立，只需 apiKey、无 workspace）。
+    // 留空即回退：环境变量 MIMO_API_KEY > 此处 apiKey
+    "mimoCredentials": {
+      "apiKey": ""
+    }
   }
 }
 `;
@@ -353,9 +425,11 @@ export interface ResolvedAsrParams extends AsrRequestedParams {
 /**
  * 按 provider 能力过滤 ASR 增强参数（纯函数，便于参数桩单测）。
  *
- * - `language`：所有 provider 都支持（realtime 走 `input_audio_transcription.language`），一律保留；
- * - `languageHints` / `vocabularyId`：仅 paraformer（aliyun-8k / aliyun-v2）支持；
- * - `context`：当前**无 provider 支持**（qwen3-asr-flash-realtime 与 paraformer 均不支持），始终忽略。
+ * - `language`：所有 provider 都支持（realtime 走 `input_audio_transcription.language`；按段 qwen 走 `asr_options.language`；
+ *   mimo 仅收 zh/en、其余映射为 auto），一律保留；
+ * - `languageHints`：paraformer（aliyun-8k / aliyun-v2）走 `language_hints`；mimo 用于 zh/en 单值映射；
+ * - `vocabularyId`：仅 paraformer（aliyun-8k / aliyun-v2）支持；
+ * - `context`：当前**无 provider 支持**（qwen3-asr-flash 系与 paraformer 均不支持），始终忽略。
  * 被忽略的键名收集到 `ignored`，由调用方记一条日志（不报错）。
  * @param preset provider 预设
  * @param requested 用户配置
@@ -510,7 +584,10 @@ function normalizeConfig(raw: unknown): VoiceConfig {
   const asr = isRecord(raw.asr) ? raw.asr : {};
   const vad = isRecord(raw.vad) ? raw.vad : {};
   const tts = isRecord(raw.tts) ? raw.tts : {};
-  const credentials = isRecord(asr.credentials) ? asr.credentials : {};
+  const asrCredentials = isRecord(asr.credentials) ? asr.credentials : {};
+  const ttsCredentials = isRecord(tts.credentials) ? tts.credentials : {};
+  const asrMimoCredentials = isRecord(asr.mimoCredentials) ? asr.mimoCredentials : {};
+  const ttsMimoCredentials = isRecord(tts.mimoCredentials) ? tts.mimoCredentials : {};
   // 语言回退链：新键（缺失/非字符串）→ 旧键 language → 内置默认 en；新键给了非法字符串则按 resolveLanguage 归一（→ en）
   const legacyLanguage = resolveLanguage(asString(raw.language, DEFAULT_VOICE_CONFIG.uiLanguage));
   return {
@@ -525,9 +602,12 @@ function normalizeConfig(raw: unknown): VoiceConfig {
       vocabularyId: asString(asr.vocabularyId, DEFAULT_VOICE_CONFIG.asr.vocabularyId),
       context: asString(asr.context, DEFAULT_VOICE_CONFIG.asr.context),
       credentials: {
-        path: asString(credentials.path, DEFAULT_VOICE_CONFIG.asr.credentials.path),
-        apiKey: asString(credentials.apiKey, DEFAULT_VOICE_CONFIG.asr.credentials.apiKey),
-        workspaceId: asString(credentials.workspaceId, DEFAULT_VOICE_CONFIG.asr.credentials.workspaceId),
+        path: asString(asrCredentials.path, DEFAULT_VOICE_CONFIG.asr.credentials.path),
+        apiKey: asString(asrCredentials.apiKey, DEFAULT_VOICE_CONFIG.asr.credentials.apiKey),
+        workspaceId: asString(asrCredentials.workspaceId, DEFAULT_VOICE_CONFIG.asr.credentials.workspaceId),
+      },
+      mimoCredentials: {
+        apiKey: asString(asrMimoCredentials.apiKey, DEFAULT_VOICE_CONFIG.asr.mimoCredentials.apiKey),
       },
     },
     vad: {
@@ -548,6 +628,15 @@ function normalizeConfig(raw: unknown): VoiceConfig {
       format: asString(tts.format, DEFAULT_VOICE_CONFIG.tts.format),
       sampleRate: asNumber(tts.sampleRate, DEFAULT_VOICE_CONFIG.tts.sampleRate),
       model: asString(tts.model, DEFAULT_VOICE_CONFIG.tts.model),
+      streamMinChars: Math.max(0, Math.trunc(asNumber(tts.streamMinChars, DEFAULT_VOICE_CONFIG.tts.streamMinChars))),
+      credentials: {
+        path: asString(ttsCredentials.path, DEFAULT_VOICE_CONFIG.tts.credentials.path),
+        apiKey: asString(ttsCredentials.apiKey, DEFAULT_VOICE_CONFIG.tts.credentials.apiKey),
+        workspaceId: asString(ttsCredentials.workspaceId, DEFAULT_VOICE_CONFIG.tts.credentials.workspaceId),
+      },
+      mimoCredentials: {
+        apiKey: asString(ttsMimoCredentials.apiKey, DEFAULT_VOICE_CONFIG.tts.mimoCredentials.apiKey),
+      },
     },
   };
 }
@@ -608,24 +697,27 @@ function applyEnvOverrides(config: VoiceConfig, env: NodeJS.ProcessEnv): VoiceCo
   const silence = numeric(ENV_VAD_SILENCE_MS);
   if (silence !== undefined) out.vad.silenceDurationMs = clamp(silence, VAD_SILENCE_MIN, VAD_SILENCE_MAX);
 
-  const ttsProvider = text("TTS_PROVIDER");
+  // TTS 环境变量名单源在 `tts/types.ts`（ENV_* 常量组），此处仅按名读取
+  const ttsProvider = text(TTS_ENV_PROVIDER);
   if (ttsProvider !== undefined) out.tts.provider = ttsProvider;
-  const ttsVoice = text("TTS_VOICE");
+  const ttsVoice = text(TTS_ENV_VOICE);
   if (ttsVoice !== undefined) out.tts.voice = ttsVoice;
-  const ttsRate = numeric("TTS_RATE");
+  const ttsRate = numeric(TTS_ENV_RATE);
   if (ttsRate !== undefined) out.tts.rate = clamp(ttsRate, TTS_RATE_MIN, TTS_RATE_MAX);
-  const ttsInstruction = text("TTS_INSTRUCTION");
+  const ttsInstruction = text(TTS_ENV_INSTRUCTION);
   if (ttsInstruction !== undefined) out.tts.instruction = ttsInstruction;
-  const ttsPitch = numeric("TTS_PITCH");
+  const ttsPitch = numeric(TTS_ENV_PITCH);
   if (ttsPitch !== undefined) out.tts.pitch = ttsPitch;
-  const ttsVolume = numeric("TTS_VOLUME");
+  const ttsVolume = numeric(TTS_ENV_VOLUME);
   if (ttsVolume !== undefined) out.tts.volume = ttsVolume;
-  const ttsFormat = text("TTS_FORMAT");
+  const ttsFormat = text(TTS_ENV_FORMAT);
   if (ttsFormat !== undefined) out.tts.format = ttsFormat;
-  const ttsSampleRate = numeric("TTS_SAMPLE_RATE");
+  const ttsSampleRate = numeric(TTS_ENV_SAMPLE_RATE);
   if (ttsSampleRate !== undefined) out.tts.sampleRate = ttsSampleRate;
-  const ttsModel = text("TTS_MODEL");
+  const ttsModel = text(TTS_ENV_MODEL);
   if (ttsModel !== undefined) out.tts.model = ttsModel;
+  const ttsStreamMinChars = numeric(TTS_ENV_STREAM_MIN_CHARS);
+  if (ttsStreamMinChars !== undefined) out.tts.streamMinChars = Math.max(0, Math.trunc(ttsStreamMinChars));
 
   return out;
 }

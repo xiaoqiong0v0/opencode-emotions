@@ -19,11 +19,11 @@ import { randomBytes, randomUUID } from "node:crypto";
 
 import WebSocket from "ws";
 
-import { DEFAULT_VAD_SILENCE_MS, DEFAULT_VAD_THRESHOLD, PARAFORMER_LANGUAGES, type AsrProtocol } from "./config.js";
+import { DEFAULT_VAD_SILENCE_MS, DEFAULT_VAD_THRESHOLD, PARAFORMER_LANGUAGES, type AsrProtocol, type AsrTransport } from "./config.js";
 import { redact } from "./credentials.js";
 import type { VoiceEmotion } from "./mapping.js";
-
-export { loadCredentials, redact, resolveCredentials, type Credentials } from "./credentials.js";
+// AsrResult/AsrClient 已收敛到 asr/types.ts（segment 客户端与工厂共用）；此处仍作为实现依赖 import。
+import type { AsrClient, AsrResult } from "./asr/types.js";
 
 /** 默认模型（realtime 协议）。 */
 export const DEFAULT_MODEL = "qwen3-asr-flash-realtime";
@@ -39,16 +39,6 @@ export const AUDIO_FRAME_MS = 100;
 export const DEFAULT_START_TIMEOUT_MS = 10000;
 /** `finish()` 等待结束事件的默认超时（毫秒）。 */
 export const DEFAULT_FINISH_TIMEOUT_MS = 20000;
-
-/** 一条识别结果。 */
-export interface AsrResult {
-  /** 识别文本；partial 为预览，final 为句末完整文本。 */
-  text: string;
-  /** 是否句末最终结果。 */
-  isFinal: boolean;
-  /** 情绪标签（7 类之一）；本次结果未携带时为空串。 */
-  emotion: VoiceEmotion | "";
-}
 
 /** server_vad 可选覆盖参数（不含 `prefix_padding_ms`——阿里云无此参数）。 */
 export interface VadOptions {
@@ -236,8 +226,10 @@ export function buildRunTask(params: {
   };
 }
 
-/** 阿里云实时 ASR 客户端（start→feed*→finish；按协议分派消息格式）。 */
-export class AliyunAsrClient {
+/** 阿里云实时 ASR 客户端（start→feed*→finish；按协议分派消息格式）。实现统一的 {@link AsrClient} 接口。 */
+export class AliyunAsrClient implements AsrClient {
+  /** 传输分类（统一接口字段；本客户端恒为 stream）。 */
+  readonly transport: AsrTransport = "stream";
   private ws: WebSocket | null = null;
   private readonly options: AliyunAsrOptions;
   private readonly protocol: AsrProtocol;

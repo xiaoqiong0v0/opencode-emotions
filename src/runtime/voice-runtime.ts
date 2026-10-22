@@ -1,27 +1,37 @@
 /**
  * 语音运行时命令行入口（纯 Node/TS，可独立运行）。
  *
- * 链路：麦克风采集（ffmpeg-static）→ 阿里云实时 ASR → 情绪映射 → 打印每句最终结果。
- * 也可用 `--wav <path>` 以 WAV 文件代替麦克风（非交互自测，云端链路验证）。
+ * 链路：麦克风采集（桌面 ffmpeg dshow / Termux termux-microphone-record）→ ASR（按 provider 工厂分流：
+ * stream = 阿里云实时 WS 两方言；segment = 阿里 qwen3-asr-flash 同步按段 / MiMo mimo-v2.5-asr 按段）
+ * → 情绪映射 → 打印每句/每段最终结果。
+ * 也可用 `--wav <路径>` 以 WAV 文件代替麦克风（非交互自测，云端链路验证；stream 按帧模拟实时，
+ * segment 把整个 WAV 作为一段发送）。
  *
  * 用法示例：
  *   node dist/runtime/voice-runtime.js --list
  *   node dist/runtime/voice-runtime.js --wav .tmp/scratch/rt-asr/models/.../test_wavs/0.wav
  *   node dist/runtime/voice-runtime.js --device "麦克风 (USB Audio)"
- *   node dist/runtime/voice-runtime.js --device "麦克风 (USB Audio)" --inject http://127.0.0.1:8799/inject
+ *   node dist/runtime/voice-runtime.js --device "麦克风 (USB Audio)" --inject http://127.0.0.1:PORT/inject
+ *   node dist/runtime/voice-runtime.js --provider mimo --wav sample.wav
  *
  * 配置来源（不写死）：`<配置目录>/emotions.jsonc`（配置目录 = `~/.config/opencode`）提供
  * provider/模型/语言/语言提示/热词表/上下文/VAD/设备/凭证；环境变量可覆盖；
  * 命令行 `--provider` / `--model` / `--language` / `--device` / `--credentials` 优先级最高。
- * 凭证解析：环境变量 `DASHSCOPE_API_KEY`/`DASHSCOPE_WORKSPACE_ID` > 配置 `asr.credentials` > 默认 `<cwd>/.tmp/aliyun`。
+ * 凭证解析：阿里系（含 aliyun-qwen-file）环境变量 `DASHSCOPE_API_KEY`/`DASHSCOPE_WORKSPACE_ID`
+ * > 配置 `asr.credentials` > 默认 `<cwd>/.tmp/aliyun`；mimo 走 `resolveMimoApiKey`
+ * （env `MIMO_API_KEY` > 配置 `asr.mimoCredentials`，与 TTS 的 `tts.mimoCredentials` 相互独立、无 workspace）。
  * 凭证只读、绝不打印；错误信息统一脱敏。
  */
 
-import { AliyunAsrClient, AUDIO_FRAME_MS, type AsrResult } from "../voice/aliyun.js";
+import { createAsrClient, type AsrClient, type AsrResult, type AsrTransport } from "../voice/asr/index.js";
+import { AUDIO_FRAME_MS } from "../voice/aliyun.js";
 import { listAudioDevices, MicCapture } from "../voice/capture.js";
 import { loadVoiceConfig, resolveAsrParams, resolveAsrProvider, voiceConfigPath } from "../voice/config.js";
-import { defaultCredentialsPath, resolveCredentials } from "../voice/credentials.js";
+import { defaultCredentialsPath, resolveCredentials, resolveMimoApiKey, ASR_MIMO_CREDENTIALS_CONFIG_PATH } from "../voice/credentials.js";
+import { noAudioDeviceGuidance } from "../voice/guidance.js";
+import { LEVEL_EVENT_INTERVAL_MS, rmsToLevel } from "../voice/meter.js";
 import { annotationForVoiceEmotion } from "../voice/mapping.js";
+import { isTermux } from "../voice/platform.js";
 import { encodeEvent, type RuntimeEvent, type RuntimeFinal } from "../voice/ndjson.js";
 import { readWavAsPcm16, silencePcm } from "../voice/wav.js";
 
@@ -135,7 +145,7 @@ function printHelp(): void {
     "  --seconds <秒>        采集指定秒数后结束（默认一直采到 Ctrl+C）",
     "  --inject <url>        最终结果 POST {text, emotion, annotation} 到该 URL",
     "  --json                以 NDJSON 输出事件到 stdout（供插件解析；人类日志转 stderr）",
-    "  --provider <名>       ASR provider：aliyun-qwen(默认) | aliyun-8k | aliyun-v2",
+    "  --provider <名>       ASR provider：aliyun-qwen(默认) | aliyun-8k | aliyun-v2 | aliyun-qwen-file(按段) | mimo(按段)",
     "  --model <名>          模型名（默认用 provider 预设）",
     "  --language <语言>     识别语言（默认空 = 自动识别）",
     "  --credentials <路径>  凭证文件（优先级：本选项 > VOICE_ALIYUN_CREDENTIALS/ALIYUN_CREDENTIALS > emotions.jsonc 的 asr.credentials.path > 默认 <cwd>/.tmp/aliyun）",
@@ -148,7 +158,8 @@ function printHelp(): void {
 function printDevices(): void {
   const devices = listAudioDevices();
   if (devices.length === 0) {
-    console.log("未找到音频输入设备");
+    // 枚举成功但确实 0 设备：给面向用户的检查引导（ffmpeg 启动失败会先抛错，不会走到这里）
+    console.log(noAudioDeviceGuidance());
     return;
   }
   console.log("音频输入设备：");
@@ -209,9 +220,12 @@ function createOutput(json: boolean): RuntimeOutput {
  */
 function resolveDevice(explicit?: string): string {
   if (explicit && explicit.trim().length > 0) return explicit;
+  // Termux 无 dshow 设备、采集走 termux-microphone-record；设备名仅占位（由采集器忽略）
+  if (isTermux()) return "termux";
   const first = listAudioDevices()[0];
   if (!first) {
-    throw new Error("未找到音频输入设备（可用 --list 查看）");
+    // 枚举成功但 0 设备：给检查/指定设备的引导（ffmpeg 启动失败会先从 listAudioDevices 抛错）
+    throw new Error(noAudioDeviceGuidance());
   }
   return first.name;
 }
@@ -240,14 +254,14 @@ function delay(ms: number): Promise<void> {
 }
 
 /**
- * 把 PCM 按实时节奏（每 frameMs 发一帧）喂给客户端，模拟真实麦克风。
+ * 把 PCM 按实时节奏（每 frameMs 发一帧）喂给客户端，模拟真实麦克风（仅 stream 自测用）。
  * @param client ASR 客户端
  * @param pcm PCM 字节
  * @param sampleRate 采样率
  * @param frameMs 每帧毫秒
  */
 async function feedRealtime(
-  client: AliyunAsrClient,
+  client: AsrClient,
   pcm: Buffer,
   sampleRate: number,
   frameMs: number,
@@ -283,15 +297,29 @@ async function injectResult(
 }
 
 /**
- * WAV 自测：读取 WAV → 按实时节奏喂入 → 尾静音 → finish。
+ * WAV 自测：
+ * - stream：读取 WAV → 按实时节奏喂入 → 尾静音 → finish（模拟麦克风，行为不变）。
+ * - segment：整个 WAV 作为**一段**直接喂入 → finish（无麦克风自测链路，一次 HTTP）。
  * @param client ASR 客户端
  * @param path WAV 路径
  * @param out 输出通道
  * @param sampleRate 目标采样率（来自 provider 预设）
+ * @param transport 传输分类（决定喂入方式）
  */
-async function runWav(client: AliyunAsrClient, path: string, out: RuntimeOutput, sampleRate: number): Promise<void> {
+async function runWav(
+  client: AsrClient,
+  path: string,
+  out: RuntimeOutput,
+  sampleRate: number,
+  transport: AsrTransport,
+): Promise<void> {
   const pcm = readWavAsPcm16(path, sampleRate);
   out.info(`WAV 自测：${path}（${pcm.length} 字节 PCM，${sampleRate}Hz 单声道）`);
+  if (transport === "segment") {
+    client.feed(pcm);
+    await client.finish();
+    return;
+  }
   await feedRealtime(client, pcm, sampleRate, AUDIO_FRAME_MS);
   client.feed(silencePcm(WAV_TAIL_SILENCE_MS, sampleRate));
   await delay(WAV_TAIL_WAIT_MS);
@@ -300,6 +328,11 @@ async function runWav(client: AliyunAsrClient, path: string, out: RuntimeOutput,
 
 /**
  * 麦克风模式：采集 → 喂流，按 Ctrl+C 或 --seconds 结束。
+ * 采集期间**并行**两路定时输出（都在同一事件循环内、无共享可变状态竞争）：
+ * - 采集统计（stderr，`STATS_INTERVAL_MS`，人类日志）；
+ * - **电平事件**（NDJSON `level`，`LEVEL_EVENT_INTERVAL_MS` 节流＝10Hz，供 TUI 槽位盲文音量列）：
+ *   按「自上次上报以来的窗口」结算 RMS（不是自采集开始的累计平均，否则电平不会回落），
+ *   经 `rmsToLevel` 归一后上行；**只在采集激活期间发**（`waitForStop` 返回即停表，`done` 之后不再发）。
  * @param client ASR 客户端
  * @param device 设备名
  * @param seconds 采集秒数（可选）
@@ -307,7 +340,7 @@ async function runWav(client: AliyunAsrClient, path: string, out: RuntimeOutput,
  * @param sampleRate 采集采样率（来自 provider 预设）
  */
 async function runMic(
-  client: AliyunAsrClient,
+  client: AsrClient,
   device: string,
   seconds: number | undefined,
   out: RuntimeOutput,
@@ -316,17 +349,24 @@ async function runMic(
   const capture = new MicCapture({ device, sampleRate });
   let sampleCount = 0;
   let squareSum = 0;
+  // 电平上报窗口（自上次上报以来的采样数 / 平方和，每次上报后清零）
+  let windowSamples = 0;
+  let windowSquareSum = 0;
 
   capture.on("data", (chunk: Buffer) => {
-    sampleCount += Math.floor(chunk.length / 2);
-    squareSum += sumOfSquares(chunk);
+    const count = Math.floor(chunk.length / 2);
+    const sum = sumOfSquares(chunk);
+    sampleCount += count;
+    squareSum += sum;
+    windowSamples += count;
+    windowSquareSum += sum;
     client.feed(chunk);
   });
   capture.on("error", (error: Error) => {
     console.error(`[采集错误] ${error.message}`);
   });
   capture.on("close", (code: number | null) => {
-    console.error(`[采集结束] ffmpeg 退出码=${code}`);
+    console.error(`[采集结束] 退出码=${code}`);
   });
 
   capture.start();
@@ -337,11 +377,24 @@ async function runMic(
     out.info(`[采集] 采样数=${sampleCount} RMS=${rms.toFixed(5)}`);
   }, STATS_INTERVAL_MS);
 
+  const levelTimer = setInterval(() => {
+    const rms = windowSamples > 0 ? Math.sqrt(windowSquareSum / windowSamples) : 0;
+    windowSamples = 0;
+    windowSquareSum = 0;
+    try {
+      // 尽力而为：stdout 写失败 / 上一行未 flush 都**只丢这一帧**，绝不让采集与识别中断
+      out.event({ type: "level", level: rmsToLevel(rms) });
+    } catch {
+      // 忽略：电平是可选视觉信息，不值得为此中断链路
+    }
+  }, LEVEL_EVENT_INTERVAL_MS);
+
   await waitForStop(seconds);
   clearInterval(statsTimer);
+  clearInterval(levelTimer);
   capture.stop();
   if (sampleCount === 0 && capture.diagnostics) {
-    console.error("未采集到任何 PCM 数据，ffmpeg stderr 尾部：");
+    console.error("未采集到任何 PCM 数据，采集 stderr 尾部：");
     console.error(capture.diagnostics.trim());
   }
   await client.finish();
@@ -397,11 +450,21 @@ async function main(): Promise<void> {
   }
   const language = asrParams.language;
 
-  const credentials = resolveCredentials({
-    config: config.asr.credentials,
-    cliPath: options.credentials,
-    defaultPath: defaultCredentialsPath(),
-  });
+  // 凭证分流：mimo 走 resolveMimoApiKey（env MIMO_API_KEY > asr.mimoCredentials，与 tts.mimoCredentials 相互独立、无 workspace）；
+  // 其余 provider（含 aliyun-qwen-file 按段）沿用 resolveCredentials（env > asr.credentials > 凭证文件）。
+  let credentials: { workspace: string; apiKey: string } | undefined;
+  let mimoApiKey: string | undefined;
+  if (provider.id === "mimo") {
+    mimoApiKey = resolveMimoApiKey({ config: config.asr.mimoCredentials, configPath: ASR_MIMO_CREDENTIALS_CONFIG_PATH });
+  } else {
+    credentials = resolveCredentials({
+      config: config.asr.credentials,
+      cliPath: options.credentials,
+      defaultPath: defaultCredentialsPath(),
+      section: "asr",
+      providerLabel: provider.id,
+    });
+  }
   const out = createOutput(options.json);
   const onFinal = (result: AsrResult): void => {
     const text = result.text.trim();
@@ -417,18 +480,17 @@ async function main(): Promise<void> {
     }
   };
 
-  const client = new AliyunAsrClient({
-    workspace: credentials.workspace,
-    apiKey: credentials.apiKey,
-    protocol: provider.protocol,
+  // 按 provider 工厂分流（stream=阿里 WS 两方言；segment=阿里按段 / MiMo 按段），运行时只依赖 AsrClient 接口
+  const client = createAsrClient({
+    preset: provider,
     model,
-    sampleRate: provider.sampleRate,
     language,
     languageHints: asrParams.languageHints,
     vocabularyId: asrParams.vocabularyId,
     context: asrParams.context,
     vad: { threshold: config.vad.threshold, silenceDurationMs: config.vad.silenceDurationMs },
-    extendedV2: provider.extendedV2,
+    credentials,
+    mimoApiKey,
     onResult: (result: AsrResult) => {
       if (result.isFinal) onFinal(result);
     },
@@ -447,7 +509,7 @@ async function main(): Promise<void> {
     );
     out.event({ type: "ready", model });
     if (options.wav) {
-      await runWav(client, options.wav, out, provider.sampleRate);
+      await runWav(client, options.wav, out, provider.sampleRate, client.transport);
     } else {
       await runMic(client, resolveDevice(device), options.seconds, out, provider.sampleRate);
     }
@@ -464,6 +526,12 @@ async function main(): Promise<void> {
 }
 
 void main().catch((err: Error) => {
-  console.error(`[voice-runtime] ${err.message}`);
+  const message = err.message;
+  console.error(`[voice-runtime] ${message}`);
+  // --json 模式：致命错误（ffmpeg/设备/凭证缺失等配置引导）也走 NDJSON error，
+  // TUI toast 直接展示文案；stderr 行保留供日志与 runtimeExited 摘要兜底。
+  if (process.argv.includes("--json")) {
+    process.stdout.write(encodeEvent({ type: "error", message }));
+  }
   process.exitCode = 1;
 });

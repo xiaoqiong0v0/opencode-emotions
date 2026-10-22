@@ -1,5 +1,6 @@
 /**
- * 情绪命令定义（英文命令 + 别名 → 固定「情绪 + 等级」）。
+ * 情绪命令定义（英文命令 → 固定「情绪 + 等级」）。
+ * 只注册精准主命令，不设别名（命令面板保持精简）。
  * 命令模板占位符用 `$ARGUMENTS`（实测有效；`{{input}}` 是死文本）。
  */
 
@@ -9,23 +10,21 @@ import { NEUTRAL_ANNOTATION, renderAnnotation, type Emotion } from "./emotions.j
 export interface EmotionCommand {
   /** 主命令名（不含前导斜杠） */
   name: string;
-  /** 别名（不含前导斜杠），仅做同义映射 */
-  aliases: readonly string[];
   /** 固定情绪；`neutral` 表示中性（只输出 😐，不带等级） */
   emotion: Emotion | "neutral";
 }
 
-/** 9 个情绪命令及其别名（见设计文档第 2.2 节）。 */
+/** 9 个情绪主命令（见设计文档第 2.2 节）。 */
 export const EMOTION_COMMANDS: readonly EmotionCommand[] = [
-  { name: "annoyed", aliases: ["meh"], emotion: { family: "anger", level: 1 } },
-  { name: "angry", aliases: ["mad"], emotion: { family: "anger", level: 2 } },
-  { name: "furious", aliases: ["rage"], emotion: { family: "anger", level: 3 } },
-  { name: "confused", aliases: ["puzzled"], emotion: { family: "confusion", level: 2 } },
-  { name: "speechless", aliases: ["sigh"], emotion: { family: "speechless", level: 2 } },
-  { name: "neutral", aliases: ["calm"], emotion: "neutral" },
-  { name: "ok", aliases: ["fine", "okay"], emotion: { family: "great", level: 1 } },
-  { name: "happy", aliases: ["good", "nice"], emotion: { family: "great", level: 2 } },
-  { name: "great", aliases: ["awesome"], emotion: { family: "great", level: 3 } },
+  { name: "annoyed", emotion: { family: "anger", level: 1 } },
+  { name: "angry", emotion: { family: "anger", level: 2 } },
+  { name: "furious", emotion: { family: "anger", level: 3 } },
+  { name: "confused", emotion: { family: "confusion", level: 2 } },
+  { name: "speechless", emotion: { family: "speechless", level: 2 } },
+  { name: "neutral", emotion: "neutral" },
+  { name: "ok", emotion: { family: "great", level: 1 } },
+  { name: "happy", emotion: { family: "great", level: 2 } },
+  { name: "great", emotion: { family: "great", level: 3 } },
 ];
 
 /** 命令参数占位符。 */
