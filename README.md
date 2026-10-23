@@ -42,7 +42,7 @@ TUI 插件（语音输入 UI + 热键）——`tui.json`：
 
 ### 包内入口如何被解析
 
-- **server 插件** = `package.json` 的 `exports["./server"]`，缺省回退 `main` → `dist/emotions.js`；
+- **server 插件** = 本包实际声明 `exports["."]` → `dist/emotions.js`（opencode 解析 server 入口按 `exports["./server"]` → `main` 回退；本包无 `./server` 键，落到 `main`，同为 `dist/emotions.js`）；
 - **TUI 插件** = `exports["./tui"]` → `dist/tui.js`。
 
 > 依据（opencode v1.18.25 源码）：`packages/opencode/src/plugin/shared.ts` `resolvePackageEntrypoint()`、`packages/opencode/src/plugin/loader.ts` `resolve()`、`packages/opencode/src/cli/cmd/plug.ts`（`opencode plugin` 按 `exports["./server"]`/`main`/`exports["./tui"]` 判定要写哪些配置）。
@@ -93,7 +93,7 @@ TUI 插件在会话输入框右侧渲染一个状态指示（`🎙️ [meter] �
 由**唯一的 server 插件入口** `emotions`（`dist/emotions.js`）通过 `tool` 钩子提供 **CLI 风格**工具 `emotions_cli`（工具定义在 `src/voice/tool.ts`）：模型在用户要求「说出来 / 念出来 / 朗读 / 用语音回答」时主动调用，把文字合成语音并对用户播放。工具名与 CLI 均对齐包名 `opencode-emotions`，避免与其它插件重名。
 工具只接受一个参数 `args`（完整 CLI 参数串），内部执行 `node dist/cli/emotions-cli.js <args>`（PATH 上找不到 `node` 时回退 `process.execPath`）。
 
-> 为什么由 server 插件提供：`@opencode-ai/plugin/tui` 的 `TuiPluginModule` 声明 `server?: never`，TUI 插件无法注册工具；工具只能由 `{ id, server }` 的 server 插件提供。现与情绪命令**合并进同一个 server 入口**——一个 npm 包只解析一个 server 入口（`exports["./server"]` / `main`），合并后 npm 安装时命令与 `emotions_cli` **都生效**。
+> 为什么由 server 插件提供：`@opencode-ai/plugin/tui` 的 `TuiPluginModule` 声明 `server?: never`，TUI 插件无法注册工具；工具只能由 `{ id, server }` 的 server 插件提供。现与情绪命令**合并进同一个 server 入口**——一个 npm 包只解析一个 server 入口（`exports["./server"]` / `main`；本包无 `./server`，实际走 `main` = `exports["."]` → `dist/emotions.js`），合并后 npm 安装时命令与 `emotions_cli` **都生效**。
 
 **`emotions_cli` 工具契约**（`args` 为命令串）：
 
@@ -137,7 +137,7 @@ node dist/cli/emotions-cli.js speak --text "你好" --emotion happy --background
 > 语音运行时脚本路径解析：`VOICE_RUNTIME_SCRIPT`（显式覆盖，优先）> **插件产物自身位置**同级 `runtime/voice-runtime.js`（`dist/` 与镜像后 `.opencode/plugin/` 同构，由 `import.meta.url` 推出）> `<cwd>/dist/runtime/voice-runtime.js`（兜底）。**不再以 cwd 为主口径**——opencode 的 cwd 是用户启动目录（家目录启动即拼出不存在的路径，runtime 秒退 code=1）；解析结果不存在时直接报错并带上完整绝对路径与全部候选。
 > CLI 路径解析：`EMOTIONS_CLI_SCRIPT`（存在则用；旧名 `VOICE_CLI_SCRIPT` 兼容）> `<cwd>/dist/cli/emotions-cli.js` > 工具模块同级（`dist/voice/` 或镜像后 `.opencode/plugin/voice/`）的 `../cli/emotions-cli.js`。
 
-**情绪与配置**：`tts.*` 见下方「语音配置」；也可用环境变量覆盖（`TTS_PROVIDER` / `TTS_VOICE` / `TTS_RATE` / `TTS_INSTRUCTION` / `TTS_PITCH` / `TTS_VOLUME` / `TTS_FORMAT` / `TTS_SAMPLE_RATE` / `TTS_MODEL` / `TTS_STREAM_MIN_CHARS` / `TTS_PLAYER` / `MIMO_API_KEY`）。
+**情绪与配置**：`tts.*` 见下方「语音配置」；也可用环境变量覆盖（`TTS_PROVIDER` / `TTS_VOICE` / `TTS_RATE` / `TTS_INSTRUCTION` / `TTS_PITCH` / `TTS_VOLUME` / `TTS_FORMAT` / `TTS_SAMPLE_RATE` / `TTS_MODEL` / `TTS_STREAM_MIN_CHARS` / `TTS_PREFETCH_DEPTH`（预取深度，`0`=关闭，默认 1）/ `TTS_PLAYER` / `TTS_STREAM` / `MIMO_API_KEY`）。
 
 **provider**：
 - `sapi`（默认）：本机 Windows SAPI，仅支持 `voice` / `rate` / `volume`；`instruction` / `pitch` / `format` / `sampleRate` / `model` 会被**忽略并记一条日志**。**仅 Windows**（非 Windows 会明确报错，不会静默无声）。
@@ -161,7 +161,7 @@ node dist/cli/emotions-cli.js speak --text "你好" --emotion happy --background
 
 可用环境变量 **`TTS_PLAYER`** 显式覆盖：填**流式** id（`waveout`/`winmm`/`aplay`/`paplay`/`sox`/`play`/`ffplay`）走流式；填文件型 id（如 `play-audio`/`soundplayer`/`afplay`）则强制走**分段回退**。音频流由 **`TTS_STREAM`** 控制（仅 Termux `play-audio` 用到：`media`/`alarm`/`notification`/`ring`/`system`/`voice`，默认 `media`）。**流式与分段都不可用时**会报清晰错误（列出已尝试候选与可安装的包，Termux 缺失时明确提示 `pkg install play-audio`），**不会静默无声**。
 
-**打断（barge-in，立即静音）**：**用户一发送消息**（server 插件 `chat.message`）**或按 `F8`/`F9` 语音输入 / `F10` 中断**（TUI 插件）时，立刻停止正在播放的 TTS。机制：播放进程（CLI `speak` / `speak --follow` / 分离的 `__play`）启动时把条目**原子写**到 `~/.opencode/plugins-cache/opencode-emotions/tts-playback`——文件是**多条目 map** `{ [sessionID]: { pid, playerPid?, provider, taskId, startedAt } }`（无主/旧格式用哨兵键 `_`），支持**跨会话混音、单会话互斥**（同会话新播顶掉旧条目，不做排队）。打断方读该文件后**逐条目过会话归属门**（条目 `sessionID` 存在且不等 → 跳过；无主条目任何会话可停；调用无参/空 sessionID = 停全部，仅 dispose/清场用），再按条目记录的 `pid` **与**可选 `playerPid` **各自**终止——先 `SIGTERM`，有界超时（1.5s）后仍存活再 `SIGKILL`；两个都杀是因为 Windows `TerminateProcess` 不杀子孙（只杀 CLI 会让发声的 PowerShell 孙进程把当前块播完）。进程退出/播完自动清理。**只允许按记录中的 PID 终止本插件自己派生的进程**（`pid>1`、非自身、未超 30 分钟 TTL），**严禁按进程名/模式杀**；找不到/已退出静默降级。被终止的播放进程会向云 TTS 发 `directive=cancel` 再退出。
+**打断（barge-in，立即静音）**：**用户一发送消息**（server 插件 `chat.message`）**或按 `F8`/`F9` 语音输入 / `F10` 中断**（TUI 插件）时，立刻停止正在播放的 TTS。按 `F10` 中断时**先写会话级中断请求水位**（`<sessionID>/interrupt-req`，内容=毫秒时间戳）再停播——修「按 F10 后剩余文本继续播」：落在单元间隙无进程可杀、worker 死后 auto-read 会重新 spawn，两者都由朗读侧在每个派发单元前读该水位拦下（时序契约见 `docs/ASYNC.md` ⑰）。机制：播放进程（CLI `speak` / `speak --follow` / 分离的 `__play`）启动时把条目**原子写**到 `~/.opencode/plugins-cache/opencode-emotions/tts-playback`——文件是**多条目 map** `{ [sessionID]: { pid, playerPid?, provider, taskId, startedAt } }`（无主/旧格式用哨兵键 `_`），支持**跨会话混音、单会话互斥**（同会话新播顶掉旧条目，不做排队）。打断方读该文件后**逐条目过会话归属门**（条目 `sessionID` 存在且不等 → 跳过；无主条目任何会话可停；调用无参/空 sessionID = 停全部，仅 dispose/清场用），再按条目记录的 `pid` **与**可选 `playerPid` **各自**终止——先 `SIGTERM`，有界超时（1.5s）后仍存活再 `SIGKILL`；两个都杀是因为 Windows `TerminateProcess` 不杀子孙（只杀 CLI 会让发声的 PowerShell 孙进程把当前块播完）。进程退出/播完自动清理。**只允许按记录中的 PID 终止本插件自己派生的进程**（`pid>1`、非自身、未超 30 分钟 TTL），**严禁按进程名/模式杀**；找不到/已退出静默降级。被终止的播放进程会向云 TTS 发 `directive=cancel` 再退出。
 
 **音色**：SAPI 优先用 `pwsh`（PowerShell 7）——它能选择全部 OneCore 音色（`Microsoft Huihui` / `Microsoft Kangkang` / `Microsoft Yaoyao`）；仅有 Windows PowerShell 5.1 时只认 Desktop 音色（如 `Microsoft Huihui Desktop`），选不到时回落到默认音色。连读会打断上一条（同一时刻只播一条）。
 
@@ -175,6 +175,9 @@ node dist/cli/emotions-cli.js speak --text "你好" --emotion happy --background
 - **状态落盘（每会话一个文件夹，对齐 file-tool）**：`~/.opencode/plugins-cache/opencode-emotions/<sessionID>/auto-tts`，内容为极简单值 **`on` / `off`**（一目录一会话，缺文件=关）；去重在 `<sessionID>/auto-tts-seen`。**原子写**（临时文件 + rename），读写失败一律降级（读→关、写失败由 F10 toast 提示）。因写开关的 **TUI 进程**与消费开关的 **server 插件进程**是两个进程，开关必须落共享文件才能被插件读到。
 - **谁来读、何时触发**：由 **server 插件**（`dist/emotions.js`）的 `event` 钩子消费两类事件**边生成边送 TTS**（2026-10-20 修正：opencode 的文本流式增量走 **`message.part.delta`**，`message.part.updated` 仅 text-start/text-end 各一次）——**`message.part.delta`** 按 `partID` 增量追加（delta payload 无类型，靠 text-start 快照登记的 `partID→type` 过滤 `reasoning` 等）、**`message.part.updated`** 作全量快照校准；用**同一「阈值 + 增量」口径**（`tts.streamMinChars`，默认 5）：**缓冲到阈值才首次派生**；随后 `drain` 每轮把**此刻已在队列**的块凑批合并（单批 ≤2000 字），再经 `splitSentences()` **按句对齐切分**（完整句连读、未完尾段 carry 到句尾）；**sapi 等 `followSupport` provider 对每条消息只派生 1 个 `speak --follow` 常驻 worker**，后续句子单元写入其 stdin（不再每块 spawn），消息完成时关 stdin 冲刷尾音；其它 provider 仍按句子单元 spawn CLI（流式送文本身仍是「阈值 + 增量、不做句切分」，交给服务端分句）；同一消息的朗读**串行**播放（避免新增量打断旧的），**每次派生前再读一次该会话的开关**——`F10` 关闭后队列里待播的下一段不再派生（与「立即停播」共同保证关掉即停；delta 高频路径读开关走 300ms TTL 缓存）。只读 `type==="text"` 的 part（排除 `reasoning`/thinking、`synthetic`、`ignored`），并用 `message.updated` 建立 `messageID→role` 表**只读 assistant**（避免读到用户消息；**角色未知时惰性补取一次** `info.role`，被角色门挡过的 part 置 tainted、其 delta 全丢，由快照兜底无重复；摘要消息不读）。**子会话硬跳过**：按 sessionID 单飞取 `Session.parentID` 判定（缓存），是子会话则无论开关开没开都不读。消息**完成**时补读未达阈值的缓冲并置去重，并打**每消息一条**诊断汇总（`自动朗读汇总：… session=… path=stream|fallback|skip …`）；**未观察到 part 更新**的消息在完成时回退「整段读」（用 `client.session.message(...)` 取回 parts）。
 - **怎么读**：复用 CLI——派生 `node dist/cli/emotions-cli.js speak --text-file <临时文件>`（正文写临时文件、argv 数组传参，**不拼 shell 字符串**；派生 bin 默认 PATH 上的 `node`，env `VOICE_NODE_BIN` 可覆盖——**不用** `process.execPath`，server 插件进程里那是 `opencode.exe`）；子进程 stderr 接管，非零退出或有 stderr 时 `log.warn` 带片段（不再静默无声）；同一块增量的音频本身走上面的**流式**路径。同一条消息按 **消息 id 去重**（内存 + 持久化每会话 `<sessionID>/auto-tts-seen`，防插件重启/事件重放重复朗读）。
+- **首句合并窗（自适应）**：首句就绪后不立即派发，先等一个**自适应窗口**合并随后到达的句子（省一次管线重启）。窗口 = `max(基值 400ms, 观测到的句间到达间隔)`，**上限 1200ms**；**下一条可合并文本到达 / 消息流结束 / 窗口到期**三者先到即结算，打断（水位 / 会话级中断请求 / 开关关闭 / 子会话门）期间每 50ms 轮询、**立即生效**。设 `FIRST_MERGE_WINDOW_MS=0` 即关闭（旧行为）。代价：首音延迟最多 +1200ms。
+- **预取（边合成边交播，2026-10-23 第十五批）**：播第 N 单元的同时**并行预合成 N+1**（深度 1，`TTS_PREFETCH_DEPTH=0` 关闭）。预合成用 `speak --pcm-out` **只落盘**（不登记 `tts-playback`、不参与打断 map）；交播时派生 `speak --pcm-file --pcm-follow` 先预热播放器、父进程经 stdin 写 `go` 放行，随后由**播放子进程**按文件增长 `stat`+`read` **边到边读**（不等整段合成完成；写端以 `done`/`abort` 控制行收尾）。预取文件**写盘不限大小**，播完 / 失败 / 取消**即删**。仅支持流式跨平台 provider（aliyun/mimo）的自动朗读路径生效；`sapi`、手动 `speak` 不受影响。
+- **预取防双播退出码口径**：播放进程退出码 `0`（完整播完）/ `3`（`PCM_PLAY_EXIT_PARTIAL`，已播部分后写端异常）**必然已出声，绝不重读**；仅 `1`（`PCM_PLAY_EXIT_NOT_STARTED`，从未起播）才**串行重试一次**；未知退出码 / 被取消一律按已播处理（宁可漏播不双播）。
 - **打断**：用户发消息时（`chat.message`）清空待读队列并停掉当前播放；**被打断的消息进入永久停读水位**——后续增量/入队直接丢弃，消息完成时也**不补读**（直接置 seen，防止回退成整段重读）；**下一条新消息正常朗读**（水位是消息级，不会影响后续回复）。
 - **跨平台播放**：同上方「音频落地」表（受 `TTS_PLAYER` 控制）。
 - **Termux 限制**：见「已知限制」。
@@ -205,7 +208,7 @@ node dist/cli/emotions-cli.js speak --text "你好" --emotion happy --background
 | `asr.credentials.apiKey` | `""` | **仅 ASR 用**；直接给出的 API Key（与 `tts.credentials` 各自独立） | `DASHSCOPE_API_KEY` |
 | `asr.credentials.workspaceId` | `""` | **仅 ASR 用**；直接给出的业务空间 ID | `DASHSCOPE_WORKSPACE_ID` |
 | `asr.mimoCredentials.apiKey` | `""` | **仅 mimo ASR 用**；MiMo API Key（无需 workspace；与 `tts.mimoCredentials` 相互独立，留空回退环境变量） | `MIMO_API_KEY` |
-| `vad.threshold` | `0.5` | 语音活动检测阈值 `[-1,1]`；**越高越抗噪**、越低越灵敏（易误触发） | `VOICE_VAD_THRESHOLD` |
+| `vad.threshold` | `0.5` | 语音活动检测**短帧能量门限**（30ms 短帧，按段 ASR 生效）。**有效区间 [0,1]**（`<0` 在映射时被夹到 0），映射为 dBFS：`0→-50 dBFS`（最灵敏）、`0.5→-35 dBFS`（默认）、`1→-20 dBFS`（最抗噪）。**越高越抗噪**、越低越灵敏（易误触发） | `VOICE_VAD_THRESHOLD` |
 | `vad.silenceDurationMs` | `800` | 句尾静音判定毫秒 `[200,6000]` | `VOICE_VAD_SILENCE_MS` |
 | `tts.provider` | `sapi` | 合成后端：`sapi`(本机 Windows SAPI) / `aliyun`(阿里云 CosyVoice) / `termux`(Termux 系统 TTS) / `mimo`(小米 MiMo) | `TTS_PROVIDER` |
 | `tts.voice` | `""` | 音色名；空 = provider 默认（sapi 系统默认 / aliyun `longxiaochun_v2` / mimo `冰糖`） | `TTS_VOICE` |
@@ -245,8 +248,8 @@ node dist/cli/emotions-cli.js speak --text "你好" --emotion happy --background
 
 ```bash
 npm install
-npm run build        # 清空 dist/ → tsc 编译 src/**（不含 .tsx）→ Babel 链编译 dist/tui.js
-npm test             # 构建后跑单元测试（node --test）
+npm run build        # 清空 dist/ → tsc 编译 src/**（不含 .tsx）→ npm run typecheck（tsconfig.tui.json）→ Babel 链编译 dist/tui.js
+npm test             # 构建后跑单元测试（node --test，388 例：387 pass + 1 POSIX-only skip）
 npm run publish:proj # build + 镜像 dist/ → .opencode/plugin/（并指向编译后的 tui.js）
 ```
 
@@ -259,7 +262,7 @@ npm version patch              # 或 minor / major：升 version 并打 git tag
 npm publish --access public    # scoped 包必须显式 --access public
 ```
 
-`prepublishOnly` 会在发布前自动 `npm run build`。发布前可用 `npm pack --dry-run` 校对将入包的产物（本包 `files` = `dist` + `README.md`；`package.json` / `LICENSE` 由 npm 自动带入）。
+`prepublishOnly` 会在发布前自动 `npm run build && node --test "test/**/*.test.js"`（既构建、又跑全量测试；`build` 本身已含 `typecheck`）。发布前可用 `npm pack --dry-run` 校对将入包的产物（本包 `files` = `dist` + `README.md`；`package.json` / `LICENSE` 由 npm 自动带入）。
 
 **产物与发布结构**（顶层只放插件入口，其余进子目录）：
 
