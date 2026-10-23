@@ -34,7 +34,9 @@
 
 import { existsSync, mkdirSync, readdirSync, renameSync, rmSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve, sep } from "node:path";
+
+import { DEFAULT_KEY_REPEAT_QUIET_MS, shouldAcceptKeyRepeat } from "../lib/key-repeat.js";
 
 /** 每会话目录内「开关」文件名。 */
 export const AUTO_TTS_FILE_NAME = "auto-tts";
@@ -59,8 +61,9 @@ export const AUTO_TTS_OFF_VALUE = "off";
  * 按住 F10 会连发按键事件（opencode spike 已实证「长按会键重复」），若逐事件切换，一次按住即可产生
  * 偶数次翻转，净效果=关（状态文件空、指示灯不亮，即实测「按了状态不变」根因）。
  * 误触快速连按（<700ms 间隔）同样只算一次；有意连续切换需间隔 ≥700ms。
+ * 实现单源在 `src/lib/key-repeat.ts`（F8/F9/F10 共用同一判据与窗口）。
  */
-export const AUTO_TTS_TOGGLE_QUIET_MS = 700;
+export const AUTO_TTS_TOGGLE_QUIET_MS = DEFAULT_KEY_REPEAT_QUIET_MS;
 /** 播放状态文件名（与 `playback-state.ts` 共用；该文件留 base 根、跨会话打断共用）。 */
 export const PLAYBACK_FILE_NAME = "tts-playback";
 /** 自动朗读派生 CLI 的临时正文目录名（留 base 根，`auto-read.ts` 消费）。 */
@@ -71,8 +74,16 @@ export const TTS_TMP_DIR_NAME = "tts";
  * - `tts`：自动朗读临时正文目录（见文件头「留在 base 根」说明）。
  */
 export const AUTO_TTS_RESET_KEEP_NAMES: readonly string[] = [PLAYBACK_FILE_NAME, TTS_TMP_DIR_NAME];
-/** sessionID 合法字符（防路径穿越：只允许 opencode 会话 id 形态的 `[A-Za-z0-9._-]`）。 */
-const SESSION_ID_PATTERN = /^[A-Za-z0-9._-]+$/;
+/**
+ * sessionID 合法形态：`ses_` 前缀 + 仅 `[A-Za-z0-9_-]`。
+ *
+ * **为什么必须收紧**（审计 P0，实测 `resetAutoTtsSession("..")` 会删掉数据根的父目录）：
+ * sessionID 直接当目录名用，旧字符集 `[A-Za-z0-9._-]` 放过了 `.` / `..`，而 `join(root, "..")`
+ * 正好指向父目录；路径分隔符、盘符、UNC、控制字符、尾随点/空格在 Windows 上也都能改写路径语义。
+ * 白名单只留 opencode 会话 id 的真实形态（`ses_*`）⇒ 上述危险输入在字符层面即被拒绝；
+ * {@link autoTtsSessionDir} 仍会再做一次 `resolve()` 后的路径包含性检查（双保险）。
+ */
+const SESSION_ID_PATTERN = /^ses_[A-Za-z0-9_-]+$/;
 
 /** 路径解析选项。 */
 export interface AutoTtsOptions {
@@ -81,12 +92,40 @@ export interface AutoTtsOptions {
 }
 
 /**
- * 校验 sessionID 可安全用作目录名（非空、仅 `[A-Za-z0-9._-]`，防路径穿越）。
+ * 校验 sessionID 可安全用作目录名（`ses_` 前缀、仅 `[A-Za-z0-9_-]`、非空）。
  * @param sessionID 会话 id
  * @returns 是否合法
  */
 function isValidSessionID(sessionID: unknown): sessionID is string {
-  return typeof sessionID === "string" && sessionID.length > 0 && SESSION_ID_PATTERN.test(sessionID);
+  return typeof sessionID === "string" && SESSION_ID_PATTERN.test(sessionID);
+}
+
+/**
+ * 判断目标路径是否**严格位于**数据根之内（不含根本身）。
+ *
+ * 两侧都 `resolve()` 消除 `..`/重复分隔符；比较时带分隔符边界，避免 `root-evil` 这类同前缀兄弟目录
+ * 被 `startsWith(root)` 误判为内部。Windows 盘符大小写差异由「同一 root 拼出」保证前缀一致。
+ * @param root 数据根绝对路径
+ * @param target 待检查的绝对路径
+ * @returns 严格位于 root 之内 true
+ */
+function isStrictlyInside(root: string, target: string): boolean {
+  const rootAbs = resolve(root);
+  const targetAbs = resolve(target);
+  const prefix = rootAbs.endsWith(sep) ? rootAbs : `${rootAbs}${sep}`;
+  return targetAbs.startsWith(prefix);
+}
+
+/**
+ * 路径包含性兜底：拼出的会话目录逃出数据根即**抛错**（调用方在删除前调用，绝不执行删除）。
+ * @param root 数据根
+ * @param dir 会话目录
+ * @throws Error 目录不在数据根之内
+ */
+function assertInsideRoot(root: string, dir: string): void {
+  if (!isStrictlyInside(root, dir)) {
+    throw new Error(`拒绝越界会话目录：dir=${dir} root=${root}`);
+  }
 }
 
 /**
@@ -110,13 +149,20 @@ export function autoTtsDataDir(options: AutoTtsOptions = {}): string {
 
 /**
  * 指定会话的数据目录（`<root>/<sessionID>`）。
+ *
+ * 双保险：① {@link isValidSessionID} 白名单拒绝 `..`/`.`/分隔符/盘符/控制字符等；
+ * ② 拼出的路径 `resolve()` 后必须严格位于数据根之内（理论上白名单已不可能越界，此处兜底防未来改动）。
  * @param sessionID 会话 id（非法时返回空串，由调用方降级）
  * @param options 路径选项
  * @returns 会话目录绝对路径；sessionID 非法时为空串
+ * @throws Error 路径包含性检查失败（越界；调用方不得执行删除）
  */
 export function autoTtsSessionDir(sessionID: string, options: AutoTtsOptions = {}): string {
   if (!isValidSessionID(sessionID)) return "";
-  return join(dataDir(options), sessionID);
+  const root = dataDir(options);
+  const dir = join(root, sessionID);
+  assertInsideRoot(root, dir);
+  return dir;
 }
 
 /**
@@ -299,8 +345,7 @@ export function readInterruptRequest(sessionID: string, options: AutoTtsOptions 
  * @returns 是否接受本次切换
  */
 export function shouldAcceptAutoTtsToggle(nowMs: number, lastEventMs: number): boolean {
-  if (!Number.isFinite(nowMs) || nowMs < 0) return false;
-  return nowMs - lastEventMs >= AUTO_TTS_TOGGLE_QUIET_MS;
+  return shouldAcceptKeyRepeat(nowMs, lastEventMs, AUTO_TTS_TOGGLE_QUIET_MS);
 }
 
 /**

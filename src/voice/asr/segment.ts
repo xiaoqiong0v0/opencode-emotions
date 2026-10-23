@@ -3,9 +3,8 @@
  *
  * 分段策略（本仓库无本地 VAD 实现，服务端 VAD 参数只对 stream 生效，故按段自建**最小能量静音切段**）：
  * - 复用 `config.vad` 两个键：`silenceDurationMs` 直接作为「连续静音多久算一句结束」；
- *   `threshold` 沿用其 [-1,1]、越高越抗噪的语义，但 server_vad 的 0.5 是**概率**口径，
- *   语音 RMS 常见量级约 0.0x，故能量口径下乘 {@link ENERGY_VAD_SCALE}（0.1）归一
- *   （默认 0.5 ≈ 能量阈值 0.05；调低 vad.threshold 即更灵敏）。
+ *   `threshold` 沿用其「越高越抗噪」的单调语义，但**不再乘比例当线性 RMS**——改为映射到 **dBFS**、
+ *   且能量按 **30ms 短帧**逐帧判定（见 {@link thresholdToDbfs} 与文件头「能量标定」）。
  * - 段边界：出现「已检测到语音 + 连续静音 ≥ silenceDurationMs」→ 切段；
  *   另有时长上限 {@link DEFAULT_MAX_SEGMENT_MS} 与体积上限（10MB base64 红线）强制切段兜底。
  * - 纯静音缓冲（从未检测到语音）在 finish/静音切段时**丢弃不发送**（识别结果必为空，省一次请求）。
@@ -19,8 +18,12 @@
 
 import { DEFAULT_VAD_SILENCE_MS, DEFAULT_VAD_THRESHOLD } from "../config.js";
 import { redact } from "../credentials.js";
+// 能量口径（RMS→dBFS）单源在 `voice/level.ts`（TTS 首尾静音裁剪复用同一口径）；此处再导出保持既有导入路径。
+import { pcmRms, rmsToDbfs } from "../level.js";
 import { buildWav, WAV_HEADER_BYTES } from "../wav.js";
 import type { AsrClient, AsrResult, AsrTransport } from "./types.js";
+
+export { pcmRms, rmsToDbfs };
 
 /** 两家按段 provider 共同的 base64 输入体积红线（10MB；阿里 qwen3-asr-flash 与 MiMo 官方一致）。 */
 export const MAX_BASE64_BYTES = 10 * 1024 * 1024;
@@ -28,8 +31,23 @@ export const MAX_BASE64_BYTES = 10 * 1024 * 1024;
 export const WAV_DATA_URL_PREFIX = "data:audio/wav;base64,";
 /** 默认单段最长时长（毫秒）：60s，远低于阿里 5 分钟上限，控制单次请求延迟与缓冲上界。 */
 export const DEFAULT_MAX_SEGMENT_MS = 60000;
-/** 能量口径下 vad.threshold 的衰减系数（见文件头「分段策略」）。 */
-export const ENERGY_VAD_SCALE = 0.1;
+/**
+ * 能量判定短帧长度（毫秒）。
+ *
+ * 根因（2026-10-22 审计实测）：采集回调是 **500ms/块**，旧实现按**整块平均 RMS** 与门限比较，
+ * 真实语声（说话块平均 RMS 实测 0.03~0.04）被整窗平均摊薄到门限（0.05）以下 ⇒ 整段静默丢弃。
+ * 语音在 20~40ms 尺度上近似平稳、在 500ms 尺度上被停顿稀释，故改按短帧判定（30ms 约一帧清音周期）。
+ */
+export const ENERGY_FRAME_MS = 30;
+/**
+ * `vad.threshold=0`（最灵敏）对应的短帧门限（dBFS）。
+ * 标定：本机静音底噪 RMS 0.00035~0.00061（≈ -69~-64 dBFS），-50 dBFS（RMS≈0.0032）仍明显高于底噪。
+ */
+export const ENERGY_DBFS_MIN = -50;
+/**
+ * `vad.threshold=1`（最抗噪）对应的短帧门限（dBFS）：RMS≈0.1，只能被近距离大声说话越过。
+ */
+export const ENERGY_DBFS_MAX = -20;
 /** 单段 HTTP 超时（毫秒）。 */
 export const SEGMENT_HTTP_TIMEOUT_MS = 60000;
 
@@ -43,19 +61,21 @@ export function maxWavBytesForBase64(maxBase64Bytes: number = MAX_BASE64_BYTES):
 }
 
 /**
- * 计算 16bit PCM 分片的 RMS（归一到 [0,1]，与 config.vad.threshold 的 [-1,1] 量级可比）。
- * @param pcm s16le 字节流
- * @returns RMS；空分片返回 0
+ * 把 `vad.threshold`（[0,1]，**越高越抗噪**，保持原单调语义）映射为短帧 RMS 的 dBFS 门限。
+ *
+ * 标定依据（2026-10-22 本机实测）：静音底噪 RMS 0.00035~0.00061（≈ -69~-64 dBFS）；
+ * 说话时 **500ms 采集块平均** RMS 0.03~0.04（≈ -30~-28 dBFS），30ms 短帧通常再高 6~12dB。
+ * 映射区间取 [-50, -20] dBFS：默认 0.5 → **-35 dBFS（RMS≈0.0178）**，
+ * 既让 0.035 平均 RMS 的语声稳定越过门限（回归用例锁定），又把 -64 dBFS 的底噪挡在门外；
+ * 调到 1 → -20 dBFS（需大声/近距离），调到 0 → -50 dBFS（更灵敏但仍高于底噪）。
+ * @param threshold vad.threshold（越界夹到 [0,1]；非有限值回退默认阈值）
+ * @returns 短帧门限（dBFS）
  */
-export function pcmRms(pcm: Buffer): number {
-  const count = Math.floor(pcm.length / 2);
-  if (count === 0) return 0;
-  let sum = 0;
-  for (let i = 0; i < count; i += 1) {
-    const sample = pcm.readInt16LE(i * 2) / 32768;
-    sum += sample * sample;
-  }
-  return Math.sqrt(sum / count);
+export function thresholdToDbfs(threshold: number): number {
+  const normalized = Number.isFinite(threshold)
+    ? Math.min(1, Math.max(0, threshold))
+    : DEFAULT_VAD_THRESHOLD;
+  return ENERGY_DBFS_MIN + normalized * (ENERGY_DBFS_MAX - ENERGY_DBFS_MIN);
 }
 
 /**
@@ -111,7 +131,8 @@ export abstract class SegmentAsrClientBase implements AsrClient {
   readonly transport: AsrTransport = "segment";
   protected readonly sampleRate: number;
   protected readonly fetchImpl: typeof fetch;
-  private readonly energyThreshold: number;
+  /** 短帧能量门限（dBFS；由 vad.threshold 单调映射，见 thresholdToDbfs）。 */
+  private readonly energyDbfs: number;
   private readonly silenceDurationMs: number;
   private readonly maxSegmentMs: number;
   private readonly maxWavBytes: number;
@@ -146,7 +167,7 @@ export abstract class SegmentAsrClientBase implements AsrClient {
     this.fetchImpl = options.fetchImpl ?? fetch;
     const threshold = options.vad?.threshold ?? DEFAULT_VAD_THRESHOLD;
     const silence = options.vad?.silenceDurationMs ?? DEFAULT_VAD_SILENCE_MS;
-    this.energyThreshold = Math.max(0, threshold * ENERGY_VAD_SCALE);
+    this.energyDbfs = thresholdToDbfs(threshold);
     this.silenceDurationMs = Math.max(1, silence);
     this.maxSegmentMs = Math.max(1000, options.maxSegmentMs ?? DEFAULT_MAX_SEGMENT_MS);
     this.maxWavBytes = maxWavBytesForBase64(options.maxBase64Bytes ?? MAX_BASE64_BYTES);
@@ -262,16 +283,23 @@ export abstract class SegmentAsrClientBase implements AsrClient {
   }
 
   /**
-   * 按当前块更新语音/静音状态（块级 RMS 与能量阈值比较）。
+   * 按当前块更新语音/静音状态：**按 30ms 短帧逐帧**结算（不是整块平均）。
+   *
+   * 这样既不会被 500ms 的停顿把你一句短话「平均掉」，静音计时也精确到帧（`silenceDurationMs`
+   * 不再被量化成整块时长）；帧级判定口径见 `thresholdToDbfs` 的标定数据。
    * @param pcm 本块 PCM
    */
   private updateVoiceState(pcm: Buffer): void {
-    const chunkMs = (Math.floor(pcm.length / 2) / this.sampleRate) * 1000;
-    if (pcmRms(pcm) >= this.energyThreshold) {
-      this.hasVoice = true;
-      this.silenceMs = 0;
-    } else {
-      this.silenceMs += chunkMs;
+    const frameBytes = Math.max(2, Math.floor((this.sampleRate * ENERGY_FRAME_MS) / 1000) * 2);
+    for (let offset = 0; offset < pcm.length; offset += frameBytes) {
+      const frame = pcm.subarray(offset, Math.min(offset + frameBytes, pcm.length));
+      const frameMs = (Math.floor(frame.length / 2) / this.sampleRate) * 1000;
+      if (rmsToDbfs(pcmRms(frame)) >= this.energyDbfs) {
+        this.hasVoice = true;
+        this.silenceMs = 0;
+      } else {
+        this.silenceMs += frameMs;
+      }
     }
   }
 

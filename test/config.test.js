@@ -26,6 +26,8 @@ import {
   LEGACY_ENV_CONFIG_DIR,
   legacyVoiceConfigPath,
   loadVoiceConfig,
+  loadVoiceConfigWithWarnings,
+  describeJsonError,
   resolveAsrParams,
   resolveAsrProvider,
   voiceConfigPath,
@@ -585,4 +587,53 @@ test("resolveAsrParams：按 provider 能力过滤并记录被忽略键", () => 
     context: "",
   });
   assert.deepEqual(none.ignored, [], "未设置任何增强参数时不报忽略");
+});
+
+// ==================== 审计修复（2026-10-22）：原型链 provider / 坏 JSON 可见告警 ====================
+
+test("asProvider：`toString`/`constructor` 等原型链键不得命中原型属性，回退默认并告警", () => {
+  const dir = tempDir();
+  try {
+    for (const bad of ["toString", "constructor", "__proto__", "hasOwnProperty"]) {
+      writeFileSync(join(dir, CONFIG_FILE_NAME), JSON.stringify({ asr: { provider: bad } }), "utf8");
+      const { config, warnings } = loadVoiceConfigWithWarnings({ configDir: dir, env: {} });
+      assert.equal(config.asr.provider, DEFAULT_ASR_PROVIDER, `${bad} 必须回退默认 provider`);
+      assert.equal(typeof resolveAsrProvider(bad).transport, "string", `${bad} 解析结果必须是真实预设`);
+      const unknown = warnings.filter((warning) => warning.kind === "unknown-provider");
+      assert.equal(unknown.length, 1, `${bad} 必须产生一条可见告警`);
+      assert.match(unknown[0].message, new RegExp(`未知 asr.provider="${bad}"`));
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("坏 JSON：返回默认配置 + parse-error 告警（含行/列/偏移），且不覆盖原文件", () => {
+  const dir = tempDir();
+  try {
+    const path = join(dir, CONFIG_FILE_NAME);
+    const broken = '{\n  "uiLanguage": "zh",\n  "tts": { "provider": "aliyun",\n}';
+    writeFileSync(path, broken, "utf8");
+    const loaded = loadVoiceConfigWithWarnings({ configDir: dir, env: {} });
+    assert.deepEqual(loaded.config, DEFAULT_VOICE_CONFIG, "解析失败回退默认");
+    const parseWarnings = loaded.warnings.filter((warning) => warning.kind === "parse-error");
+    assert.equal(parseWarnings.length, 1);
+    assert.match(parseWarnings[0].message, /第 \d+ 行第 \d+ 列（偏移 \d+）/, "必须给出行/列/字符偏移");
+    assert.equal(readFileSync(path, "utf8"), broken, "绝不重写用户原文件");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("describeJsonError：把 JSONC 解析错误换算成原文行/列/偏移（无位置时退回原文消息）", () => {
+  const text = '{\n  "a": ,\n}';
+  let error;
+  try {
+    parseJsonc(text);
+  } catch (caught) {
+    error = caught;
+  }
+  const described = describeJsonError(error, text);
+  assert.match(described, /第 \d+ 行第 \d+ 列（偏移 \d+）/);
+  assert.equal(describeJsonError(new Error("plain failure"), text), "plain failure");
 });

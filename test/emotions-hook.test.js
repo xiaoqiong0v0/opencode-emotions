@@ -50,6 +50,8 @@ test("chat.message：按 input.sessionID 隔离打断（跨会话保留条目、
     assert.equal(typeof emotions.server, "function", "默认导出含 server 工厂");
     const hooks = await emotions.server({ client: {} });
     assert.equal(typeof hooks["chat.message"], "function", "chat.message 钩子存在");
+    assert.equal(typeof hooks.dispose, "function", "dispose 钩子存在（清场：取消预取/朗读子进程）");
+    await hooks.dispose();
 
     // ① 跨会话消息（另一窗口新会话）→ 不杀不清：条目原样保留（误杀修复的核心断言）
     await hooks["chat.message"]({ sessionID: "ses_other", client: {} }, {});

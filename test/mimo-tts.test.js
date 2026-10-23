@@ -8,10 +8,14 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import {
   DEFAULT_PROVIDER,
   MiMoProvider,
+  PcmFileSink,
   buildMimoMessages,
   buildMimoRequestBody,
   extractMimoAudioPcm,
@@ -31,6 +35,7 @@ import {
 } from "../dist/voice/tts/mimo.js";
 import { ENV_MIMO_API_KEY, resolveMimoApiKey } from "../dist/voice/credentials.js";
 import { DEFAULT_VOICE_CONFIG } from "../dist/voice/config.js";
+import { parseWav } from "../dist/voice/wav.js";
 import { TTS_PROVIDER_CAPABILITIES, resolveTtsConfig } from "../dist/voice/tts/types.js";
 
 /** 完整的 ResolvedTtsOptions（provider 入参契约）。 */
@@ -246,4 +251,48 @@ test("speak 接线：provider=mimo 缺 Key 时在 speak() 入口即抛清晰错�
     () => speak({ text: "测试" }, { env: {}, config }),
     /未配置 MiMo 凭证/,
   );
+});
+
+test("MiMoProvider：sinkFactory 只合成不出声（PcmFileSink 落盘、不选播放器）", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "oc-mimo-pcm-"));
+  const path = join(dir, "mimo.wav");
+  const originalFetch = globalThis.fetch;
+  const pcm = Buffer.alloc(2400, 0x22);
+  const sse = [
+    `data: ${JSON.stringify({ choices: [{ delta: { audio: { data: pcm.subarray(0, 1000).toString("base64") } } }] })}`,
+    "",
+    `data: ${JSON.stringify({ choices: [{ delta: { audio: { data: pcm.subarray(1000).toString("base64") } } }] })}`,
+    "",
+    "data: [DONE]",
+    "",
+    "",
+  ].join("\n");
+  globalThis.fetch = async () =>
+    new Response(new ReadableStream({ start(controller) {
+      controller.enqueue(new TextEncoder().encode(sse));
+      controller.close();
+    } }), { status: 200 });
+  const provider = new MiMoProvider();
+  try {
+    assert.equal(provider.pcmOutputSupport, true, "MiMo 音频帧经 AudioSink ⇒ 支持预取");
+    let factoryRate = 0;
+    const result = provider.speak({
+      ...fullOptions({ text: "你好" }),
+      mimoApiKey: "test-key",
+      sinkFactory: (sampleRate) => {
+        factoryRate = sampleRate;
+        return new PcmFileSink(path, sampleRate);
+      },
+    });
+    await result.done;
+    assert.equal(factoryRate, MIMO_SAMPLE_RATE);
+    const parsed = parseWav(readFileSync(path));
+    assert.equal(parsed.sampleRate, MIMO_SAMPLE_RATE);
+    assert.equal(parsed.bitsPerSample, 16);
+    assert.equal(parsed.data.length, pcm.length, "两个 SSE chunk 的 PCM 全部落盘（与直播同一合成链路）");
+  } finally {
+    globalThis.fetch = originalFetch;
+    provider.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

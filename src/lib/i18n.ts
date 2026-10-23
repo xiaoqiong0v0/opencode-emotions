@@ -64,10 +64,16 @@ export interface CliPhrases {
   speakSkipped: string;
   /** `--follow` 被不支持的 provider 拒绝（占位符：provider）。 */
   followUnsupported: string;
+  /** `--pcm-out` 被不支持的 provider 拒绝（占位符：provider）。 */
+  pcmUnsupported: string;
+  /** `--pcm-file` 文件头非法/不可读（占位符：message）。 */
+  pcmFileInvalid: string;
   /** 无音频输入设备。 */
   noDevices: string;
   /** 设备列表标题。 */
   devicesHeader: string;
+  /** 配置文件解析失败提示（占位符：message，含行/列/偏移）。 */
+  configInvalid: string;
 }
 
 /** 模式标签（完整名，用于 toast/命令标题）。 */
@@ -104,6 +110,8 @@ export interface ToastPhrases {
   autoReadChildSession: string;
   /** F10 双态中断：本次按键只中断正在播放的朗读、开关状态未变（2026-10-22）。 */
   autoReadInterrupted: string;
+  /** 配置文件解析失败（占位符：message，含行/列/偏移；已回退默认、不改原文件）。 */
+  configInvalid: string;
 }
 
 /** 命令（keymap command）文案。 */
@@ -140,6 +148,8 @@ const HELP_ZH = [
   "  speak --follow [--emotion <情绪>] [--voice <音色>] [--rate <语速>] [--provider <sapi|...>]",
   "        常驻模式：从 stdin 按行读 UTF-8 文本连续朗读（每行一块，空行跳过），EOF 收尾退出；",
   "        与 --text/--text-file 互斥；provider 需支持 follow（目前 sapi）。",
+  "  speak --text <文本> --pcm-out <文件>   只合成不出声：把 16bit PCM（WAV）写入文件（自动朗读预取用）。",
+  "  speak --pcm-file <文件> [--await-go]  播放 PCM 文件（预取交播；--await-go 先预热、等 stdin 一行 go）。",
   "  devices  列出本机音频输入设备",
   "  status   查看解析后的语音配置（含语言）",
   "  help     显示本帮助",
@@ -170,6 +180,8 @@ const HELP_EN = [
   "  speak --follow [--emotion <name>] [--voice <name>] [--rate <n>] [--provider <sapi|...>]",
   "        Follow mode: read UTF-8 lines from stdin and speak them continuously (one chunk per line, blank lines skipped),",
   "        exits on EOF; mutually exclusive with --text/--text-file; the provider must support follow (currently sapi).",
+  "  speak --pcm-out <file> ...   Synthesize only, write 16-bit PCM (WAV) to <file>; used by auto-read prefetch.",
+  "  speak --pcm-file <file> [--await-go]   Play a PCM file (prewarmed; --await-go waits for a \"go\" line on stdin).",
   "  devices  List local audio input devices",
   "  status   Show resolved voice config (incl. language)",
   "  help     Show this help",
@@ -206,8 +218,11 @@ export const PHRASES: Readonly<Record<Language, Phrases>> = {
       speakFailed: "朗读失败：{message}",
       speakSkipped: "朗读跳过：文本为空",
       followUnsupported: "朗读失败：provider={provider} 不支持 --follow 常驻模式（当前仅 sapi 支持）",
+    pcmUnsupported: "朗读失败：provider={provider} 不支持 --pcm-out 只合成模式（当前仅 mimo/aliyun 支持）",
+    pcmFileInvalid: "朗读失败：PCM 文件不可用（{message}）",
       noDevices: "未发现音频输入设备（Windows 需 ffmpeg dshow 可用）",
       devicesHeader: "音频输入设备：",
+      configInvalid: "配置解析失败：{message}（已使用默认值，原文件未修改）",
     },
     label: { inject: "语音注入", input: "语音输入" },
     toast: {
@@ -230,6 +245,7 @@ export const PHRASES: Readonly<Record<Language, Phrases>> = {
       autoReadFailed: "切换自动朗读失败（无法写入状态文件）",
       autoReadChildSession: "子会话不自动朗读",
       autoReadInterrupted: "已中断播放（朗读开关状态未变）",
+      configInvalid: "配置文件解析失败：{message}（已使用默认值，原文件未修改）",
     },
     command: {
       injectTitle: "语音：注入开关 ({key})",
@@ -257,8 +273,11 @@ export const PHRASES: Readonly<Record<Language, Phrases>> = {
       speakFailed: "Speech failed: {message}",
       speakSkipped: "Skipped speaking: empty text",
       followUnsupported: "Speech failed: provider={provider} does not support --follow mode (only sapi does)",
+    pcmUnsupported: "Speech failed: provider={provider} does not support --pcm-out synthesis (only mimo/aliyun do)",
+    pcmFileInvalid: "Speech failed: PCM file unusable ({message})",
       noDevices: "No audio input device found (Windows requires ffmpeg dshow)",
       devicesHeader: "Audio input devices:",
+      configInvalid: "Config parse failed: {message} (using defaults; your file was not modified)",
     },
     label: { inject: "Voice inject", input: "Voice input" },
     toast: {
@@ -281,6 +300,7 @@ export const PHRASES: Readonly<Record<Language, Phrases>> = {
       autoReadFailed: "Failed to toggle auto-read (cannot write state file)",
       autoReadChildSession: "Auto-read is disabled for subagent (child) sessions",
       autoReadInterrupted: "Playback interrupted (auto-read toggle unchanged)",
+      configInvalid: "Config parse failed: {message} (using defaults; your file was not modified)",
     },
     command: {
       injectTitle: "Voice: inject toggle ({key})",

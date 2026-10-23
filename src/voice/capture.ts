@@ -53,6 +53,33 @@ const TERMUX_RECORD_MARGIN_MS = 400;
 /** Termux 录音/解码失败时对用户的安装提示。 */
 export const TERMUX_MIC_HINT = `请执行 pkg install termux-api，并在手机上安装 Termux:API 应用（命令 ${TERMUX_MIC_BIN}）`;
 
+/**
+ * 判定采集进程退出是否属「异常失败」，并生成给用户的错误文本。
+ *
+ * 口径（2026-10-22 审计根因）：采集进程以**非 0 退出码 / 异常信号**结束，或整段**0 字节音频**，
+ * 都不能当作「用户没说话」——必须上报 `error` 并以非 0 退出码结束。旧行为只在 stderr 打一行
+ * `[采集结束] 退出码=…` 后继续等信号（假 `ready` + `level:0` 刷屏 + 永久挂住）。
+ * @param code 采集子进程退出码（null = 被信号/未知）
+ * @param bytes 本次已采集的 PCM 字节数
+ * @param diagnostics 采集进程 stderr 尾部（诊断用，调用方已限长）
+ * @returns 失败文本；正常结束（退出码 0 且读到过音频）返回 null
+ */
+export function formatCaptureExitFailure(
+  code: number | null,
+  bytes: number,
+  diagnostics: string,
+): string | null {
+  const codeLabel = code === null ? "signal/unknown" : String(code);
+  const detail = diagnostics.trim().slice(-800);
+  if (bytes === 0) {
+    return `未采集到任何音频（采集进程退出码=${codeLabel}）${detail ? `；stderr：${detail}` : ""}`;
+  }
+  if (code !== 0) {
+    return `采集进程异常退出（退出码=${codeLabel}，已采集 ${bytes} 字节）${detail ? `；stderr：${detail}` : ""}`;
+  }
+  return null;
+}
+
 /** 音频输入设备。 */
 export interface AudioDevice {
   /** 友好名（喂给 ffmpeg dshow 的名字）。 */

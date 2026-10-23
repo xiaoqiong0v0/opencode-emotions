@@ -4,9 +4,11 @@
  * 覆盖：空（从未活跃）→ 放；播放活跃 → 拦；播放结束 300ms（尾音窗口内）→ 拦；结束 600ms（窗口已过）→ 放；
  * 窗口边界（恰好 tailMs 放、差 1ms 拦）；窗口起点随活跃刷新；时钟回拨（保守拦）；非法时刻 / `tailMs<=0`（放）；
  * `tailMs` 缺省 = `ASR_GATE_TAIL_MS`；
- * **归属口径边界**（真值取自 helper、临时目录注入、`isAlive` 注入不真探进程）：其它会话有活跃播放 →
+ * **归属口径边界**（真值取自 helper、临时目录注入、`isAlive` 注入不真探进程）：其它会话有**存活**播放 →
  * 传**本会话 id** 判假 ⇒ 门放行；传哨兵键 `_`（TUI 无会话路由时的口径）同样判假；传**空串**才为真
  * （本门不使用空串口径，此处钉死差异，防止改用空 sessionID 越界读其它会话）；无主条目任何会话都算 → 拦。
+ * **活跃口径（审计 P1，2026-10-22）**：新鲜 ≠ 活跃——判活以 pid 存活为准，判死条目当场清理；
+ * 仅无 pid 的条目用 ≤15s 短 TTL，探测异常一律 fail-open（不阻断）。
  * 产物接线断言见 `test/tui-diagnostics.test.js`。
  */
 
@@ -78,8 +80,8 @@ test("静音门：归属口径边界——其它会话的活跃播放不算（he
   const dir = mkdtempSync(join(tmpdir(), "asr-gate-"));
   try {
     const opts = { dataDir: dir, now: () => T };
-    // 只有**其它会话**（ses_other）在播；isAlive 恒 false ⇒ 活跃性来自「条目新鲜」而非真探进程
-    const inject = { isAlive: () => false };
+    // 只有**其它会话**（ses_other）在播；isAlive 恒 true ⇒ 该条目确实活跃（判活以进程存活为准，不看新鲜）
+    const inject = { isAlive: () => true };
     assert.equal(writePlayback({ pid: 4242, provider: "aliyun", startedAt: T, kind: "speak", sessionID: "ses_other" }, opts), true);
 
     // ① 传本会话 id：不算其它会话 → 判假 → 门放行（正题：跨会话不误拦）
@@ -101,7 +103,7 @@ test("静音门：无主（手动 speak）播放算本会话可见 → 拦", () 
   try {
     const opts = { dataDir: dir, now: () => T };
     assert.equal(writePlayback({ pid: 4343, provider: "sapi", startedAt: T, kind: "speak" }, opts), true);
-    const active = isInterruptablePlaybackActive("ses_self", T, { ...opts, isAlive: () => false });
+    const active = isInterruptablePlaybackActive("ses_self", T, { ...opts, isAlive: () => true });
     assert.equal(active, true, "无主条目任何会话都算（与 stopPlayback 同口径）");
     assert.equal(shouldDropAsrFinal(active, T, T, ASR_GATE_TAIL_MS), true);
   } finally {

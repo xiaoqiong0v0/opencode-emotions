@@ -21,9 +21,12 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
+import createLogger from "@xiaoqiong0v0/opencode-plugin-logger";
+import type { Logger } from "@xiaoqiong0v0/opencode-plugin-logger";
+
 import { resolveConfigDir } from "../lib/config-dir.js";
 import { DEFAULT_LANGUAGE, resolveLanguage, type Language } from "../lib/i18n.js";
-import { parseJsonc } from "../lib/jsonc.js";
+import { getJsoncErrorOffset, parseJsonc } from "../lib/jsonc.js";
 import { DEFAULT_STREAM_MIN_CHARS } from "./tts/stream.js";
 import {
   DEFAULT_PROVIDER as DEFAULT_TTS_PROVIDER,
@@ -75,6 +78,8 @@ export const ENV_ASR_LANGUAGE_HINTS = "VOICE_ASR_LANGUAGE_HINTS";
 export const ENV_ASR_VOCABULARY_ID = "VOICE_ASR_VOCABULARY_ID";
 /** ASR 领域上下文覆盖环境变量。 */
 export const ENV_ASR_CONTEXT = "VOICE_ASR_CONTEXT";
+
+const log: Logger = createLogger("config");
 
 /** ASR provider 标识。 */
 export type AsrProviderId = "aliyun-qwen" | "aliyun-8k" | "aliyun-v2" | "aliyun-qwen-file" | "mimo";
@@ -399,13 +404,42 @@ export interface LoadVoiceConfigOptions {
   env?: NodeJS.ProcessEnv;
 }
 
+/** 配置告警类型：解析失败 / 未知 provider（回退默认）。 */
+export type ConfigWarningKind = "parse-error" | "unknown-provider";
+
+/**
+ * 一条**不阻断**的配置告警（加载仍成功，但用户需要知道配置没按原样生效）。
+ */
+export interface ConfigWarning {
+  /** 告警类型。 */
+  kind: ConfigWarningKind;
+  /** 配置文件绝对路径。 */
+  path: string;
+  /** 面向用户的说明（解析失败时含行/列/字符偏移）。 */
+  message: string;
+}
+
+/** 带告警的配置加载结果。 */
+export interface LoadedVoiceConfig {
+  /** 归一化后的配置（失败项回退默认值）。 */
+  config: VoiceConfig;
+  /** 本次加载产生的告警（空数组 = 完全按文件/环境生效）。 */
+  warnings: ConfigWarning[];
+}
+
 /**
  * 解析 provider 预设；未知标识回退到默认 provider。
+ *
+ * **只认自有键**（`Object.hasOwn`）：旧实现用 `id as AsrProviderId` 直接索引，
+ * `provider:"toString"` 会命中原型链上的 `Object.prototype.toString`（返回函数、`transport/sampleRate`
+ * 全 undefined），后续按 undefined 采样率构造客户端，错误信息完全指不到根因（审计 P2）。
  * @param id provider 标识
  * @returns provider 预设
  */
 export function resolveAsrProvider(id: string): AsrProviderPreset {
-  const preset = ASR_PROVIDER_PRESETS[id as AsrProviderId];
+  const preset = Object.hasOwn(ASR_PROVIDER_PRESETS, id)
+    ? ASR_PROVIDER_PRESETS[id as AsrProviderId]
+    : undefined;
   return preset ?? ASR_PROVIDER_PRESETS[DEFAULT_ASR_PROVIDER];
 }
 
@@ -471,25 +505,45 @@ export function legacyVoiceConfigPath(options: { configDir?: string } = {}): str
 }
 
 /**
- * 加载语音配置：旧名迁移 → 文件缺失则写默认，读取失败静默降级，最后叠加环境变量。
+ * 加载语音配置：旧名迁移 → 文件缺失则写默认，解析失败回退默认（**可见告警、不覆盖原文件**），
+ * 最后叠加环境变量。
  * @param options 选项（configDir/env）
- * @returns 归一化后的配置
+ * @returns 归一化后的配置（丢弃告警；需要提示用户时用 {@link loadVoiceConfigWithWarnings}）
  */
 export function loadVoiceConfig(options: LoadVoiceConfigOptions = {}): VoiceConfig {
+  return loadVoiceConfigWithWarnings(options).config;
+}
+
+/**
+ * 加载语音配置并返回**不阻断的告警**（供 TUI/CLI 提示用户）。
+ *
+ * 解析失败时：返回默认配置 + `parse-error` 告警（含行/列/字符偏移），并写一条日志；
+ * **绝不重写用户原文件**。未知 provider → `unknown-provider` 告警并回退文档默认值。
+ * @param options 选项（configDir/env）
+ * @returns 配置 + 告警列表
+ */
+export function loadVoiceConfigWithWarnings(options: LoadVoiceConfigOptions = {}): LoadedVoiceConfig {
   const env = options.env ?? process.env;
   const path = voiceConfigPath({ ...options, env });
+  const warnings: ConfigWarning[] = [];
   let fileConfig: VoiceConfig;
   if (!existsSync(path)) {
     // 旧文件名迁移成功则直接读新文件（保留用户已改的值）；否则写一份默认
-    if (migrateLegacyConfig(path)) fileConfig = readConfigFile(path);
+    if (migrateLegacyConfig(path)) fileConfig = readConfigFile(path, warnings);
     else {
       writeDefaultConfig(path);
       fileConfig = DEFAULT_VOICE_CONFIG;
     }
   } else {
-    fileConfig = readConfigFile(path);
+    fileConfig = readConfigFile(path, warnings);
   }
-  return applyEnvOverrides(fileConfig, env);
+  const config = applyEnvOverrides(fileConfig, env, (kind, message) => {
+    warnings.push({ kind, path, message });
+  });
+  for (const warning of warnings) {
+    log.warn(`语音配置告警（${warning.kind}）：${warning.message} path=${warning.path}`);
+  }
+  return { config, warnings };
 }
 
 /**
@@ -510,15 +564,74 @@ function migrateLegacyConfig(targetPath: string): boolean {
   }
 }
 
+/** 配置归一化过程中的告警回调（收集未知 provider 等）。 */
+type ConfigWarnSink = (kind: ConfigWarningKind, message: string) => void;
+
 /**
- * 读取并归一化配置文件；任何失败都静默返回默认配置。
+ * 定位 JSON 解析错误（行/列/字符偏移），并生成可操作的中文说明。
+ *
+ * Node 的 `SyntaxError.message` 在不同版本可能带 `at position N (line L column C)` 或不带位置；
+ * 这里优先解析 `position`（字符偏移），没有则解析 `line/column`，再退化到只带原文消息。
+ * @param error 解析抛出的异常
+ * @param text 被解析的原文（用于把偏移换算成行列）
+ * @returns 形如 `第 3 行第 12 列（偏移 45）：Unexpected token ...`
+ */
+export function describeJsonError(error: unknown, text: string): string {
+  const message = error instanceof Error ? error.message : String(error);
+  // 首选 jsonc 层换算好的**原文**偏移（剥离注释/尾逗号后仍能指回用户文件）
+  const jsoncOffset = getJsoncErrorOffset(error);
+  if (jsoncOffset !== undefined) {
+    return `${describeOffset(text, jsoncOffset)}：${message}`;
+  }
+  const position = /at position (\d+)/i.exec(message);
+  const lineColumn = /at line (\d+) column (\d+)/i.exec(message);
+  if (position) return `${describeOffset(text, Number(position[1]))}：${message}`;
+  if (lineColumn) return `第 ${Number(lineColumn[1])} 行第 ${Number(lineColumn[2])} 列：${message}`;
+  return message;
+}
+
+/**
+ * 把字符偏移换算成「第 N 行第 M 列（偏移 K）」。
+ * @param text 原文
+ * @param offset 字符偏移（可超出末尾，按末尾处理）
+ * @returns 可读位置
+ */
+function describeOffset(text: string, offset: number): string {
+  const safe = Math.max(0, Math.min(offset, text.length));
+  const before = text.slice(0, safe);
+  const line = before.split(/\r\n|\r|\n/).length;
+  const lastBreak = Math.max(before.lastIndexOf("\n"), before.lastIndexOf("\r"));
+  const column = safe - lastBreak;
+  return `第 ${line} 行第 ${column} 列（偏移 ${safe}）`;
+}
+
+/**
+ * 读取并归一化配置文件。
+ *
+ * 解析失败**不再静默**：收集 `parse-error` 告警（含行/列/偏移）并回退默认配置；
+ * 只读原文、**绝不写回**（用户文件保持原样）。读取失败（无权限等）同样回退默认且不覆盖。
  * @param path 配置文件路径
+ * @param warnings 告警收集器（原地追加）
  * @returns 归一化配置
  */
-function readConfigFile(path: string): VoiceConfig {
+function readConfigFile(path: string, warnings: ConfigWarning[]): VoiceConfig {
+  let text: string;
   try {
-    return normalizeConfig(parseJsonc(readFileSync(path, "utf8")));
-  } catch {
+    text = readFileSync(path, "utf8");
+  } catch (error) {
+    warnings.push({
+      kind: "parse-error",
+      path,
+      message: `无法读取配置文件：${error instanceof Error ? error.message : String(error)}`,
+    });
+    return DEFAULT_VOICE_CONFIG;
+  }
+  try {
+    return normalizeConfig(parseJsonc(text), (kind, message) => {
+      warnings.push({ kind, path, message });
+    });
+  } catch (error) {
+    warnings.push({ kind: "parse-error", path, message: describeJsonError(error, text) });
     return DEFAULT_VOICE_CONFIG;
   }
 }
@@ -567,19 +680,31 @@ function clamp(value: number, min: number, max: number): number {
   return value;
 }
 
-/** 校验 provider 标识。 */
-function asProvider(value: unknown): AsrProviderId {
-  return typeof value === "string" && value in ASR_PROVIDER_PRESETS
-    ? (value as AsrProviderId)
-    : DEFAULT_ASR_PROVIDER;
+/**
+ * 校验 provider 标识（**自有键白名单**，不得命中原型链）。
+ *
+ * 未知字符串会被明确告警并回退文档默认值；缺失/非字符串直接回退，不告警（未配置是正常状态）。
+ * @param value 原始值
+ * @param warn 告警回调（未知 provider 时调用）
+ * @returns 合法 provider 或默认值
+ */
+function asProvider(value: unknown, warn?: ConfigWarnSink): AsrProviderId {
+  if (typeof value !== "string") return DEFAULT_ASR_PROVIDER;
+  if (Object.hasOwn(ASR_PROVIDER_PRESETS, value)) return value as AsrProviderId;
+  warn?.(
+    "unknown-provider",
+    `未知 asr.provider=${JSON.stringify(value)}，已回退默认 ${DEFAULT_ASR_PROVIDER}（可用：${Object.keys(ASR_PROVIDER_PRESETS).join(", ")}）`,
+  );
+  return DEFAULT_ASR_PROVIDER;
 }
 
 /**
  * 把任意解析结果归一化为完整配置（缺字段/类型不符逐项回退默认）。
  * @param raw 解析结果
+ * @param warn 告警回调（未知 provider 等）
  * @returns 完整配置
  */
-function normalizeConfig(raw: unknown): VoiceConfig {
+function normalizeConfig(raw: unknown, warn?: ConfigWarnSink): VoiceConfig {
   if (!isRecord(raw)) return DEFAULT_VOICE_CONFIG;
   const asr = isRecord(raw.asr) ? raw.asr : {};
   const vad = isRecord(raw.vad) ? raw.vad : {};
@@ -595,7 +720,7 @@ function normalizeConfig(raw: unknown): VoiceConfig {
     toolLanguage: resolveLanguage(asString(raw.toolLanguage, legacyLanguage)),
     device: asString(raw.device, DEFAULT_VOICE_CONFIG.device),
     asr: {
-      provider: asProvider(asr.provider),
+      provider: asProvider(asr.provider, warn),
       model: asString(asr.model, DEFAULT_VOICE_CONFIG.asr.model),
       language: asString(asr.language, DEFAULT_VOICE_CONFIG.asr.language),
       languageHints: asStringArray(asr.languageHints, DEFAULT_VOICE_CONFIG.asr.languageHints),
@@ -647,7 +772,11 @@ function normalizeConfig(raw: unknown): VoiceConfig {
  * @param env 环境变量表
  * @returns 覆盖后的配置
  */
-function applyEnvOverrides(config: VoiceConfig, env: NodeJS.ProcessEnv): VoiceConfig {
+function applyEnvOverrides(
+  config: VoiceConfig,
+  env: NodeJS.ProcessEnv,
+  warn?: ConfigWarnSink,
+): VoiceConfig {
   const out: VoiceConfig = {
     uiLanguage: config.uiLanguage,
     toolLanguage: config.toolLanguage,
@@ -676,7 +805,7 @@ function applyEnvOverrides(config: VoiceConfig, env: NodeJS.ProcessEnv): VoiceCo
   const tool = text(ENV_TOOL_LANGUAGE) ?? legacyEnvLanguage;
   if (tool !== undefined) out.toolLanguage = resolveLanguage(tool);
   const provider = text(ENV_ASR_PROVIDER);
-  if (provider !== undefined) out.asr.provider = asProvider(provider);
+  if (provider !== undefined) out.asr.provider = asProvider(provider, warn);
   const model = text(ENV_ASR_MODEL);
   if (model !== undefined) out.asr.model = model;
   const language = text(ENV_ASR_LANGUAGE);

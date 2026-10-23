@@ -55,6 +55,8 @@ export interface TermuxProviderOptions {
   platform?: NodeJS.Platform;
   /** 命令可用性探测；默认按绝对路径判定。 */
   isAvailable?: (bin: string) => boolean;
+  /** spawn 实现；默认 `node:child_process.spawn`（测试注入假子进程）。 */
+  spawn?: typeof spawn;
 }
 
 /**
@@ -98,21 +100,27 @@ export class TermuxProvider implements TtsProvider {
   private readonly env: NodeJS.ProcessEnv;
   private readonly platform: NodeJS.Platform;
   private readonly isAvailable: (bin: string) => boolean;
+  private readonly spawnFn: typeof spawn;
   private child: ChildProcess | null = null;
 
   /**
-   * @param options 可注入依赖（env/platform/探测；缺省用生产默认）
+   * @param options 可注入依赖（env/platform/探测/spawn；缺省用生产默认）
    */
   constructor(options: TermuxProviderOptions = {}) {
     this.env = options.env ?? process.env;
     this.platform = options.platform ?? process.platform;
     this.isAvailable = options.isAvailable ?? ((bin: string) => commandExists(bin, this.env, this.platform));
+    this.spawnFn = options.spawn ?? spawn;
   }
 
   /**
    * 后台开始朗读：立即返回（不等待播放完成）；内部先打断上一次。
+   *
+   * `done` 在 `termux-tts-speak` 子进程真正退出后 settle：正常退出 resolve、被 `stop()`/新一次
+   * `speak()` 打断也 resolve（有意停止）、非 0 退出/无法启动则 reject 可识别错误。
+   * （Termux API 的该命令在系统 TTS 播完后才返回，故进程退出即约等于播放结束。）
    * @param options 解析后的朗读参数
-   * @returns 本次朗读的启动结果
+   * @returns 本次朗读的启动结果（含 `done`）
    * @throws Error 非 Termux / 文本为空 / 未安装 termux-api
    */
   speak(options: ResolvedTtsOptions): SpeakResult {
@@ -127,11 +135,12 @@ export class TermuxProvider implements TtsProvider {
       throw new Error(`未找到 ${TERMUX_TTS_BIN}：${TERMUX_TTS_HINT}`);
     }
     this.stop();
-    this.spawnPlayer(bin, buildTermuxTtsArgs(options, this.env));
+    const done = this.startPlayer(bin, buildTermuxTtsArgs(options, this.env));
     return {
       provider: this.name,
       voice: options.voice || DEFAULT_VOICE_LABEL,
       rate: clampRate(options.rate, DEFAULT_RATE),
+      done,
     };
   }
 
@@ -147,29 +156,56 @@ export class TermuxProvider implements TtsProvider {
   }
 
   /**
-   * 启动 `termux-tts-speak`（可被 stop 打断）。
+   * 启动 `termux-tts-speak`（可被 stop 打断），并返回「本次播放真正结束」的 Promise。
+   *
+   * settle 语义与 `SpeakResult.done` 契约一致：正常退出/被顶替 resolve，非 0 退出或启动失败 reject。
    * @param bin 命令绝对路径
    * @param args 命令参数
+   * @returns 播放结束（成功/有意停止 resolve，失败 reject）后 settle
    */
-  private spawnPlayer(bin: string, args: string[]): void {
+  private startPlayer(bin: string, args: string[]): Promise<void> {
     let child: ChildProcess;
     try {
-      child = spawn(bin, args, { stdio: ["ignore", "ignore", "pipe"] });
+      child = this.spawnFn(bin, args, { stdio: ["ignore", "ignore", "pipe"] });
     } catch (err) {
-      this.log.error(`启动 ${bin} 失败`, err as Error);
-      return;
+      const error = err instanceof Error ? err : new Error(String(err));
+      this.log.error(`启动 ${bin} 失败`, error);
+      return Promise.reject(error);
     }
     this.child = child;
-    child.stderr?.on("data", (chunk: Buffer) => {
-      const line = String(chunk).trim();
-      if (line.length > 0) this.log.warn(`termux tts stderr: ${line}`);
-    });
-    child.on("error", (err: Error) => {
-      if (this.child === child) this.child = null;
-      this.log.error(`termux TTS 子进程异常（${bin}）`, err);
-    });
-    child.on("exit", () => {
-      if (this.child === child) this.child = null;
+    return new Promise<void>((resolveDone, rejectDone) => {
+      let settled = false;
+      /** 幂等 settle（`exit` / `error` 可能先后到达）。 */
+      const settle = (action: () => void): void => {
+        if (settled) return;
+        settled = true;
+        action();
+      };
+      child.stderr?.on("data", (chunk: Buffer) => {
+        const line = String(chunk).trim();
+        if (line.length > 0) this.log.warn(`termux tts stderr: ${line}`);
+      });
+      child.on("error", (err: Error) => {
+        if (this.child === child) this.child = null;
+        this.log.error(`termux TTS 子进程异常（${bin}）`, err);
+        settle(() => rejectDone(new Error(`termux TTS 播放失败（${bin}）：${err.message}`)));
+      });
+      child.on("exit", (code: number | null) => {
+        // 被 stop()/新一次 speak 顶替时 this.child 已不是本子进程 ⇒ 有意打断，正常收尾
+        const current = this.child === child;
+        if (current) this.child = null;
+        if (!current) {
+          settle(resolveDone);
+          return;
+        }
+        if (code !== null && code !== 0) {
+          const err = new Error(`termux TTS 播放失败（退出码=${code}）`);
+          this.log.error(err.message);
+          settle(() => rejectDone(err));
+          return;
+        }
+        settle(resolveDone);
+      });
     });
   }
 }

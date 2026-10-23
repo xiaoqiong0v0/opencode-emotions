@@ -44,6 +44,14 @@ export const PLAYBACK_SESSION_ENV = "EMOTIONS_SESSION_ID";
 export const PLAYBACK_OWNERLESS_KEY = "_";
 /** 状态条目被认为「新鲜」的最长时间（超过则视为陈旧，防 PID 复用误杀；每次读写时顺带清）。 */
 export const PLAYBACK_TTL_MS = 30 * 60 * 1000;
+/**
+ * **短心跳 TTL**（毫秒）：仅用于「无法做 pid 存活探测」的条目（无 pid / pid 非法）。
+ *
+ * 旧口径把 `PLAYBACK_TTL_MS`(30min) 当活跃判据，导致「进程已死但条目仍新鲜」被当成正在播放：
+ * ASR 半双工门最长 30 分钟内**静默吞掉真人语音**（审计 P1）。判活改为 pid 存活优先后，
+ * 该常量只保留「刚登记、pid 尚未落盘」这一类窄窗口，取值 ≤15s，远小于 30min。
+ */
+export const PLAYBACK_FRESH_TTL_MS = 15_000;
 /** `SIGTERM` 后升级到 `SIGKILL` 的等待（毫秒）。 */
 export const SIGTERM_GRACE_MS = 1500;
 
@@ -229,6 +237,56 @@ export function stopPlayback(options: PlaybackStateOptions = {}): boolean {
   return signaled;
 }
 
+/** 单条播放条目的活跃判定结果。 */
+export type PlaybackLiveness =
+  /** 至少一个 pid（`pid`/`playerPid`）确认存活。 */
+  | "active"
+  /** 所有可探测 pid 都确认已死（可安全清理）。 */
+  | "dead"
+  /** 探测抛错/无法判定——调用方必须按「不阻断」处理（fail-open，见判活函数）。 */
+  | "unknown"
+  /** 没有可探测 pid，但条目仍在短心跳窗口内（{@link PLAYBACK_FRESH_TTL_MS}）。 */
+  | "fresh";
+
+/**
+ * 判定单条播放条目的活跃性（纯函数，可用注入的探测函数离线单测）。
+ *
+ * 口径（审计 P1 修复：「新鲜」不再等于「在播」）：
+ * - 有 `pid`/`playerPid` 且任一探测为存活 → `active`；
+ * - 全部探测为死 → `dead`（调用方清理，不得残留阻断后续）；
+ * - 探测抛错 → `unknown`（**不能**据此阻断；丢语音比多一次回声更不可接受）；
+ * - 没有可探测 pid（外部/旧格式未带）→ 短 TTL 内 `fresh`，超出即 `dead`。
+ * @param entry 播放条目
+ * @param now 当前时间戳（毫秒）
+ * @param isAlive 存活探测（默认 `process.kill(pid, 0)` 语义；EPERM 视为存活）
+ * @returns 活跃判定结果
+ */
+export function classifyPlaybackEntry(
+  entry: PlaybackEntry,
+  now: number,
+  isAlive: (pid: number) => boolean = isProcessAlive,
+): PlaybackLiveness {
+  const candidates = [entry.pid, entry.playerPid].filter(
+    (pid): pid is number => typeof pid === "number" && Number.isInteger(pid) && pid > 0,
+  );
+  if (candidates.length === 0) {
+    const fresh =
+      Number.isFinite(now) &&
+      Number.isFinite(entry.startedAt) &&
+      now - entry.startedAt <= PLAYBACK_FRESH_TTL_MS;
+    return fresh ? "fresh" : "dead";
+  }
+  let probeFailed = false;
+  for (const pid of new Set(candidates)) {
+    try {
+      if (isAlive(pid)) return "active";
+    } catch {
+      probeFailed = true;
+    }
+  }
+  return probeFailed ? "unknown" : "dead";
+}
+
 /**
  * **F10 双态中断判活**（2026-10-22）：该会话（或**无主**）是否存在「可中断的活跃播放」。
  *
@@ -236,14 +294,16 @@ export function stopPlayback(options: PlaybackStateOptions = {}): boolean {
  * `sessionID` 非空 → 只看「该会话键条目 + 无主条目」，其它会话的条目**一律不算**；
  * `sessionID` 空/空白 → 全部条目都算（与无参 stop 停全部同口径）。
  *
- * 「活跃」判据（满足其一即真）：
- * 1. `pid` 或 `playerPid` 进程存活（{@link isProcessAlive}，可注入替换）——正常在播；
- * 2. `startedAt + PLAYBACK_TTL_MS` 未过期——条目尚新鲜（防「CLI 刚登记、playerPid 未补写 /
- *    刚死亡但条目未清」的窗口期漏判；陈旧条目本就在 `loadMap` 读取时清除，不会走到这）。
+ * 「活跃」判据（{@link classifyPlaybackEntry}）：
+ * 1. `pid` 或 `playerPid` **进程存活**——正常在播（`process.kill(pid,0)`；EPERM 视为存活）；
+ * 2. 无 pid 的条目只在 {@link PLAYBACK_FRESH_TTL_MS}（≤15s）短窗口内算活跃；
+ * 3. 探测抛错/无法判定 → **不阻断**（fail-open 到「不丢语音」）。
+ * 确认已死的条目在本次调用内**就地清理并落盘**，不再残留阻断后续判定。
  *
  * 消费方：① TUI `toggleAutoRead`（F10）——为真则本次按键**只中断播放、不切换开关**；
  * ② TUI `dispatch()` 的**半双工静音门**（2026-10-22，`voice/asr-gate.ts`）——为真则**丢弃该条 ASR final**，
- * 掐断「朗读→麦克风→转文字→注入→再朗读」回环（AEC 实测 unsupported 的兜底）。两处都只读、不写状态、不杀进程。
+ * 掐断「朗读→麦克风→转文字→注入→再朗读」回环（AEC 实测 unsupported 的兜底）。
+ * 本函数只读状态、必要时清理死条目，**绝不杀进程**；任何内部异常都降级为 false（不阻断）。
  * @param sessionID 打断方会话 id（空/空白=全部条目）
  * @param nowMs 当前时间戳（毫秒；缺省用 `options.now ?? Date.now()`）
  * @param options 路径/时钟选项 + 存活探测注入（`isAlive`，单测不真探进程）
@@ -254,19 +314,35 @@ export function isInterruptablePlaybackActive(
   nowMs?: number,
   options: PlaybackFileOptions & { isAlive?: (pid: number) => boolean } = {},
 ): boolean {
-  const map = loadMap(options);
-  const wanted = typeof sessionID === "string" ? sessionID.trim() : "";
-  const now =
-    typeof nowMs === "number" && Number.isFinite(nowMs) ? nowMs : (options.now ?? (() => Date.now()))();
-  const isAlive = options.isAlive ?? isProcessAlive;
-  // 逐条目：会话归属门（与 stopPlayback 同口径：有主且不等 → 跳过）→ 判活（存活 或 未过 TTL）
-  for (const entry of Object.values(map)) {
-    const owned = typeof entry.sessionID === "string" && entry.sessionID.length > 0;
-    if (wanted.length > 0 && owned && entry.sessionID !== wanted) continue;
-    const alive = isAlive(entry.pid) || (typeof entry.playerPid === "number" && isAlive(entry.playerPid));
-    if (alive || now - entry.startedAt <= PLAYBACK_TTL_MS) return true;
+  try {
+    const map = loadMap(options);
+    const wanted = typeof sessionID === "string" ? sessionID.trim() : "";
+    const now =
+      typeof nowMs === "number" && Number.isFinite(nowMs) ? nowMs : (options.now ?? (() => Date.now()))();
+    const isAlive = options.isAlive ?? isProcessAlive;
+    const deadKeys: string[] = [];
+    let active = false;
+    // 逐条目：会话归属门（与 stopPlayback 同口径：有主且不等 → 跳过）→ 存活探测/短 TTL
+    for (const [key, entry] of Object.entries(map)) {
+      const owned = typeof entry.sessionID === "string" && entry.sessionID.length > 0;
+      if (wanted.length > 0 && owned && entry.sessionID !== wanted) continue;
+      const state = classifyPlaybackEntry(entry, now, isAlive);
+      if (state === "active" || state === "fresh") active = true;
+      else if (state === "dead") deadKeys.push(key);
+      // state="unknown"：探测失败 → 不阻断（fail-open）
+    }
+    if (deadKeys.length > 0) {
+      for (const key of deadKeys) delete map[key];
+      if (persistMap(map, options)) {
+        log.info(`pruned dead playback entries: count=${deadKeys.length} keys=${deadKeys.join(",")}`);
+      }
+    }
+    return active;
+  } catch (err) {
+    // 判活绝不能拖垮分发/热键：任何意外一律按「无活跃播放」处理（不丢语音）
+    log.warn("playback liveness check failed; treated as inactive", err as Error);
+    return false;
   }
-  return false;
 }
 
 /**

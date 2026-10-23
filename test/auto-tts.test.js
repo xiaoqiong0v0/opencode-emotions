@@ -52,6 +52,7 @@ import {
   autoTtsDataDir,
   autoTtsInterruptPath,
   autoTtsSeenPath,
+  autoTtsSessionDir,
   autoTtsStatePath,
   readAutoTts,
   readAutoTtsSeen,
@@ -280,6 +281,33 @@ test("resetAutoTtsSession：只删本会话目录（开关+去重），不动其
   }
 });
 
+test("sessionID 路径穿越防线：`.`/`..`/空/绝对路径/盘符/UNC/NUL 一律拒绝，且不做任何删除（哨兵仍在）", () => {
+  // dataDir 是临时父目录下的子目录：父目录里的兄弟目录 = 旧 `..` 能删掉的目标
+  const parent = mkdtempSync(join(tmpdir(), "auto-tts-trav-"));
+  const root = join(parent, "opencode-emotions");
+  const sibling = join(parent, "file-tool");
+  const sentinel = join(sibling, "sentinel.txt");
+  const rootSentinel = join(root, "sentinel.txt");
+  try {
+    mkdirSync(sibling, { recursive: true });
+    mkdirSync(root, { recursive: true });
+    writeFileSync(sentinel, "keep", "utf8");
+    writeFileSync(rootSentinel, "keep", "utf8");
+    const bad = ["", ".", "..", "ses_../../x", "ses_a/b", "ses_a\\b", "C:\\Windows", "\\\\server\\share", "ses_a\0b", " ses_a", "ses_a "];
+    for (const id of bad) {
+      assert.equal(autoTtsSessionDir(id, { dataDir: root }), "", `非法 id 必须返回空串：${JSON.stringify(id)}`);
+      assert.equal(writeAutoTts(id, true, { dataDir: root }), false, `非法 id 不写：${JSON.stringify(id)}`);
+      assert.equal(resetAutoTtsSession(id, { dataDir: root }), false, `非法 id 不删：${JSON.stringify(id)}`);
+      assert.equal(resetAutoTtsSessionOnce(new Set(), id, { dataDir: root }), false);
+    }
+    assert.equal(existsSync(sentinel), true, "兄弟目录哨兵必须仍在（修 P0：`..` 递归删父目录）");
+    assert.equal(existsSync(rootSentinel), true, "数据根哨兵必须仍在（`.`/空串不得删根）");
+    assert.equal(readFileSync(sentinel, "utf8"), "keep");
+  } finally {
+    rmSync(parent, { recursive: true, force: true });
+  }
+});
+
 test("resetAutoTtsSessionOnce：本进程首见删该会话（从关开始）、再见不删（保住已激活开关），touched 只增", () => {
   const dir = tempDataDir();
   try {
@@ -429,6 +457,8 @@ test("auto-read 会话级中断请求：命中（请求时刻严格大于消息�
     const log = stubLogger();
     const fallbacks = [];
     const reader = createAutoReader({
+      // 本文件不验证「首句合并窗」（专测见 test/auto-read-merge-window.test.js）：置 0 保持原有派发时序断言
+      firstMergeWindowMs: 0,
       log,
       cliPath: "/fake/emotions-cli.js",
       fetchParts: async (s, m) => {
@@ -484,6 +514,8 @@ test("auto-read 会话级中断请求：未命中（请求早于消息开始）�
     writeAutoTts("ses_1", true, { dataDir: dir });
     const log = stubLogger();
     const reader = createAutoReader({
+      // 本文件不验证「首句合并窗」（专测见 test/auto-read-merge-window.test.js）：置 0 保持原有派发时序断言
+      firstMergeWindowMs: 0,
       log,
       cliPath: "/fake/emotions-cli.js",
       fetchParts: async () => [{ type: "text", text: "不应整段" }],
@@ -525,6 +557,8 @@ test("auto-read 会话级中断请求：命中只 kill 本会话在途 worker、
     const log = stubLogger();
     const { spawnFn, calls } = workerSpawn();
     const reader = createAutoReader({
+      // 本文件不验证「首句合并窗」（专测见 test/auto-read-merge-window.test.js）：置 0 保持原有派发时序断言
+      firstMergeWindowMs: 0,
       log,
       cliPath: "/fake/emotions-cli.js",
       fetchParts: async () => [{ type: "text", text: "不应读" }],
@@ -563,6 +597,8 @@ test("auto-read follow worker：worker 活着但会话有中断请求 → 不再
     const { spawnFn, calls } = workerSpawn();
     const log = stubLogger();
     const reader = createAutoReader({
+      // 本文件不验证「首句合并窗」（专测见 test/auto-read-merge-window.test.js）：置 0 保持原有派发时序断言
+      firstMergeWindowMs: 0,
       log,
       cliPath: "/fake/emotions-cli.js",
       fetchParts: async () => [{ type: "text", text: "不应回退整段" }],
@@ -601,6 +637,8 @@ test("auto-read 回退整段读：命中中断请求 → 不 spawn、汇总 skip
     const { spawnFn, calls } = fakeSpawn();
     const log = stubLogger();
     const reader = createAutoReader({
+      // 本文件不验证「首句合并窗」（专测见 test/auto-read-merge-window.test.js）：置 0 保持原有派发时序断言
+      firstMergeWindowMs: 0,
       log,
       cliPath: "/fake/emotions-cli.js",
       fetchParts: async () => [{ type: "text", text: "整段回退正文。" }],
@@ -629,6 +667,8 @@ test("auto-read 触发器：开关开启 + 助手完成才朗读，且按消息 
     const log = stubLogger();
     const calls = [];
     const reader = createAutoReader({
+      // 本文件不验证「首句合并窗」（专测见 test/auto-read-merge-window.test.js）：置 0 保持原有派发时序断言
+      firstMergeWindowMs: 0,
       log,
       cliPath: "/fake/emotions-cli.js",
       fetchParts: async (sessionID, messageID) => {
@@ -693,6 +733,8 @@ test("auto-read 分会话：A 会话开、B 会话关 → 只读 A 的消息", a
     const log = stubLogger();
     const calls = [];
     const reader = createAutoReader({
+      // 本文件不验证「首句合并窗」（专测见 test/auto-read-merge-window.test.js）：置 0 保持原有派发时序断言
+      firstMergeWindowMs: 0,
       log,
       cliPath: "/fake/emotions-cli.js",
       fetchParts: async (sessionID, messageID) => {
@@ -723,6 +765,8 @@ test("auto-read 子会话硬跳过：无论 map 开没开都不读（fallback �
     const calls = [];
     const childCalls = [];
     const reader = createAutoReader({
+      // 本文件不验证「首句合并窗」（专测见 test/auto-read-merge-window.test.js）：置 0 保持原有派发时序断言
+      firstMergeWindowMs: 0,
       log,
       cliPath: "/fake/emotions-cli.js",
       fetchParts: async (sessionID, messageID) => {
@@ -774,6 +818,8 @@ test("auto-read 子会话硬跳过：增量路径（part/delta）在判定期间
       resolveChild = resolve;
     });
     const reader = createAutoReader({
+      // 本文件不验证「首句合并窗」（专测见 test/auto-read-merge-window.test.js）：置 0 保持原有派发时序断言
+      firstMergeWindowMs: 0,
       log,
       cliPath: "/fake/emotions-cli.js",
       fetchParts: async () => [{ type: "text", text: "不应回退" }],
@@ -834,6 +880,8 @@ test("auto-read 派生 bin：默认 node、env VOICE_NODE_BIN 可覆盖、deps �
       const { spawnFn, calls } = fakeSpawn();
       const log = stubLogger();
       const reader = createAutoReader({
+      // 本文件不验证「首句合并窗」（专测见 test/auto-read-merge-window.test.js）：置 0 保持原有派发时序断言
+      firstMergeWindowMs: 0,
         log,
         cliPath: "/fake/emotions-cli.js",
         fetchParts: async () => [{ type: "text", text: "你好世界啊" }],
@@ -852,6 +900,8 @@ test("auto-read 派生 bin：默认 node、env VOICE_NODE_BIN 可覆盖、deps �
       const { spawnFn, calls } = fakeSpawn();
       const log = stubLogger();
       const reader = createAutoReader({
+      // 本文件不验证「首句合并窗」（专测见 test/auto-read-merge-window.test.js）：置 0 保持原有派发时序断言
+      firstMergeWindowMs: 0,
         log,
         cliPath: "/fake/emotions-cli.js",
         fetchParts: async () => [{ type: "text", text: "你好世界啊" }],
@@ -868,6 +918,8 @@ test("auto-read 派生 bin：默认 node、env VOICE_NODE_BIN 可覆盖、deps �
       const { spawnFn, calls } = fakeSpawn();
       const log = stubLogger();
       const reader = createAutoReader({
+      // 本文件不验证「首句合并窗」（专测见 test/auto-read-merge-window.test.js）：置 0 保持原有派发时序断言
+      firstMergeWindowMs: 0,
         log,
         cliPath: "/fake/emotions-cli.js",
         fetchParts: async () => [{ type: "text", text: "你好世界啊" }],
@@ -896,6 +948,8 @@ test("auto-read 派生：非零退出或有 stderr → warn 带片段；exit 0 �
       const { spawnFn, calls } = fakeSpawn({ exitCode: 1, stderrText: "Error: boom\n" });
       const log = stubLogger();
       const reader = createAutoReader({
+      // 本文件不验证「首句合并窗」（专测见 test/auto-read-merge-window.test.js）：置 0 保持原有派发时序断言
+      firstMergeWindowMs: 0,
         log,
         cliPath: "/fake/emotions-cli.js",
         fetchParts: async () => [{ type: "text", text: "你好世界啊" }],
@@ -916,6 +970,8 @@ test("auto-read 派生：非零退出或有 stderr → warn 带片段；exit 0 �
       const { spawnFn } = fakeSpawn({ exitCode: 0, stderrText: "provider warning: soft\n" });
       const log = stubLogger();
       const reader = createAutoReader({
+      // 本文件不验证「首句合并窗」（专测见 test/auto-read-merge-window.test.js）：置 0 保持原有派发时序断言
+      firstMergeWindowMs: 0,
         log,
         cliPath: "/fake/emotions-cli.js",
         fetchParts: async () => [{ type: "text", text: "你好世界啊" }],
@@ -933,6 +989,8 @@ test("auto-read 派生：非零退出或有 stderr → warn 带片段；exit 0 �
       const { spawnFn } = fakeSpawn({ exitCode: 0 });
       const log = stubLogger();
       const reader = createAutoReader({
+      // 本文件不验证「首句合并窗」（专测见 test/auto-read-merge-window.test.js）：置 0 保持原有派发时序断言
+      firstMergeWindowMs: 0,
         log,
         cliPath: "/fake/emotions-cli.js",
         fetchParts: async () => [{ type: "text", text: "你好世界啊" }],
@@ -956,6 +1014,8 @@ test("auto-read 触发器：空正文（仅 reasoning）不朗读", async () => 
     writeAutoTts("ses_1", true, { dataDir: dir });
     const log = stubLogger();
     const reader = createAutoReader({
+      // 本文件不验证「首句合并窗」（专测见 test/auto-read-merge-window.test.js）：置 0 保持原有派发时序断言
+      firstMergeWindowMs: 0,
       log,
       cliPath: "/fake/emotions-cli.js",
       fetchParts: async () => [{ type: "reasoning", text: "只有思考" }],
@@ -1041,6 +1101,8 @@ test("auto-read 增量：阈值未达标不发送、达标后缓冲、句尾对�
     const log = stubLogger();
     const calls = [];
     const reader = createAutoReader({
+      // 本文件不验证「首句合并窗」（专测见 test/auto-read-merge-window.test.js）：置 0 保持原有派发时序断言
+      firstMergeWindowMs: 0,
       log,
       cliPath: "/fake/emotions-cli.js",
       fetchParts: async (s, m) => {
@@ -1117,6 +1179,8 @@ test("auto-read 增量：完成时补读未达阈值缓冲；interrupt 水位—
     writeAutoTts("ses_1", true, { dataDir: dir });
     const log = stubLogger();
     const reader = createAutoReader({
+      // 本文件不验证「首句合并窗」（专测见 test/auto-read-merge-window.test.js）：置 0 保持原有派发时序断言
+      firstMergeWindowMs: 0,
       log,
       cliPath: "/fake/emotions-cli.js",
       fetchParts: async () => [{ type: "text", text: "不应回退" }],
@@ -1172,6 +1236,8 @@ test("interrupt(sessionID)：只停本会话——队列只清本会话、水位
     const log = stubLogger();
     const fallbacks = [];
     const reader = createAutoReader({
+      // 本文件不验证「首句合并窗」（专测见 test/auto-read-merge-window.test.js）：置 0 保持原有派发时序断言
+      firstMergeWindowMs: 0,
       log,
       cliPath: "/fake/emotions-cli.js",
       fetchParts: async (s, m) => {
@@ -1244,6 +1310,8 @@ test("interrupt(sessionID)：只 kill 本会话朗读子进程；无参 interrup
       return child;
     };
     const reader = createAutoReader({
+      // 本文件不验证「首句合并窗」（专测见 test/auto-read-merge-window.test.js）：置 0 保持原有派发时序断言
+      firstMergeWindowMs: 0,
       log,
       cliPath: "/fake/emotions-cli.js",
       fetchParts: async () => [{ type: "text", text: "回退不应读" }],
@@ -1281,6 +1349,8 @@ test("interrupt() 无参回归：全清——所有会话的在途消息都置�
     const log = stubLogger();
     const fallbacks = [];
     const reader = createAutoReader({
+      // 本文件不验证「首句合并窗」（专测见 test/auto-read-merge-window.test.js）：置 0 保持原有派发时序断言
+      firstMergeWindowMs: 0,
       log,
       cliPath: "/fake/emotions-cli.js",
       fetchParts: async (s, m) => {
@@ -1327,6 +1397,8 @@ test("auto-read 触发器：重启后（已持久化 id）不回放旧消息", a
     writeAutoTtsSeen("ses_1", new Set(["msg_old"]), { dataDir: dir });
     const log = stubLogger();
     const reader = createAutoReader({
+      // 本文件不验证「首句合并窗」（专测见 test/auto-read-merge-window.test.js）：置 0 保持原有派发时序断言
+      firstMergeWindowMs: 0,
       log,
       cliPath: "/fake/emotions-cli.js",
       fetchParts: async () => [{ type: "text", text: "复读" }],
@@ -1349,6 +1421,8 @@ test("auto-read 增量：队列未空时关闭开关 → 派生前复查，不�
     writeAutoTts("ses_1", true, { dataDir: dir });
     const log = stubLogger();
     const reader = createAutoReader({
+      // 本文件不验证「首句合并窗」（专测见 test/auto-read-merge-window.test.js）：置 0 保持原有派发时序断言
+      firstMergeWindowMs: 0,
       log,
       cliPath: "/fake/emotions-cli.js",
       fetchParts: async () => [{ type: "text", text: "不应被整段读" }],
@@ -1385,6 +1459,8 @@ test("auto-read delta 流式：text-start 登记类型 + part.delta 增量驱动
     const log = stubLogger();
     const calls = [];
     const reader = createAutoReader({
+      // 本文件不验证「首句合并窗」（专测见 test/auto-read-merge-window.test.js）：置 0 保持原有派发时序断言
+      firstMergeWindowMs: 0,
       log,
       cliPath: "/fake/emotions-cli.js",
       fetchParts: async (s, m) => {
@@ -1448,6 +1524,8 @@ test("auto-read 角色补取：未知角色惰性 fetchMessageRole（并发去�
     const log = stubLogger();
     const roleCalls = [];
     const reader = createAutoReader({
+      // 本文件不验证「首句合并窗」（专测见 test/auto-read-merge-window.test.js）：置 0 保持原有派发时序断言
+      firstMergeWindowMs: 0,
       log,
       cliPath: "/fake/emotions-cli.js",
       fetchParts: async () => [{ type: "text", text: "不应回退" }],
@@ -1499,6 +1577,8 @@ test("auto-read 角色补取为 user：消息绝不读（增量与快照都挡�
     writeAutoTts("ses_1", true, { dataDir: dir });
     const log = stubLogger();
     const reader = createAutoReader({
+      // 本文件不验证「首句合并窗」（专测见 test/auto-read-merge-window.test.js）：置 0 保持原有派发时序断言
+      firstMergeWindowMs: 0,
       log,
       cliPath: "/fake/emotions-cli.js",
       fetchParts: async () => [{ type: "text", text: "不应回退" }],
@@ -1534,6 +1614,8 @@ test("auto-read 摘要消息（summary）不读：增量与快照都跳过", asy
     writeAutoTts("ses_1", true, { dataDir: dir });
     const log = stubLogger();
     const reader = createAutoReader({
+      // 本文件不验证「首句合并窗」（专测见 test/auto-read-merge-window.test.js）：置 0 保持原有派发时序断言
+      firstMergeWindowMs: 0,
       log,
       cliPath: "/fake/emotions-cli.js",
       fetchParts: async () => [{ type: "text", text: "摘要也不该回退读" }],
@@ -1628,6 +1710,8 @@ test("auto-read 凑批合并+句对齐：drain 在途期间入队的块合并后
     const { spawnFn, calls } = heldSpawn();
     const log = stubLogger();
     const reader = createAutoReader({
+      // 本文件不验证「首句合并窗」（专测见 test/auto-read-merge-window.test.js）：置 0 保持原有派发时序断言
+      firstMergeWindowMs: 0,
       log,
       cliPath: "/fake/emotions-cli.js",
       fetchParts: async () => [{ type: "text", text: "不应回退" }],
@@ -1687,6 +1771,8 @@ test("auto-read 句对齐：无标点尾巴 carry 至消息完成才派生（末
     const { spawnFn, calls } = heldSpawn();
     const log = stubLogger();
     const reader = createAutoReader({
+      // 本文件不验证「首句合并窗」（专测见 test/auto-read-merge-window.test.js）：置 0 保持原有派发时序断言
+      firstMergeWindowMs: 0,
       log,
       cliPath: "/fake/emotions-cli.js",
       fetchParts: async () => [{ type: "text", text: "不应回退" }],
@@ -1720,6 +1806,8 @@ test("auto-read 无标点超长尾巴：carry 超 DRAIN_MERGE_MAX_CHARS 时句�
     const { spawnFn, calls } = heldSpawn();
     const log = stubLogger();
     const reader = createAutoReader({
+      // 本文件不验证「首句合并窗」（专测见 test/auto-read-merge-window.test.js）：置 0 保持原有派发时序断言
+      firstMergeWindowMs: 0,
       log,
       cliPath: "/fake/emotions-cli.js",
       fetchParts: async () => [{ type: "text", text: "不应回退" }],
@@ -1757,6 +1845,8 @@ test("auto-read follow worker：首块 spawn 1 次 --follow、后续 0 次 spawn
     const { spawnFn, calls } = workerSpawn();
     const log = stubLogger();
     const reader = createAutoReader({
+      // 本文件不验证「首句合并窗」（专测见 test/auto-read-merge-window.test.js）：置 0 保持原有派发时序断言
+      firstMergeWindowMs: 0,
       log,
       cliPath: "/fake/emotions-cli.js",
       fetchParts: async () => [{ type: "text", text: "不应回退" }],
@@ -1800,6 +1890,8 @@ test("auto-read follow worker 天折：写失败 → 停读该消息（水位同
     const { spawnFn, calls } = workerSpawn();
     const log = stubLogger();
     const reader = createAutoReader({
+      // 本文件不验证「首句合并窗」（专测见 test/auto-read-merge-window.test.js）：置 0 保持原有派发时序断言
+      firstMergeWindowMs: 0,
       log,
       cliPath: "/fake/emotions-cli.js",
       fetchParts: async () => [{ type: "text", text: "不应回退整段" }],
@@ -1853,6 +1945,8 @@ test("auto-read 空文本：纯空白块/空正文不 spawn、不报错（消「
     const { spawnFn, calls } = fakeSpawn();
     const log = stubLogger();
     const reader = createAutoReader({
+      // 本文件不验证「首句合并窗」（专测见 test/auto-read-merge-window.test.js）：置 0 保持原有派发时序断言
+      firstMergeWindowMs: 0,
       log,
       cliPath: "/fake/emotions-cli.js",
       fetchParts: async () => [{ type: "text", text: "   " }],
@@ -1887,6 +1981,8 @@ test("auto-read 派生 env：spawnSpeak 注入 EMOTIONS_SESSION_ID=<消息 sessi
     const { spawnFn, calls } = fakeSpawn();
     const log = stubLogger();
     const reader = createAutoReader({
+      // 本文件不验证「首句合并窗」（专测见 test/auto-read-merge-window.test.js）：置 0 保持原有派发时序断言
+      firstMergeWindowMs: 0,
       log,
       cliPath: "/fake/emotions-cli.js",
       fetchParts: async () => [{ type: "text", text: "你好世界啊" }],
@@ -1921,6 +2017,8 @@ test("auto-read 派生 env：follow worker 注入 EMOTIONS_SESSION_ID=<消息 se
     const { spawnFn, calls } = workerSpawn();
     const log = stubLogger();
     const reader = createAutoReader({
+      // 本文件不验证「首句合并窗」（专测见 test/auto-read-merge-window.test.js）：置 0 保持原有派发时序断言
+      firstMergeWindowMs: 0,
       log,
       cliPath: "/fake/emotions-cli.js",
       fetchParts: async () => [{ type: "text", text: "不应回退" }],
@@ -1955,3 +2053,4 @@ test("auto-read 派生 env：follow worker 注入 EMOTIONS_SESSION_ID=<消息 se
     rmSync(dir, { recursive: true, force: true });
   }
 });
+

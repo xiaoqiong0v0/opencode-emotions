@@ -49,11 +49,12 @@ TUI 插件（语音输入 UI + 热键）——`tui.json`：
 
 ## 依赖体积（含 `ffmpeg-static`）
 
-- **`ffmpeg-static`（写在 `dependencies`）**：npm 安装时会**下载**一个预编译 ffmpeg 二进制到 `node_modules/ffmpeg-static`（Windows `ffmpeg.exe` 实测 **≈ 79 MB**），用于语音采集（及 Termux 分块录音转码）。云 TTS 走**流式 raw PCM**，不再用它转码。代价是首次安装的网络流量与磁盘占用；可用环境变量 `FFMPEG_BIN` 指向系统自带 ffmpeg 以绕开随附二进制。
+- **`ffmpeg-static`（写在 `optionalDependencies`）**：npm 安装时由该包的 `install` 脚本**下载**一个预编译 ffmpeg 二进制到 `node_modules/ffmpeg-static`（Windows `ffmpeg.exe` 实测 **≈ 79 MB**），用于语音采集（及 Termux 分块录音转码）。云 TTS 走**流式 raw PCM**，不再用它转码。代价是首次安装的网络流量与磁盘占用；可用环境变量 `FFMPEG_BIN` 指向系统自带 ffmpeg 以绕开随附二进制。
+- **opencode 自动安装不会执行 `install` 脚本**（源码 `packages/core/src/npm.ts` 硬编码 `ignoreScripts: true`）⇒ 插件缓存里只有包文件、没有 `ffmpeg.exe`。部署/本地发布后需跑一次 `node scripts/ensure-ffmpeg.mjs` 补齐（`--check` 为只检查的发布前门禁）；未补齐时语音入口会给出明确引导，不会静默无声。
 - `ffmpeg-static` 自身按 **GPL-3.0-or-later** 分发（与本包 MIT 许可相互独立）。
 - `ws`：ASR/TTS 的 WebSocket 客户端（体积小）。
 
-> 只用情绪命令、不用语音的用户也会因 `dependencies` 拉入 `ffmpeg-static`（opencode 自动安装 `--production` 依赖）。
+> 只用情绪命令、不用语音的用户：`ffmpeg-static` 位于 `optionalDependencies`，安装失败（如部分 Termux 环境）**不会拖垮主装**；opencode 自动安装的是生产依赖并跳过 install 脚本，见上一条的补齐步骤。
 
 ## 用法：情绪命令
 
@@ -77,15 +78,15 @@ TUI 插件（语音输入 UI + 热键）——`tui.json`：
 
 ## 语音输入（TUI 插件）
 
-TUI 插件在会话输入框右侧渲染一个状态指示（`🎙 [meter] ↧F8/⤉F9 🔊 F10`，总宽恒 **18** 列、中英一致不抖）——`🎙 ` 段**永远静态**（恒 3 列、中性 `accent`，只做「这里是语音功能」的标记；2026-10-22 第十三批起**不再做任何 emoji 帧轮播/变色动画**，因为 emoji 的字形与进格宽度由终端/字体决定，换字形会跳位、不居中），其右侧是**恒定 1 列的盲文音量列**承载全部语音状态动画（盲文 U+2800–U+28FF 各终端同宽、可着色）：**关**=空白、**连接中**（F8/F9 已开但 ASR 还没连上）=spinner 转动（「还在连、别急着说」）、**在听**=纵向电平条 6 档（`⠁⠃⠇⠏⠟⠿`，由**真实麦克风电平**驱动 ⇒ **有音频输入才动**）；`↧`=输入/`F8`、`⤉`=注入/`F9`，**图标紧贴键位成组**，**没有模式文字**（2026-10-21 用户指令：先删「注入/输入」文字段、同日删 ●/○ 状态圆圈段、同日又恢复 `🎙` 并把与 `F8` 重叠的 `⇥` 换成 `↧`）——当前模式由**哪一组「图标+键位」整组高亮**表达；末端 `🔊 F10` 段颜色表达自动朗读状态：**亮=开、灰=关**），并用**点按**热键控制语音输入与自动朗读：
+TUI 插件在会话输入框右侧渲染一个状态指示（`🎙️ [meter] ↧F8/⤉F9 🔊 F10`，总宽按宿主口径恒 **18** 列、中英一致不抖）——`🎙️ ` 段（`🎙` + VS16，宿主恒 2 列 + 1 列间隔）**永远静态**（恒 3 列、中性 `accent`，只做「这里是语音功能」的标记；2026-10-22 第十三批起**不再做任何 emoji 帧轮播/变色动画**，因为 emoji 的字形与进格宽度由终端/字体决定，换字形会跳位、不居中），其右侧是**恒定 1 列的盲文音量列**承载全部语音状态动画（盲文 U+2800–U+28FF 各终端同宽、可着色）：**关**=空白、**连接中**（F8/F9 已开但 ASR 还没连上）=spinner 转动（「还在连、别急着说」）、**在听**=纵向电平条 6 档（`⠁⠃⠇⠏⠟⠿`，由**真实麦克风电平**驱动 ⇒ **有音频输入才动**）；`↧`=输入/`F8`、`⤉`=注入/`F9`，**图标紧贴键位成组**，**没有模式文字**（2026-10-21 用户指令：先删「注入/输入」文字段、同日删 ●/○ 状态圆圈段、同日又恢复 `🎙` 并把与 `F8` 重叠的 `⇥` 换成 `↧`）——当前模式由**哪一组「图标+键位」整组高亮**表达；末端 `🔊 F10` 段颜色表达自动朗读状态：**亮=开、灰=关**），并用**点按**热键控制语音输入与自动朗读：
 
 | 热键 | 模式 | 行为 |
 |---|---|---|
 | `F8` | 输入 | 识别结果**追加进输入框**，由你编辑后发送 |
 | `F9` | 注入 | 识别结果作为**新消息**发进当前会话（带 `🎙` 标记 + 情绪标注） |
-| `F10` | 自动朗读（**双态**） | **正在播放**（本会话或无主）时按键 = **只中断播放、开关不动**（toast「已中断播放（朗读开关状态未变）」，不写状态文件、指示灯原样）；**无播放**时才开/关**当前会话**的助手回复**自动朗读**（分会话开关，模型不可切换，独占此热键），关闭同时**立即停止**正在朗读的那段，开启只影响后续回复、不补读历史；**子会话（subagent）不支持**——按 F10 时 toast 提示且不写状态；状态在槽位**末端 `🔊 F10` 段**以颜色指示（亮=开、灰=关，响应式跟随当前会话，仅状态、非模式） |
+| `F10` | 自动朗读（**双态**） | **正在播放**（本会话或无主）时按键 = **只中断播放、开关不动**（toast「已中断播放（朗读开关状态未变）」，不写状态文件、指示灯原样）；**无播放**时才开/关**当前会话**的助手回复**自动朗读**（分会话开关，模型不可切换，独占此热键），关闭同时**立即停止**正在朗读的那段，开启只影响后续回复、不补读历史；**子会话（subagent）不支持**——有活跃播放时先按「只中断播放」处理（开关不动）；无播放且判定为子会话时 toast 提示且不写状态；状态在槽位**末端 `🔊 F10` 段**以颜色指示（亮=开、灰=关，响应式跟随当前会话，仅状态、非模式） |
 
-`F8`/`F9` 两模式互斥，都关闭时停止后台语音运行时；`F10` 独立控制自动朗读（只写共享状态文件 + 停止播放，不影响语音运行时；槽位末端 `🔊 F10` 段只做状态显示，文本恒定、不影响宽度恒定契约）。ASR 依赖 DashScope 凭证与 ffmpeg，识别出的情绪映射为同一 `emoji(等级/3)` 标注。TUI 槽位/热键的 API **官方未公开**、跨版本可能变（详见 `docs/设计-语音输入注入.md`）。
+`F8`/`F9` 两模式互斥，都关闭时停止后台语音运行时；**`F8`/`F9`/`F10` 均带 700ms 尾沿静默的键重复抑制**（按住不会连续 toggle：窗口内重复事件只记调试日志、不执行；F8/F9 各自独立互不抑制）。`F10` 独立控制自动朗读（只写共享状态文件 + 停止播放，不影响语音运行时；槽位末端 `🔊 F10` 段只做状态显示，文本恒定、不影响宽度恒定契约）。ASR 依赖 DashScope 凭证与 ffmpeg，识别出的情绪映射为同一 `emoji(等级/3)` 标注。TUI 槽位/热键的 API **官方未公开**、跨版本可能变（详见 `docs/设计-语音输入注入.md`）。
 
 ## 语音输出（`emotions_cli` 工具 / `emotions-cli` 命令）
 
@@ -132,7 +133,7 @@ node dist/cli/emotions-cli.js speak --text "你好" --emotion happy --background
 | `lib/**`、`voice/**` | 依赖 | 对应子目录 |
 
 > **顶层只放真插件**：opencode 会把 `.opencode/plugin/` 顶层的**每个 `.js`** 当插件自动 import；CLI、语音运行时等非插件产物一律进子目录（`cli/`、`runtime/`），子目录不被扫描。`publish:proj` **断言顶层只有插件入口**——出现 `emotions-cli.js` / `voice-runtime.js` 之类会立即报错退出（防回归）。
-> `tui.js` 由**宿主同款 Babel 链**（`babel-preset-solid` + `@babel/preset-typescript`，见 `scripts/build-tui.mjs`）编译：Solid 编译会把 JSX 包成 `createElement` / `insert` / `setProp` + `effect` 的**响应式**结构，而 `tsc` 的 `jsx()` 产物不会包裹 props/children（会失去响应式），故 `.tsx` **不进主 `tsc`**。产物保留裸 `@opentui/solid` / `solid-js` import，由宿主加载时重写为运行时模块 id。
+> `tui.js` 由**宿主同款 Babel 链**（`babel-preset-solid` + `@babel/preset-typescript`，见 `scripts/build-tui.mjs`）编译：Solid 编译会把 JSX 包成 `createElement` / `insert` / `setProp` + `effect` 的**响应式**结构，而 `tsc` 的 `jsx()` 产物不会包裹 props/children（会失去响应式），故 `.tsx` **不进主 `tsc`**；但它由 `tsconfig.tui.json`（`jsx: "preserve"` + `jsxImportSource: "@opentui/solid"`，与宿主一致）单独做 `--noEmit` 类型检查，`npm run build` 会**先 typecheck 再编译**（`npm run typecheck` 可单独跑）。产物保留裸 `@opentui/solid` / `solid-js` import，由宿主加载时重写为运行时模块 id。
 > 语音运行时脚本路径解析：`VOICE_RUNTIME_SCRIPT`（显式覆盖，优先）> **插件产物自身位置**同级 `runtime/voice-runtime.js`（`dist/` 与镜像后 `.opencode/plugin/` 同构，由 `import.meta.url` 推出）> `<cwd>/dist/runtime/voice-runtime.js`（兜底）。**不再以 cwd 为主口径**——opencode 的 cwd 是用户启动目录（家目录启动即拼出不存在的路径，runtime 秒退 code=1）；解析结果不存在时直接报错并带上完整绝对路径与全部候选。
 > CLI 路径解析：`EMOTIONS_CLI_SCRIPT`（存在则用；旧名 `VOICE_CLI_SCRIPT` 兼容）> `<cwd>/dist/cli/emotions-cli.js` > 工具模块同级（`dist/voice/` 或镜像后 `.opencode/plugin/voice/`）的 `../cli/emotions-cli.js`。
 
@@ -160,7 +161,7 @@ node dist/cli/emotions-cli.js speak --text "你好" --emotion happy --background
 
 可用环境变量 **`TTS_PLAYER`** 显式覆盖：填**流式** id（`waveout`/`winmm`/`aplay`/`paplay`/`sox`/`play`/`ffplay`）走流式；填文件型 id（如 `play-audio`/`soundplayer`/`afplay`）则强制走**分段回退**。音频流由 **`TTS_STREAM`** 控制（仅 Termux `play-audio` 用到：`media`/`alarm`/`notification`/`ring`/`system`/`voice`，默认 `media`）。**流式与分段都不可用时**会报清晰错误（列出已尝试候选与可安装的包，Termux 缺失时明确提示 `pkg install play-audio`），**不会静默无声**。
 
-**打断（barge-in，立即静音）**：**用户一发送消息**（server 插件 `chat.message`）**或按 `F8`/`F9` 语音输入**（TUI 插件）时，立刻停止正在播放的 TTS。机制：播放进程（CLI `speak` / 分离的 `__play`）启动时把 `{ pid, provider, taskId, startedAt }` **原子写**到 `~/.opencode/plugins-cache/opencode-emotions/tts-playback`；打断方读该文件后**只按记录的 PID** 终止——先 `SIGTERM`，有界超时（1.5s）后仍存活再 `SIGKILL`；进程退出/播完自动清理。**只允许按 PID 终止本插件自己派生的进程**（`pid>1`、非自身、未超 30 分钟 TTL），**严禁按进程名/模式杀**；找不到/已退出静默降级。被 `SIGTERM` 的播放进程会向云 TTS 发 `directive=cancel` 再退出。
+**打断（barge-in，立即静音）**：**用户一发送消息**（server 插件 `chat.message`）**或按 `F8`/`F9` 语音输入 / `F10` 中断**（TUI 插件）时，立刻停止正在播放的 TTS。机制：播放进程（CLI `speak` / `speak --follow` / 分离的 `__play`）启动时把条目**原子写**到 `~/.opencode/plugins-cache/opencode-emotions/tts-playback`——文件是**多条目 map** `{ [sessionID]: { pid, playerPid?, provider, taskId, startedAt } }`（无主/旧格式用哨兵键 `_`），支持**跨会话混音、单会话互斥**（同会话新播顶掉旧条目，不做排队）。打断方读该文件后**逐条目过会话归属门**（条目 `sessionID` 存在且不等 → 跳过；无主条目任何会话可停；调用无参/空 sessionID = 停全部，仅 dispose/清场用），再按条目记录的 `pid` **与**可选 `playerPid` **各自**终止——先 `SIGTERM`，有界超时（1.5s）后仍存活再 `SIGKILL`；两个都杀是因为 Windows `TerminateProcess` 不杀子孙（只杀 CLI 会让发声的 PowerShell 孙进程把当前块播完）。进程退出/播完自动清理。**只允许按记录中的 PID 终止本插件自己派生的进程**（`pid>1`、非自身、未超 30 分钟 TTL），**严禁按进程名/模式杀**；找不到/已退出静默降级。被终止的播放进程会向云 TTS 发 `directive=cancel` 再退出。
 
 **音色**：SAPI 优先用 `pwsh`（PowerShell 7）——它能选择全部 OneCore 音色（`Microsoft Huihui` / `Microsoft Kangkang` / `Microsoft Yaoyao`）；仅有 Windows PowerShell 5.1 时只认 Desktop 音色（如 `Microsoft Huihui Desktop`），选不到时回落到默认音色。连读会打断上一条（同一时刻只播一条）。
 
@@ -169,12 +170,12 @@ node dist/cli/emotions-cli.js speak --text "你好" --emotion happy --background
 助手回复边生成边自动朗读（`type==="text"` 的可见正文，排除 reasoning）；开关**按会话独立**、由用户用热键控制。
 
 - **分会话开关（F10 双态，2026-10-22）**：由 TUI 的 **`F10` 热键**控制**当前会话**——**本会话（或无主）正在播放**时按键 = **只中断播放、开关不切**（`isInterruptablePlaybackActive` 判活 → `stopPlayback({ sessionID })` + toast，不写状态文件、指示灯原样）；**无播放**时才点按切换开/关（一个会话的开关**不影响**其它会话/窗口）。模型与 `emotions-cli` 均**不能**切换——CLI 已无 `auto_tts` 子命令、`emotions_cli` 工具也不含该能力，**无旁路**（F10 开着时模型 `speak` 还会被**拦截跳过**，见上节工具说明）。`F10` 关闭时**立即停止**正在朗读的那段（复用按 PID 的 `stopPlayback()`）；开启只影响后续回复，**不**补读历史。**键重复抑制**：按住 F10 被 OS 连发按键事件时，一次物理按压只切换一次（尾沿静默 700ms；否则一次按住会产生偶数次翻转、净效果=关，即「按了状态不变」根因）。
-- **子会话不自动朗读**：子会话（subagent 任务会话）**不支持**自动朗读——server 侧按 sessionID 单飞取 `Session.parentID` 判定并硬跳过（无论开关开没开都不读）；TUI 侧按 F10 时 toast 提示「子会话不自动朗读」且不写状态。
-- **重启不保留 → 每会话首见懒重置（2026-10-21 起）**：本 TUI 进程**首次见到某会话**时（指示灯求值 / F10 按下两触点）才删**该会话目录**（`auto-tts` + `auto-tts-seen`）——重启（新进程首见）= 自动朗读回到关；**后开窗口只重置它自己首见的会话，不会清掉其它窗口已激活的开关**（旧「init 清整个会话数据根」在多窗口场景会误删先开窗口的开关，已作废；`resetAutoTtsState()` 全量清保留但生产不再调用）。
+- **子会话不自动朗读**：子会话（subagent 任务会话）**不支持**自动朗读——server 侧按 sessionID 单飞取 `Session.parentID` 判定并硬跳过（无论开关开没开都不读）；TUI 侧按 F10 时**先判有没有活跃播放**：有播放则只中断（开关不动，toast「已中断播放」），**无播放且判定为子会话**才 toast 提示「子会话不自动朗读」且不写状态。**已知限制：两个窗口打开同一会话时，后开窗口首见该会话会删共享的 `auto-tts` 目录 ⇒ 先开窗口的已激活开关也会被重置。**
+- **重启不保留 → 每会话首见懒重置（2026-10-21 起）**：本 TUI 进程**首次见到某会话**时（指示灯求值 / F10 按下两触点）才删**该会话目录**（`auto-tts` + `auto-tts-seen`）——重启（新进程首见）= 自动朗读回到关；后开窗口只重置它自己首见的会话，**不同会话**的已激活开关不受影响（旧「init 清整个会话数据根」在多窗口场景会误删先开窗口的开关，已作废；`resetAutoTtsState()` 全量清保留但生产不再调用）。**同一会话被两个窗口同时打开时仍是共享文件**：后开窗口首见会重置、退出停播也会互停，属已知取舍。
 - **状态落盘（每会话一个文件夹，对齐 file-tool）**：`~/.opencode/plugins-cache/opencode-emotions/<sessionID>/auto-tts`，内容为极简单值 **`on` / `off`**（一目录一会话，缺文件=关）；去重在 `<sessionID>/auto-tts-seen`。**原子写**（临时文件 + rename），读写失败一律降级（读→关、写失败由 F10 toast 提示）。因写开关的 **TUI 进程**与消费开关的 **server 插件进程**是两个进程，开关必须落共享文件才能被插件读到。
-- **谁来读、何时触发**：由 **server 插件**（`dist/emotions.js`）的 `event` 钩子消费两类事件**边生成边送 TTS**（2026-10-20 修正：opencode 的文本流式增量走 **`message.part.delta`**，`message.part.updated` 仅 text-start/text-end 各一次）——**`message.part.delta`** 按 `partID` 增量追加（delta payload 无类型，靠 text-start 快照登记的 `partID→type` 过滤 `reasoning` 等）、**`message.part.updated`** 作全量快照校准；用**同一「阈值 + 增量」口径**（`tts.streamMinChars`，默认 5）：**缓冲到阈值才首次派生 CLI 朗读，此后每个增量各派生一次**（**不做句切分**，交给服务端分句）；同一消息的朗读**串行**播放（避免新增量打断旧的），**每次派生前再读一次该会话的开关**——`F10` 关闭后队列里待播的下一段不再派生（与「立即停播」共同保证关掉即停；delta 高频路径读开关走 300ms TTL 缓存）。只读 `type==="text"` 的 part（排除 `reasoning`/thinking、`synthetic`、`ignored`），并用 `message.updated` 建立 `messageID→role` 表**只读 assistant**（避免读到用户消息；**角色未知时惰性补取一次** `info.role`，被角色门挡过的 part 置 tainted、其 delta 全丢，由快照兜底无重复；摘要消息不读）。**子会话硬跳过**：按 sessionID 单飞取 `Session.parentID` 判定（缓存），是子会话则无论开关开没开都不读。消息**完成**时补读未达阈值的缓冲并置去重，并打**每消息一条**诊断汇总（`自动朗读汇总：… session=… path=stream|fallback|skip …`）；**未观察到 part 更新**的消息在完成时回退「整段读」（用 `client.session.message(...)` 取回 parts）。
+- **谁来读、何时触发**：由 **server 插件**（`dist/emotions.js`）的 `event` 钩子消费两类事件**边生成边送 TTS**（2026-10-20 修正：opencode 的文本流式增量走 **`message.part.delta`**，`message.part.updated` 仅 text-start/text-end 各一次）——**`message.part.delta`** 按 `partID` 增量追加（delta payload 无类型，靠 text-start 快照登记的 `partID→type` 过滤 `reasoning` 等）、**`message.part.updated`** 作全量快照校准；用**同一「阈值 + 增量」口径**（`tts.streamMinChars`，默认 5）：**缓冲到阈值才首次派生**；随后 `drain` 每轮把**此刻已在队列**的块凑批合并（单批 ≤2000 字），再经 `splitSentences()` **按句对齐切分**（完整句连读、未完尾段 carry 到句尾）；**sapi 等 `followSupport` provider 对每条消息只派生 1 个 `speak --follow` 常驻 worker**，后续句子单元写入其 stdin（不再每块 spawn），消息完成时关 stdin 冲刷尾音；其它 provider 仍按句子单元 spawn CLI（流式送文本身仍是「阈值 + 增量、不做句切分」，交给服务端分句）；同一消息的朗读**串行**播放（避免新增量打断旧的），**每次派生前再读一次该会话的开关**——`F10` 关闭后队列里待播的下一段不再派生（与「立即停播」共同保证关掉即停；delta 高频路径读开关走 300ms TTL 缓存）。只读 `type==="text"` 的 part（排除 `reasoning`/thinking、`synthetic`、`ignored`），并用 `message.updated` 建立 `messageID→role` 表**只读 assistant**（避免读到用户消息；**角色未知时惰性补取一次** `info.role`，被角色门挡过的 part 置 tainted、其 delta 全丢，由快照兜底无重复；摘要消息不读）。**子会话硬跳过**：按 sessionID 单飞取 `Session.parentID` 判定（缓存），是子会话则无论开关开没开都不读。消息**完成**时补读未达阈值的缓冲并置去重，并打**每消息一条**诊断汇总（`自动朗读汇总：… session=… path=stream|fallback|skip …`）；**未观察到 part 更新**的消息在完成时回退「整段读」（用 `client.session.message(...)` 取回 parts）。
 - **怎么读**：复用 CLI——派生 `node dist/cli/emotions-cli.js speak --text-file <临时文件>`（正文写临时文件、argv 数组传参，**不拼 shell 字符串**；派生 bin 默认 PATH 上的 `node`，env `VOICE_NODE_BIN` 可覆盖——**不用** `process.execPath`，server 插件进程里那是 `opencode.exe`）；子进程 stderr 接管，非零退出或有 stderr 时 `log.warn` 带片段（不再静默无声）；同一块增量的音频本身走上面的**流式**路径。同一条消息按 **消息 id 去重**（内存 + 持久化每会话 `<sessionID>/auto-tts-seen`，防插件重启/事件重放重复朗读）。
-- **打断**：用户发消息时（`chat.message`）清空待读队列并停掉当前播放；被打断后**后续增量继续/重开**。
+- **打断**：用户发消息时（`chat.message`）清空待读队列并停掉当前播放；**被打断的消息进入永久停读水位**——后续增量/入队直接丢弃，消息完成时也**不补读**（直接置 seen，防止回退成整段重读）；**下一条新消息正常朗读**（水位是消息级，不会影响后续回复）。
 - **跨平台播放**：同上方「音频落地」表（受 `TTS_PLAYER` 控制）。
 - **Termux 限制**：见「已知限制」。
 

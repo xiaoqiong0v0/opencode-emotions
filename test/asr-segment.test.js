@@ -14,7 +14,11 @@ import {
   maxWavBytesForBase64,
   pcmRms,
   splitPcmByMaxBytes,
-  ENERGY_VAD_SCALE,
+  ENERGY_DBFS_MAX,
+  ENERGY_DBFS_MIN,
+  ENERGY_FRAME_MS,
+  rmsToDbfs,
+  thresholdToDbfs,
   MAX_BASE64_BYTES,
   WAV_DATA_URL_PREFIX,
 } from "../dist/voice/asr/segment.js";
@@ -85,7 +89,15 @@ test("pcmRms / maxWavBytesForBase64：能量与 10MB 红线换算", () => {
   // 10MB base64 → WAV 上限：(10MB - 前缀) * 3/4，含 44 字节头
   const maxWav = maxWavBytesForBase64(MAX_BASE64_BYTES);
   assert.equal(maxWav, Math.floor(((10 * 1024 * 1024 - WAV_DATA_URL_PREFIX.length) * 3) / 4));
-  assert.ok(ENERGY_VAD_SCALE > 0 && ENERGY_VAD_SCALE < 1);
+  // 新的标定口径：threshold 越高门限越高（越抗噪），默认 0.5 对应 -35dBFS（标定数据见 segment.ts）
+  assert.equal(thresholdToDbfs(0), ENERGY_DBFS_MIN);
+  assert.equal(thresholdToDbfs(1), ENERGY_DBFS_MAX);
+  assert.equal(thresholdToDbfs(0.5), (ENERGY_DBFS_MIN + ENERGY_DBFS_MAX) / 2);
+  assert.ok(thresholdToDbfs(0.7) > thresholdToDbfs(0.3), "threshold 单调：越高越抗噪");
+  assert.equal(thresholdToDbfs(Number.NaN), thresholdToDbfs(0.5), "非法阈值回退默认");
+  assert.ok(ENERGY_FRAME_MS >= 20 && ENERGY_FRAME_MS <= 40, "短帧 20~40ms");
+  assert.equal(rmsToDbfs(0), Number.NEGATIVE_INFINITY);
+  assert.ok(Math.abs(rmsToDbfs(1)) < 1e-9);
 });
 
 test("splitPcmByMaxBytes：不超限原样、超限均分且采样点对齐", () => {
@@ -162,6 +174,73 @@ test("纯静音缓冲丢弃：从未检出语音的段不发送", async () => {
   for (const chunk of chunks100(pcm(1000, false))) client.feed(chunk);
   await client.finish();
   assert.equal(submitted.length, 0, "纯静音不发送");
+});
+
+/**
+ * 生成振幅已知的正弦 PCM（s16le 单声道），用于能量标定回归。
+ * @param {number} ms 时长（毫秒）
+ * @param {number} rms 目标线性 RMS（[0,1]；0 = 纯静音）。正弦 RMS = 振幅/√2。
+ * @returns {Buffer} PCM 字节
+ */
+function sinePcm(ms, rms) {
+  const samples = Math.floor((SR * ms) / 1000);
+  const buf = Buffer.alloc(samples * 2);
+  const amplitude = rms * Math.SQRT2;
+  for (let i = 0; i < samples; i += 1) {
+    const value = Math.round(Math.sin((2 * Math.PI * 220 * i) / SR) * amplitude * 32767);
+    buf.writeInt16LE(Math.max(-32768, Math.min(32767, value)), i * 2);
+  }
+  return buf;
+}
+
+test("能量标定回归：500ms 窗平均 RMS 0.035 的语声必须切段（旧门 0.05 会整段丢弃）", async () => {
+  const submitted = [];
+  class TestClient extends SegmentAsrClientBase {
+    async submitSegment(wav) {
+      submitted.push(wav);
+      return { text: `段${submitted.length}`, emotion: "" };
+    }
+  }
+  const client = new TestClient({ sampleRate: SR, vad: { threshold: 0.5, silenceDurationMs: 300 }, onResult: () => {} });
+  // 真实量级语声：500ms/块、块平均 RMS=0.035（实测说话块 0.03~0.04），共 5 块
+  for (let i = 0; i < 5; i += 1) client.feed(sinePcm(500, 0.035));
+  // 500ms 静音 → 触发切段
+  for (const chunk of chunks100(pcm(500, false))) client.feed(chunk);
+  await client.finish();
+  assert.equal(submitted.length, 1, "低幅语声必须被识别为语音并切段发送（修复前发送 0 段）");
+  const samples = (submitted[0].length - WAV_HEADER_BYTES) / 2;
+  assert.ok(samples / SR >= 2.4, `该段应包含 ~2.5s 语声，实际 ${(samples / SR).toFixed(2)}s`);
+});
+
+test("能量标定：同一 500ms 块内「短词 + 静音」不再被整窗平均摊薄", async () => {
+  const submitted = [];
+  class TestClient extends SegmentAsrClientBase {
+    async submitSegment(wav) {
+      submitted.push(wav);
+      return { text: "短词", emotion: "" };
+    }
+  }
+  const client = new TestClient({ sampleRate: SR, vad: { threshold: 0.5, silenceDurationMs: 300 }, onResult: () => {} });
+  // 一个 500ms 块 = 200ms 语声（RMS 0.06）+ 300ms 静音 ⇒ 块平均 RMS≈0.038（< 旧门 0.05），帧级仍应判语音
+  client.feed(Buffer.concat([sinePcm(200, 0.06), pcm(300, false)]));
+  for (const chunk of chunks100(pcm(500, false))) client.feed(chunk);
+  await client.finish();
+  assert.equal(submitted.length, 1, "块内短词必须触发切段");
+});
+
+test("能量标定：静音底噪（RMS 0.0005）与纯静音都不得切段", async () => {
+  const submitted = [];
+  class TestClient extends SegmentAsrClientBase {
+    async submitSegment(wav) {
+      submitted.push(wav);
+      return { text: "不应出现", emotion: "" };
+    }
+  }
+  const client = new TestClient({ sampleRate: SR, vad: { threshold: 0.5, silenceDurationMs: 300 }, onResult: () => {} });
+  // 本机实测底噪 0.00035~0.00061（≈ -69~-64 dBFS），远低于默认门限 -35dBFS
+  for (let i = 0; i < 6; i += 1) client.feed(sinePcm(500, 0.0005));
+  await client.finish();
+  assert.equal(submitted.length, 0, "底噪不得被判为语音");
 });
 
 test("时长上限强制切段：连续语音超 maxSegmentMs 即切", async () => {

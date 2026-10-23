@@ -134,27 +134,55 @@ export function buildSapiFollowEnv(options: ResolvedTtsOptions, base: NodeJS.Pro
   return buildSapiVoiceEnv(options, base);
 }
 
+/** SapiProvider 的可注入依赖（便于离线单测；生产不传）。 */
+export interface SapiProviderOptions {
+  /** 目标平台；默认 `process.platform`（非 win32 时 `speak()` 抛错）。 */
+  platform?: NodeJS.Platform;
+  /** spawn 实现；默认 `node:child_process.spawn`（测试注入假子进程）。 */
+  spawn?: typeof spawn;
+}
+
 /** Windows SAPI provider。 */
 export class SapiProvider implements TtsProvider {
   readonly name = SAPI_PROVIDER_NAME;
   /** 支持 follow 常驻模式（一次 spawn PowerShell + ReadLine 循环连续 Speak）。 */
   readonly followSupport = true;
   private readonly log: Logger = createLogger("tts-sapi");
+  private readonly platform: NodeJS.Platform;
+  private readonly spawnFn: typeof spawn;
   private child: ChildProcess | null = null;
 
+  /**
+   * @param options 可注入依赖（platform/spawn；缺省用生产默认）
+   */
+  constructor(options: SapiProviderOptions = {}) {
+    this.platform = options.platform ?? process.platform;
+    this.spawnFn = options.spawn ?? spawn;
+  }
+
+  /**
+   * 后台开始朗读（同步返回，不等待播放完成）；内部先打断上一次。
+   *
+   * `done` 在 PowerShell 子进程真正退出后 settle：正常退出 resolve、被 `stop()`/新一次 `speak()`
+   * 打断也 resolve（有意停止）、非 0 退出/无法启动则 reject 可识别错误。
+   * @param options 解析后的朗读参数
+   * @returns 本次朗读的启动结果（含 `done`）
+   * @throws Error 非 Windows / 文本为空
+   */
   speak(options: ResolvedTtsOptions): SpeakResult {
-    if (process.platform !== "win32") {
+    if (this.platform !== "win32") {
       throw new Error("sapi provider 仅支持 Windows；请设置 TTS_PROVIDER 使用其它 provider");
     }
     if (options.text.trim().length === 0) {
       throw new Error("text 不能为空");
     }
     this.stop();
-    this.spawnPlayer(0, buildSapiEnv(options), SAPI_ARGS, "ignore");
+    const done = this.startPlayer(0, buildSapiEnv(options), SAPI_ARGS, "ignore");
     return {
       provider: this.name,
       voice: options.voice || DEFAULT_VOICE_LABEL,
       rate: clampRate(options.rate, DEFAULT_RATE),
+      done,
     };
   }
 
@@ -172,7 +200,7 @@ export class SapiProvider implements TtsProvider {
   /**
    * 当前 PowerShell 子进程 PID（真正发声的孙进程；供 `tts-playback` 登记 `playerPid`）。
    *
-   * `spawnPlayer()` 在 `speak()`/`followStart()` 内同步调用 ⇒ 返回后即可读到；子进程退出/未启动时 undefined。
+   * `startPlayer()` 在 `speak()`/`followStart()` 内同步 spawn ⇒ 返回后即可读到；子进程退出/未启动时 undefined。
    * @returns 子进程 PID；无存活子进程时 undefined
    */
   activePlayerPid(): number | undefined {
@@ -180,12 +208,13 @@ export class SapiProvider implements TtsProvider {
   }
 
   followStart(options: ResolvedTtsOptions): void {
-    if (process.platform !== "win32") {
+    if (this.platform !== "win32") {
       throw new Error("sapi provider 仅支持 Windows；请设置 TTS_PROVIDER 使用其它 provider");
     }
     // 先 stop：普通 speak 的子进程 / 上一个 follow 常驻进程都不允许与本 follow 并存
     this.stop();
-    this.spawnPlayer(0, buildSapiFollowEnv(options), SAPI_FOLLOW_ARGS, "pipe");
+    // follow 启动失败由 followLine 抛错暴露；此处只记录（不产生未处理的 Promise 拒绝）
+    void this.startPlayer(0, buildSapiFollowEnv(options), SAPI_FOLLOW_ARGS, "pipe").catch(() => undefined);
   }
 
   followLine(text: string): void {
@@ -229,44 +258,81 @@ export class SapiProvider implements TtsProvider {
   }
 
   /**
-   * 按候选顺序尝试启动 PowerShell；`ENOENT` 时回退下一个候选。
+   * 按候选顺序尝试启动 PowerShell，并返回「本次播放真正结束」的 Promise。
+   *
+   * `done` 语义（见 `SpeakResult.done` 契约）：
+   * - 子进程正常退出（退出码 0 / 无码）→ resolve；
+   * - 被 `stop()` 或新一次 `startPlayer()` 顶替（`this.child` 已不是本子进程）→ resolve（有意打断，不算失败）；
+   * - 启动失败（ENOENT 已回退完）或非 0 退出 → reject（带退出码/原因）。
    * @param index 当前候选下标
    * @param env 子进程环境变量
    * @param args PowerShell 参数（普通 speak 单发脚本 / follow ReadLine 循环脚本）
    * @param stdinMode stdin 模式：普通 speak `"ignore"`；follow `"pipe"`（写入待读行）
+   * @returns 播放结束（成功/有意停止 resolve，失败 reject）后 settle
    */
-  private spawnPlayer(index: number, env: NodeJS.ProcessEnv, args: readonly string[], stdinMode: "ignore" | "pipe"): void {
+  private startPlayer(
+    index: number,
+    env: NodeJS.ProcessEnv,
+    args: readonly string[],
+    stdinMode: "ignore" | "pipe",
+  ): Promise<void> {
     const bin = BIN_CANDIDATES[index];
     if (bin === undefined) {
-      this.log.error("未找到可用 PowerShell（powershell / pwsh）");
-      return;
+      const err = new Error("未找到可用 PowerShell（powershell / pwsh）");
+      this.log.error(err.message);
+      return Promise.reject(err);
     }
     let child: ChildProcess;
     try {
-      child = spawn(bin, [...args], { env, stdio: [stdinMode, "ignore", "pipe"], windowsHide: true });
+      child = this.spawnFn(bin, [...args], { env, stdio: [stdinMode, "ignore", "pipe"], windowsHide: true });
     } catch (err) {
-      this.log.error(`启动 ${bin} 失败`, err as Error);
-      return;
+      const error = err instanceof Error ? err : new Error(String(err));
+      this.log.error(`启动 ${bin} 失败`, error);
+      return Promise.reject(error);
     }
     this.child = child;
-    // follow 模式 stdin 写入后子进程死亡 → EPIPE 走 error 事件；不监听会让宿主进程崩溃
-    child.stdin?.on("error", (err: Error) => {
-      this.log.warn(`sapi follow stdin 写入失败：${err.message}`);
-    });
-    child.stderr?.on("data", (chunk: Buffer) => {
-      const line = String(chunk).trim();
-      if (line.length > 0) this.log.warn(`sapi stderr: ${line}`);
-    });
-    child.on("error", (err: NodeJS.ErrnoException) => {
-      if (this.child === child) this.child = null;
-      if (err.code === "ENOENT" && index + 1 < BIN_CANDIDATES.length) {
-        this.spawnPlayer(index + 1, env, args, stdinMode);
-        return;
-      }
-      this.log.error(`SAPI 子进程异常（${bin}）`, err);
-    });
-    child.on("exit", () => {
-      if (this.child === child) this.child = null;
+    return new Promise<void>((resolveDone, rejectDone) => {
+      let settled = false;
+      /** 幂等 settle（`exit` / `error` 可能先后到达）。 */
+      const settle = (action: () => void): void => {
+        if (settled) return;
+        settled = true;
+        action();
+      };
+      // follow 模式 stdin 写入后子进程死亡 → EPIPE 走 error 事件；不监听会让宿主进程崩溃
+      child.stdin?.on("error", (err: Error) => {
+        this.log.warn(`sapi follow stdin 写入失败：${err.message}`);
+      });
+      child.stderr?.on("data", (chunk: Buffer) => {
+        const line = String(chunk).trim();
+        if (line.length > 0) this.log.warn(`sapi stderr: ${line}`);
+      });
+      child.on("error", (err: NodeJS.ErrnoException) => {
+        if (this.child === child) this.child = null;
+        if (err.code === "ENOENT" && index + 1 < BIN_CANDIDATES.length) {
+          // 回退下一个候选：本次播放的 `done` 交给回退者 settle
+          this.startPlayer(index + 1, env, args, stdinMode).then(resolveDone, rejectDone);
+          return;
+        }
+        this.log.error(`SAPI 子进程异常（${bin}）`, err);
+        settle(() => rejectDone(new Error(`SAPI 播放失败（${bin}）：${err.message}`)));
+      });
+      child.on("exit", (code: number | null) => {
+        // 被 stop()/新一次 speak 顶替时 this.child 已不是本子进程 ⇒ 有意打断，正常收尾
+        const current = this.child === child;
+        if (current) this.child = null;
+        if (!current) {
+          settle(resolveDone);
+          return;
+        }
+        if (code !== null && code !== 0) {
+          const err = new Error(`SAPI 播放失败（退出码=${code}）`);
+          this.log.error(err.message);
+          settle(() => rejectDone(err));
+          return;
+        }
+        settle(resolveDone);
+      });
     });
   }
 }

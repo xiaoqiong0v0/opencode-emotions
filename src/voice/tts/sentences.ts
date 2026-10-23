@@ -44,12 +44,38 @@ export interface SentenceSplit {
 }
 
 /**
- * 按句末标点切分文本（纯函数，无 IO）。
- * @param text 输入文本
- * @returns 完整句数组与未完结尾段（`tail` 为原始后缀）
+ * 一句在**原文中的可见区间**（trim 后）。
+ *
+ * 用途：句对齐切分既要「文本单元」也要「原文消费到哪」——预取把下一单元从队列里提前摘走时，
+ * 必须按原文偏移精确切分（句子之间有空白，不能用 `text.length` 直接切片）。
  */
-export function splitSentences(text: string): SentenceSplit {
-  const sentences: string[] = [];
+export interface SentenceSpan {
+  /** 该句 trim 后的文本（含句末标点）。 */
+  text: string;
+  /** 在原文中的起始下标（含）。 */
+  start: number;
+  /** 在原文中的结束下标（不含；恰好落在句末标点之后）。 */
+  end: number;
+}
+
+/** 带原文偏移的切句结果。 */
+export interface SentenceSpanSplit {
+  /** 完整句（含原文区间）。 */
+  spans: SentenceSpan[];
+  /** 未完结尾段在原文中的起始下标（`text.slice(tailStart)` 即 `tail` 原文）。 */
+  tailStart: number;
+}
+
+/**
+ * 按句末标点切分文本，并给出每句在原文中的区间（纯函数，无 IO）。
+ *
+ * 与 {@link splitSentences} 同一口径（连续句末标点并入、空段丢弃），额外返回原文偏移：
+ * `spans[i].end` 是「消费到该句为止」的原文下标——调用方据此把已预取的句子从待读队列里摘除。
+ * @param text 输入文本
+ * @returns 完整句区间数组与未完尾段起点
+ */
+export function splitSentenceSpans(text: string): SentenceSpanSplit {
+  const spans: SentenceSpan[] = [];
   const length = text.length;
   let start = 0;
   let i = 0;
@@ -61,10 +87,26 @@ export function splitSentences(text: string): SentenceSplit {
     // 连续句末标点并入同一句（不错切成空段）
     let end = i;
     while (end + 1 < length && isTerminatorAt(text, end + 1)) end += 1;
-    const sentence = text.slice(start, end + 1).trim();
-    if (sentence.length > 0) sentences.push(sentence);
+    const raw = text.slice(start, end + 1);
+    const sentence = raw.trim();
+    if (sentence.length > 0) {
+      // trim 只可能去掉首尾空白：用 indexOf 定位可见区间在原文中的起点
+      const lead = raw.indexOf(sentence);
+      const visibleStart = start + lead;
+      spans.push({ text: sentence, start: visibleStart, end: visibleStart + sentence.length });
+    }
     start = end + 1;
     i = end + 1;
   }
-  return { sentences, tail: text.slice(start) };
+  return { spans, tailStart: start };
+}
+
+/**
+ * 按句末标点切分文本（纯函数，无 IO）。
+ * @param text 输入文本
+ * @returns 完整句数组与未完结尾段（`tail` 为原始后缀）
+ */
+export function splitSentences(text: string): SentenceSplit {
+  const { spans, tailStart } = splitSentenceSpans(text);
+  return { sentences: spans.map((span) => span.text), tail: text.slice(tailStart) };
 }

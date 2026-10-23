@@ -85,7 +85,12 @@ import {
 } from "./auto-tts.js";
 import { loadVoiceConfig } from "./config.js";
 import { PLAYBACK_SESSION_ENV } from "./playback-state.js";
-import { splitSentences } from "./tts/sentences.js";
+import { splitSentenceSpans } from "./tts/sentences.js";
+import {
+  normalizePrefetchDepth,
+  PrefetchUnit,
+  PREFETCH_DEPTH_DEFAULT,
+} from "./tts/prefetch.js";
 import { createStreamChunker, DEFAULT_STREAM_MIN_CHARS, type StreamChunker } from "./tts/stream.js";
 
 /** 消息最小结构（只取判定所需字段）。 */
@@ -153,6 +158,12 @@ export interface AutoReaderDeps {
   /** 流式最小缓冲阈值（首次朗读前需缓冲的字符数）；缺省从 `emotions.jsonc` 的 `tts.streamMinChars` 读取。 */
   streamMinChars?: number;
   /**
+   * 首句合并窗（毫秒，见 {@link FIRST_MERGE_WINDOW_MS}）：只对每条消息**首个派发单元**生效；
+   * 缺省 400，0 = 关闭。注入时该值同时作为**自适应上限**（未注入时上限=
+   * {@link FIRST_MERGE_WINDOW_MAX_MS}=1200）——测试注入小值即可缩短用例时长。
+   */
+  firstMergeWindowMs?: number;
+  /**
    * provider 是否支持 follow 常驻 worker（`speak --follow`）。生产由 `emotions.ts` 注入
    * `resolveFollowSupport()`（env→config→默认解析链）；缺省 false——测试不触真实配置/ provider，
    * 走按块 spawn 旧路径（确定性）。为 true 时 spawn/写行/收尾全经 `spawnFn` 注入观察。
@@ -164,6 +175,19 @@ export interface AutoReaderDeps {
   spawnFn?: (command: string, args: readonly string[], options: SpawnOptions) => ChildProcess;
   /** 是否派生真实子进程（测试可置 false，仅记录 argv）。 */
   spawnEnabled?: boolean;
+  /**
+   * provider 是否支持**只合成不出声**（`speak --pcm-out`，见 `resolvePcmOutputSupport()`）。
+   * 缺省 false（测试确定性：不触预取，走原有串行路径）。为 true 且 `prefetchDepth > 0` 时，
+   * 自动朗读在播当前单元期间预取**下一单元**（合成到临时文件 + 预热播放进程），交播间隔目标 <200ms。
+   */
+  prefetchSupport?: boolean;
+  /**
+   * 预取深度：默认 {@link PREFETCH_DEPTH_DEFAULT}(1)，0 = 关闭，>1 夹到 1（见 `normalizePrefetchDepth`）。
+   * 仅 `prefetchSupport=true` 时生效；且 `spawnEnabled=false`（单测假派生）一律不预取。
+   */
+  prefetchDepth?: number;
+  /** 单次预取合成超时（毫秒）；缺省 `PREFETCH_TIMEOUT_MS`（仅测试注入短值）。 */
+  prefetchTimeoutMs?: number;
 }
 
 /** 自动朗读器句柄。 */
@@ -177,6 +201,11 @@ export interface AutoReader {
    *   缺省或空白 = **全清**（dispose/进程退出等清场路径保持原「全清」语义）
    */
   interrupt(sessionID?: string): void;
+  /**
+   * **清场**（插件 `dispose` / 进程退出）：取消**全部会话**的待读队列、预取（kill 合成/预热子进程 +
+   * 删缓冲）与朗读子进程。语义等同 `interrupt()` 无参，但作为独立入口，避免与「消息级打断」混淆。
+   */
+  dispose(): void;
 }
 
 /** `messageID→role` 缓存上限（防无界增长）。 */
@@ -212,6 +241,29 @@ export const AUTO_READ_STDERR_LIMIT = 2048;
  * 上限只是防御超长，不是打断粒度约束。
  */
 export const DRAIN_MERGE_MAX_CHARS = 2000;
+/**
+ * **首句合并窗基值（毫秒，2026-10-22 第十三批修法 1；2026-10-23 第十五批改自适应）**：
+ * 每条消息的**首个派发单元**就绪时，若消息流仍未结束，等一段时间以合并随后完成的句子
+ * （例：61 字被切成 24+37 时，24 字的单元 1 播完还要为 37 字重启一次 CLI/合成/播放器，实测约 1.7s）。
+ *
+ * 自适应（用户实测：模型吐句间隔可能 >400ms）：实际等待 =
+ * `max(基值, 观测到的句间到达间隔)`，夹到 `[{@link FIRST_MERGE_WINDOW_MIN_MS}, 上限]`；
+ * 且**下一条可合并文本到达 / 流结束 / 上限到期**三者先到即结算。代价是首音延迟最多 +上限，
+ * 收益是省掉一次整条管线重启；设为 0 即关闭（语义=旧行为）。
+ */
+export const FIRST_MERGE_WINDOW_MS = 400;
+/** 首句合并窗下限（0 = 关闭）。 */
+export const FIRST_MERGE_WINDOW_MIN_MS = 0;
+/**
+ * 首句合并窗**上限**（毫秒）：再长首音延迟体感明显。模型吐句间隔实测可达 ~700ms，
+ * 上限取 1200 才能覆盖「慢半拍」的下一句，同时给首音延迟封顶。
+ */
+export const FIRST_MERGE_WINDOW_MAX_MS = 1200;
+/**
+ * 合并窗的取消轮询间隔（毫秒）：窗口等待期间周期检查「打断水位 / 会话级中断请求 / 开关关闭 /
+ * 子会话门」，保证打断**立即生效**（不依赖窗口到期）。`done` 由 `finalize()` 主动唤醒，不靠轮询。
+ */
+export const FIRST_MERGE_WINDOW_POLL_MS = 50;
 /** 消息级打断水位集合上限（LRU 淘汰最旧，防未完成消息无界堆积）。 */
 export const INTERRUPTED_LIMIT = 100;
 /**
@@ -264,33 +316,101 @@ export function splitDrainUnits(
   merged: string,
   maxChars: number = DRAIN_MERGE_MAX_CHARS,
 ): { units: string[]; carry: string } {
+  const { units, carry } = splitDrainUnitSpans(merged, maxChars);
+  return { units: units.map((unit) => unit.text), carry };
+}
+
+/** 一个朗读单元 + 它在合并正文中的**原文消费终点**（供预取提前摘除）。 */
+export interface DrainUnitSpan {
+  /** 单元文本（完整句拼接，已 trim）。 */
+  text: string;
+  /** 消费到该单元为止的原文下标（不含）；`merged.slice(0, end)` 即本单元覆盖的原文。 */
+  end: number;
+}
+
+/**
+ * 与 {@link splitDrainUnits} 同一口径，但额外给出每个单元的**原文区间终点**。
+ *
+ * 预取必须精确知道「从待读队列里摘走哪一段」：句子之间存在被 trim 的空白，
+ * 不能简单用 `unit.text.length` 切片（否则会错位/重复）。`end` 落在句末标点之后，
+ * `merged.slice(end)` 即剩余文本（含下一句前的空白，后续切句会再 trim）。
+ * @param merged 合并后的文本（carry + 队列块）
+ * @param maxChars 单元字符上限（默认 {@link DRAIN_MERGE_MAX_CHARS}）
+ * @returns `units`=按序单元（文本 + 原文终点）；`carry`=未完结尾段**原文**
+ */
+export function splitDrainUnitSpans(
+  merged: string,
+  maxChars: number = DRAIN_MERGE_MAX_CHARS,
+): { units: DrainUnitSpan[]; carry: string } {
   const limit = Math.max(1, Math.trunc(maxChars));
-  const { sentences, tail } = splitSentences(merged);
-  const pieces: string[] = [];
-  for (const sentence of sentences) {
-    if (sentence.length <= limit) {
-      pieces.push(sentence);
+  const { spans, tailStart } = splitSentenceSpans(merged);
+  const pieces: DrainUnitSpan[] = [];
+  for (const span of spans) {
+    if (span.text.length <= limit) {
+      pieces.push({ text: span.text, end: span.end });
       continue;
     }
-    // 唯一的句内硬切：单句超上限
-    for (let i = 0; i < sentence.length; i += limit) pieces.push(sentence.slice(i, i + limit));
+    // 唯一的句内硬切：单句超上限（按 trim 后文本切，终点仍可精确映射回原文）
+    for (let i = 0; i < span.text.length; i += limit) {
+      const piece = span.text.slice(i, i + limit);
+      pieces.push({ text: piece, end: span.start + i + piece.length });
+    }
   }
-  const units: string[] = [];
-  let current = "";
+  const units: DrainUnitSpan[] = [];
+  let current: DrainUnitSpan | null = null;
   for (const piece of pieces) {
-    if (current.length === 0) {
-      current = piece;
+    if (!current) {
+      current = { text: piece.text, end: piece.end };
       continue;
     }
-    if (current.length + piece.length <= limit) {
-      current += piece;
+    if (current.text.length + piece.text.length <= limit) {
+      current = { text: current.text + piece.text, end: piece.end };
     } else {
       units.push(current);
-      current = piece;
+      current = { text: piece.text, end: piece.end };
     }
   }
-  if (current.length > 0) units.push(current);
-  return { units, carry: tail };
+  if (current) units.push(current);
+  // 没有完整句时 carry 必须是整段原文（tailStart 为 0）；有完整句时 tailStart 与最后一个 span.end
+  // 之间的空白属于剩余文本，故用 tailStart 切分（与 splitSentences 的 tail 完全一致）。
+  return { units, carry: merged.slice(tailStart) };
+}
+
+/**
+ * 归一化首句合并窗（毫秒）：非有限值回退 {@link FIRST_MERGE_WINDOW_MS}，越界夹到
+ * [{@link FIRST_MERGE_WINDOW_MIN_MS}, {@link FIRST_MERGE_WINDOW_MAX_MS}]，其余取整。
+ * @param ms 注入值（缺省=默认 400）
+ * @returns 实际使用的窗口长度（毫秒；0 = 关闭合并窗）
+ */
+export function normalizeFirstMergeWindow(ms: number | undefined): number {
+  if (ms === undefined || !Number.isFinite(ms)) return FIRST_MERGE_WINDOW_MS;
+  return Math.min(FIRST_MERGE_WINDOW_MAX_MS, Math.max(FIRST_MERGE_WINDOW_MIN_MS, Math.trunc(ms)));
+}
+
+/**
+ * 计算**一次**首句合并窗的实际等待时长（自适应，纯函数）。
+ *
+ * 口径：`clamp(max(基值, 观测到的句间到达间隔), 0, 上限)`；本消息尚无观测（首个单元必然如此）
+ * 时按**上限**等——用户实测模型的吐句间隔可能 >400ms，固定 400ms 会把同一句回复拆成两个单元。
+ * 等待本身还会被「下一条可合并文本到达 / 流结束」提前结算，故上限不是固定延迟。
+ * @param baseMs 基值（`FIRST_MERGE_WINDOW_MS` 或注入值）
+ * @param observedGapMs 观测到的句间到达间隔（毫秒）；无观测为 undefined
+ * @param capMs 上限（注入值或 {@link FIRST_MERGE_WINDOW_MAX_MS}）
+ * @returns 实际等待时长（毫秒；0 = 不等待）
+ */
+export function adaptiveFirstMergeWindow(
+  baseMs: number,
+  observedGapMs: number | undefined,
+  capMs: number,
+): number {
+  const cap = Math.max(FIRST_MERGE_WINDOW_MIN_MS, Math.trunc(capMs));
+  if (cap === 0) return 0;
+  const base = Math.min(cap, Math.max(FIRST_MERGE_WINDOW_MIN_MS, Math.trunc(baseMs)));
+  const observed =
+    observedGapMs === undefined || !Number.isFinite(observedGapMs)
+      ? cap
+      : Math.max(base, Math.trunc(observedGapMs));
+  return Math.min(cap, Math.max(base, observed));
 }
 
 /** 单个 text part 的增量状态（同一条消息可有多个 text part，各有独立偏移）。 */
@@ -348,8 +468,14 @@ interface StreamState {
    * 使块边界落在句尾；消息完成（done）时作为最终单元冲出（末尾无标点也不丢文本）。
    */
   carry: string;
-  /** 是否正在串行播放。 */
-  active: boolean;
+  /**
+   * 在途 drain 循环（同一消息至多一个）。
+   *
+   * 2026-10-22 审计修复：原来的 `active: boolean` 只能表达「忙/闲」，`finalize()` 无法知道
+   * 尾部队列何时真正放完；现改为可 await 的 Promise——`finalize` 在它收敛后才回收
+   * `streams`/partMeta，使「消息已完成但仍在 drain/播放」的窗口仍能被 `interrupt()` 命中。
+   */
+  loop: Promise<void> | null;
   /** 消息是否已完成。 */
   done: boolean;
   /** 流式送文分块器（阈值 + 增量；缓冲未达阈值的短文本）。 */
@@ -358,6 +484,28 @@ interface StreamState {
   worker?: FollowWorker;
   /** follow worker 派生失败后，该消息退回按块 spawn CLI 路径。 */
   followBroken: boolean;
+  /** 是否已经派发过该消息的首个单元（首句合并窗只生效一次）。 */
+  firstDispatchDone: boolean;
+  /**
+   * 当前是否有单元正在播放（`drain` 已开始投递、尚未 await 到播放结束）。
+   * 只有为 true 时 `enqueue` 才会尝试预取下一单元——否则会把还没凑批合并的文本提前摘走，
+   * 改变既有凑批语义（首句合并窗也依赖队列）。
+   */
+  playing: boolean;
+  /**
+   * **已预取、等待交播的下一单元**（深度 1，单槽）：其正文在预取启动时就从 `queue/carry`
+   * 按原文偏移**摘走**（顺序确定、不会与后续文本重排）；失败/打断时按 `entry.text` 退回串行投递，
+   * 保证不丢句。所有权：预取进程与临时文件归本条目，消费/取消后清空。
+   */
+  prefetch?: PrefetchUnit;
+  /**
+   * 首句合并窗的唤醒钩子（等待期间 `finalize()`/`stopInFlight()`/新文本用它立即推进）：
+   * - `done`＝消息流已结束（立即派发，不必等窗口到期）；
+   * - `cancel`＝打断/开关关闭/子会话门（立即取消等待，**不得拖延中断**）；
+   * - `arrived`＝又完成了一整句（可并入首单元，立即结算并合并，不必等满窗口）。
+   * 无等待者时为 undefined（幂等清理）。
+   */
+  wakeFirstWindow?: (reason: "done" | "cancel" | "arrived") => void;
 }
 
 /**
@@ -416,8 +564,30 @@ export function createAutoReader(deps: AutoReaderDeps): AutoReader {
   // 阈值口径与 provider 一致：缺省从 emotions.jsonc 的 tts.streamMinChars 读取（可注入）
   const streamMinChars = deps.streamMinChars ?? loadVoiceConfig({ configDir: deps.configDir }).tts.streamMinChars;
   const effectiveMinChars = Number.isFinite(streamMinChars) ? Math.max(0, Math.trunc(streamMinChars)) : DEFAULT_STREAM_MIN_CHARS;
+  // 首句合并窗（0 = 关闭；越界夹取，见 normalizeFirstMergeWindow）
+  const firstMergeWindowBaseMs = normalizeFirstMergeWindow(deps.firstMergeWindowMs);
+  // 注入值同时作为自适应上限（测试注入小值即可缩短用例）——未注入时上限 = FIRST_MERGE_WINDOW_MAX_MS
+  const firstMergeWindowCapMs =
+    deps.firstMergeWindowMs === undefined ? FIRST_MERGE_WINDOW_MAX_MS : firstMergeWindowBaseMs;
+  /**
+   * 跨消息的「句间到达间隔」观测（毫秒；进程内）：模型吐句节奏是模型属性而非消息属性，
+   * 故一条消息里学到的间隔供**下一条消息**的首句合并窗使用；无观测时按上限等。
+   */
+  let lastObservedSentenceGapMs: number | undefined;
+  /** 上一条观测到的句末标点时刻（只统计**同一消息**内的相邻句，避免把跨消息空闲算成间隔）。 */
+  let lastSentenceBoundary: { messageID: string; at: number } | undefined;
+  /** 最近一次首句合并窗的实际等待时长（日志用）。 */
+  let lastMergeWindowMs = 0;
   // provider follow 能力：生产由 emotions.ts 注入 resolveFollowSupport()；缺省 false（测试确定性，走按块 spawn）
   const followSupport = deps.followSupport === true;
+  /**
+   * 预取深度（见 {@link AutoReaderDeps.prefetchDepth}）：`prefetchSupport` 为假、`spawnEnabled=false`
+   * 或 depth=0 时**完全关闭**（既有测试与 sapi 路径行为不变）。
+   */
+  const prefetchDepth =
+    deps.prefetchSupport === true && spawnEnabled
+      ? normalizePrefetchDepth(deps.prefetchDepth ?? PREFETCH_DEPTH_DEFAULT)
+      : 0;
   // 已朗读消息 id：按会话懒加载持久化记录（覆盖插件重启/事件重放），运行期滚动写回该会话文件
   /** `sessionID → 已朗读消息 id 集合`（LRU：命中即移到队尾；上限 {@link SEEN_SESSION_CACHE_LIMIT}）。 */
   const seenBySession = new Map<string, Set<string>>();
@@ -590,6 +760,10 @@ export function createAutoReader(deps: AutoReaderDeps): AutoReader {
       activeIds.add(messageID);
       state.queue.length = 0;
       state.carry = "";
+      // 已预取的下一单元：立即 kill 合成/预热进程并删缓冲文件（打断优先级最高，不得残留播放）
+      discardPrefetch(state);
+      // 首句合并窗等待者立即取消（打断不得因等新句而拖延）
+      state.wakeFirstWindow?.("cancel");
     }
     for (const [messageID, counters] of diag) {
       if (scoped && counters.sessionID !== sessionID) continue;
@@ -1033,35 +1207,293 @@ export function createAutoReader(deps: AutoReaderDeps): AutoReader {
   };
 
   /**
+   * 丢弃当前消息已预取的下一单元（kill 合成/预热子进程 + 删文件；幂等）。
+   * 打断/开关关/子会话门/收敛清理都走它，保证**不残留播放、不残留临时文件**。
+   * @param state 消息状态
+   */
+  const discardPrefetch = (state: StreamState): void => {
+    const entry = state.prefetch;
+    state.prefetch = undefined;
+    entry?.cancel();
+  };
+
+  /**
+   * 为一段**已知正文**启动预取（深度 1：已有预取时不重复启动）。
+   * @param state 消息状态
+   * @param text 下一单元正文（非空）
+   * @param messageID 消息 id
+   */
+  const startPrefetchText = (state: StreamState, text: string, messageID: string): void => {
+    if (prefetchDepth < 1 || state.prefetch) return;
+    if (text.trim().length === 0) return;
+    if (interrupted.has(messageID)) return;
+    const entry = new PrefetchUnit(
+      {
+        cliPath,
+        spawnBin,
+        spawnFn,
+        log,
+        paths: pathOptions,
+        attach: (child) => activeChildren.set(child, { messageID, sessionID: state.sessionID }),
+        detach: (child) => activeChildren.delete(child),
+        timeoutMs: deps.prefetchTimeoutMs,
+      },
+      text,
+      messageID,
+      state.sessionID,
+    );
+    state.prefetch = entry;
+    entry.start();
+    void entry.ready.then((ok) => {
+      if (!ok && state.prefetch === entry) {
+        log.info(`自动朗读预取不可用，将退回串行：message=${messageID} len=${text.length}`);
+      }
+    });
+  };
+
+  /**
+   * 从待读队列里**按句对齐**摘出下一单元并预取（仅当有单元正在播放时）。
+   *
+   * 为什么只在播放中：`drain` 每轮要把「此刻已在队列」的块凑批合并 + 首句合并窗；提前摘走会
+   * 改变既有合并语义。播放期间新到的文本不会参与本轮合并（drain 正 await 播放），此时摘走是安全的。
+   * 摘除用原文偏移（`splitDrainUnitSpans`），顺序确定；失败时 `entry.text` 仍会串行补读，不丢句。
+   * @param state 消息状态
+   * @param messageID 消息 id
+   */
+  const maybeStartPrefetch = (state: StreamState, messageID: string): void => {
+    if (prefetchDepth < 1 || state.prefetch || !state.playing) return;
+    if (interrupted.has(messageID)) return;
+    if (childGateBlocks(state.sessionID)) return;
+    if (!readAutoTts(state.sessionID, pathOptions)) return;
+    const pending = state.carry + state.queue.join("");
+    if (pending.length === 0) return;
+    const { units } = splitDrainUnitSpans(pending);
+    let candidate: { text: string; consumed: number } | null = null;
+    if (units.length > 0) {
+      candidate = { text: units[0].text, consumed: units[0].end };
+    } else if (state.done) {
+      // 消息已完成：末尾无标点的尾段也作为最终单元（与 drain 的 finalUnit 同口径）
+      const finalText = pending.trim();
+      if (finalText.length > 0) candidate = { text: finalText, consumed: pending.length };
+    }
+    if (!candidate) return;
+    // 摘走：carry 保留剩余原文（含句间空白），队列块已全部并入 pending
+    state.carry = pending.slice(candidate.consumed);
+    state.queue.length = 0;
+    startPrefetchText(state, candidate.text, messageID);
+  };
+
+  /**
+   * 交播一个**已预取**单元：打断/开关/子会话门复查 → 打开交播闸门 → 等播放进程退出。
+   * 预取不可用（合成失败/超时/播放器从未起播）→ **退回串行** `deliverUnit`（同一正文，不丢句）。
+   * @param state 消息状态
+   * @param entry 预取条目
+   * @param messageID 消息 id
+   */
+  const playPrefetched = async (state: StreamState, entry: PrefetchUnit, messageID: string): Promise<void> => {
+    if (applyInterruptRequest(messageID, state.sessionID)) {
+      entry.cancel();
+      return;
+    }
+    if (!readAutoTts(state.sessionID, pathOptions) || childGateBlocks(state.sessionID)) {
+      entry.cancel();
+      return;
+    }
+    const played = await entry.play();
+    if (played) return;
+    if (interrupted.has(messageID)) {
+      entry.cancel();
+      return;
+    }
+    log.warn(`自动朗读预取不可用，退回串行：message=${messageID} len=${entry.text.length}`);
+    await deliverUnit(state, entry.text, messageID);
+  };
+
+  /**
+   * 播放一个单元（统一入口）：若 `state.prefetch` 恰好是本单元则交播预取，否则走串行合成播放；
+   * 播放**开始后**立即尝试预取下一单元（深度 1），并在播放结束的 finally 里回落 `playing`。
+   *
+   * 顺序契约：`state.playing` 在派生/交播**之前**置位、在播放结束**之后**清除；预取只在
+   * `playing=true` 时启动，因此**不会**把还在凑批/合并窗阶段的文本提前摘走。
+   * @param state 消息状态
+   * @param unit 单元正文
+   * @param messageID 消息 id
+   * @param prefetched 已预取条目（可选；正文必须与 `unit` 一致）
+   * @param nextText 已确定的本批下一单元正文（可选；优先于队列预取——它更靠前）
+   * @returns 本单元播放结束（或被中断/降级路径收敛）后 resolve
+   */
+  const playUnit = (
+    state: StreamState,
+    unit: string,
+    messageID: string,
+    prefetched?: PrefetchUnit,
+    nextText?: string,
+  ): Promise<void> => {
+    state.playing = true;
+    const done = prefetched ? playPrefetched(state, prefetched, messageID) : deliverUnit(state, unit, messageID);
+    // 派生已同步完成（非 follow）/已写 stdin 行（follow）：此刻启动下一单元预取。
+    // **顺序**：本批已确定的下一单元优先占用单槽（它比队列里的文本更靠前），再尝试队列预取。
+    if (nextText !== undefined) startPrefetchText(state, nextText, messageID);
+    maybeStartPrefetch(state, messageID);
+    return done.finally(() => {
+      state.playing = false;
+    });
+  };
+
+  /**
+   * 投递一个单元并消费其预取条目（若文本一致）：预取按序摘取，文本不一致视为异常
+   * （理论上不会发生）——丢弃预取、串行播放本单元，绝不混音/乱序。
+   * @param state 消息状态
+   * @param unit 单元正文
+   * @param messageID 消息 id
+   * @param nextText 本批下一单元正文（可选；用于在播当前单元期间预取它）
+   */
+  const deliverNext = async (
+    state: StreamState,
+    unit: string,
+    messageID: string,
+    nextText?: string,
+  ): Promise<void> => {
+    const entry = state.prefetch;
+    if (entry && entry.text === unit) {
+      state.prefetch = undefined;
+      await playUnit(state, unit, messageID, entry, nextText);
+      return;
+    }
+    if (entry) discardPrefetch(state);
+    await playUnit(state, unit, messageID, undefined, nextText);
+  };
+
+  /**
+   * 合并窗期间是否应取消等待（打断优先级最高）：消息级打断水位、开关被关、子会话门、
+   * 会话级中断请求（跨进程水位，命中即走同一套 `stopInFlight`）。
+   * @param state 消息状态
+   * @param messageID 消息 id
+   * @returns 是否应立即取消等待并放弃派发
+   */
+  const mergeWindowCancelRequested = (state: StreamState, messageID: string): boolean =>
+    interrupted.has(messageID) ||
+    !readAutoTts(state.sessionID, pathOptions) ||
+    childGateBlocks(state.sessionID) ||
+    applyInterruptRequest(messageID, state.sessionID);
+
+  /**
+   * 等待首句合并窗（见 {@link adaptiveFirstMergeWindow}）。四种结算：
+   * - `timeout`：自适应窗口到期；
+   * - `arrived`：又完成了一整句（可并入首单元；`enqueue` 唤醒，立即结算合并，不必等满窗口）；
+   * - `done`：消息流在窗口内结束（`finalize()` 主动唤醒，立即派发，不多等）；
+   * - `cancel`：打断/开关关闭/子会话门/会话级中断请求（**立即**取消，绝不拖延中断）。
+   * 等待期间每 {@link FIRST_MERGE_WINDOW_POLL_MS} 复查一次取消条件（跨进程请求只能轮询），
+   * 并登记 `state.wakeFirstWindow` 供同进程的 `finalize()`/`stopInFlight()`/`enqueue()` 即时唤醒。
+   * @param state 消息状态
+   * @param messageID 消息 id
+   * @returns 结算原因
+   */
+  const waitFirstMergeWindow = (
+    state: StreamState,
+    messageID: string,
+  ): Promise<"timeout" | "arrived" | "done" | "cancel"> =>
+    new Promise<"timeout" | "arrived" | "done" | "cancel">((resolve) => {
+      let settled = false;
+      let timer: NodeJS.Timeout | undefined;
+      let poll: NodeJS.Timeout | undefined;
+      function finish(reason: "timeout" | "arrived" | "done" | "cancel"): void {
+        if (settled) return;
+        settled = true;
+        if (timer !== undefined) clearTimeout(timer);
+        if (poll !== undefined) clearInterval(poll);
+        if (state.wakeFirstWindow === wake) state.wakeFirstWindow = undefined;
+        resolve(reason);
+      }
+      function wake(reason: "done" | "cancel" | "arrived"): void {
+        finish(reason);
+      }
+      state.wakeFirstWindow = wake;
+      // 等待开始前就已打断/关闭/已结束：不必再等
+      if (mergeWindowCancelRequested(state, messageID)) {
+        finish("cancel");
+        return;
+      }
+      if (state.done) {
+        finish("done");
+        return;
+      }
+      const windowMs = adaptiveFirstMergeWindow(firstMergeWindowBaseMs, lastObservedSentenceGapMs, firstMergeWindowCapMs);
+      lastMergeWindowMs = windowMs;
+      if (windowMs <= 0) {
+        finish("timeout");
+        return;
+      }
+      timer = setTimeout(() => finish("timeout"), windowMs);
+      poll = setInterval(() => {
+        if (mergeWindowCancelRequested(state, messageID)) finish("cancel");
+        else if (state.done) finish("done");
+      }, FIRST_MERGE_WINDOW_POLL_MS);
+    });
+
+  /**
+   * 把「窗口内新完成的完整句」并入首个单元（**只并完整句**，保持句对齐与顺序）：
+   * 取 `carry + 队列全部块` 重新按 `splitDrainUnits()` 口径切分（未完尾段回写 `carry`，
+   * 沿用既有 carry 语义），再按 {@link DRAIN_MERGE_MAX_CHARS} 贪婪追加到首单元；
+   * 超上限的句子**按原顺序**作为本批后续单元返回（不丢、不重排）。
+   * @param state 消息状态
+   * @param unit 首个单元（窗口前的正文，保证 ≤ 合并上限）
+   * @returns `unit`=合并后的首单元；`rest`=未能并入的完整句单元（顺序不变）
+   */
+  const mergeNewSentencesIntoFirstUnit = (state: StreamState, unit: string): { unit: string; rest: string[] } => {
+    if (state.carry.length === 0 && state.queue.length === 0) return { unit, rest: [] };
+    const pending = state.carry + state.queue.join("");
+    state.queue.length = 0;
+    state.carry = "";
+    const { units, carry } = splitDrainUnits(pending);
+    state.carry = carry;
+    const rest: string[] = [];
+    let merged = unit;
+    for (const extra of units) {
+      if (merged.length + extra.length <= DRAIN_MERGE_MAX_CHARS) merged += extra;
+      else rest.push(extra);
+    }
+    return { unit: merged, rest };
+  };
+
+  /**
    * 串行播放某消息的待读队列（每轮把**此刻已在队列**的块凑批合并 → 句对齐切分 → 逐单元投递）。
    * 派生前复查：子会话（或未知 fail-closed）→ 清空队列/carry 不再播；开关关 → 清空不再播；
    * 打断水位置位 → 清空不再播（中止时一并关 follow worker）。
    * 消息完成（done）且队列/carry 已空 → 关 follow worker（EOF 等退出，冲刷尾音）。
    * 不在 drain 打汇总（避免与 finalize/runFallback 双打；skip 汇总只在 finalize/runFallback 路径）。
+   * **首句合并窗（2026-10-22 第十三批修法 1）**：每消息**首个**单元派发前，若消息流未结束，
+   * 最多等 `firstMergeWindowMs` 把窗口内新完成的句子并进该单元（省一次整条管线重启）；
+   * 第 2 个及以后单元、以及已是最后一句（流已结束）的情况**不等待**。
+   * **幂等**：已在跑时返回同一个 Promise（调用方可 await 到真正收敛）。
    * @param state 消息状态
    * @param messageID 消息 id
+   * @returns 该消息本轮到收敛（队列/carry 清空、follow worker 关闭）后 resolve
    */
-  const drain = async (state: StreamState, messageID: string): Promise<void> => {
-    if (state.active) return;
-    state.active = true;
-    try {
+  const drain = (state: StreamState, messageID: string): Promise<void> => {
+    // 已在跑：返回同一 Promise（调用方可 await 到真正收敛，不再「忙就立即返回」）
+    if (state.loop) return state.loop;
+    const loop = (async () => {
       for (;;) {
-        // 终态收敛：完成且无待处理文本 → 关 follow worker（EOF 等退出，冲刷尾音）
-        if (state.done && state.queue.length === 0 && state.carry.length === 0) {
+        const hasPending =
+          state.prefetch !== undefined || state.queue.length > 0 || state.carry.length > 0;
+        // 终态收敛：完成且无待处理文本（含预取槽）→ 关 follow worker（EOF 等退出，冲刷尾音）
+        if (state.done && !hasPending) {
           if (state.worker) await closeWorker(state);
           break;
         }
-        if (state.queue.length === 0) {
-          // 未完成且队列空：carry 留待下一批拼接（等新 delta / finalize）
-          if (!state.done) break;
-          // 已完成：carry 尾段作为最终单元冲出（消息末尾无标点也不丢文本）
-          const finalUnit = state.carry;
+        // 打断水位：interrupt() 置位后不再派生（interrupt 已清队列/预取，此处兜底 await 期间的置位）。
+        // 预取同样立即丢弃（kill 合成/预热进程 + 删文件），绝不残留播放。
+        if (interrupted.has(messageID)) {
+          discardPrefetch(state);
+          state.queue.length = 0;
           state.carry = "";
-          if (finalUnit.trim().length > 0) await deliverUnit(state, finalUnit, messageID);
-          continue;
+          if (state.worker) await closeWorker(state);
+          break;
         }
-        // 子会话硬跳过：判定为子会话（或未知期间 fail-closed）→ 清空队列/carry、不再派生
+        // 子会话硬跳过：判定为子会话（或未知期间 fail-closed）→ 清空队列/carry/预取、不再派生
         if (childGateBlocks(state.sessionID)) {
+          discardPrefetch(state);
           state.queue.length = 0;
           state.carry = "";
           if (state.worker) await closeWorker(state);
@@ -1069,17 +1501,28 @@ export function createAutoReader(deps: AutoReaderDeps): AutoReader {
         }
         // 派生前复查开关（实时读，不经 TTL 缓存）：F10 关闭后立即停止，不再继续播已入队的下一段
         if (!readAutoTts(state.sessionID, pathOptions)) {
+          discardPrefetch(state);
           state.queue.length = 0;
           state.carry = "";
           if (state.worker) await closeWorker(state);
           break;
         }
-        // 打断水位：interrupt() 置位后不再派生（interrupt 已清队列，此处兜底 await 期间的置位）
-        if (interrupted.has(messageID)) {
-          state.queue.length = 0;
+        // 预取槽优先消费（其正文已从队列按序摘走）：交播失败自动退回串行，不丢句
+        if (state.prefetch) {
+          const entry = state.prefetch;
+          state.prefetch = undefined;
+          await playUnit(state, entry.text, messageID, entry);
+          if (interrupted.has(messageID)) break;
+          continue;
+        }
+        if (state.queue.length === 0) {
+          // 未完成且队列空：carry 留待下一批拼接（等新 delta / finalize）
+          if (!state.done) break;
+          // 已完成：carry 尾段作为最终单元冲出（消息末尾无标点也不丢文本）
+          const finalUnit = state.carry;
           state.carry = "";
-          if (state.worker) await closeWorker(state);
-          break;
+          if (finalUnit.trim().length > 0) await playUnit(state, finalUnit, messageID);
+          continue;
         }
         // 凑批合并（消碎块×进程冷启动）：shift 首块（前置 carry）后继续 shift 拼接**此刻已在队列**的块。
         // 事件驱动：只拼现成的块，不等待/不轮询新 delta；单次合并 ≤ DRAIN_MERGE_MAX_CHARS。
@@ -1094,23 +1537,69 @@ export function createAutoReader(deps: AutoReaderDeps): AutoReader {
         // 句对齐切分：完整句连读成单元；未完结尾段 carry 到下一批（块边界落在句尾）
         const { units, carry } = splitDrainUnits(merged);
         state.carry = carry;
-        for (const unit of units) {
+        let batchUnits = units;
+        // 首句合并窗：仅当（a）该消息还没派发过首个单元、（b）本批恰好只有 1 个完整句单元
+        // （≥2 说明本批已够长，无需再等）、（c）消息流未结束（最后一句不等，避免无谓延迟）、
+        // （d）窗口 > 0 时生效。等待期间新完成的句子（`arrived`）或窗口到期后并入该单元。
+        if (!state.firstDispatchDone && batchUnits.length === 1 && !state.done && firstMergeWindowCapMs > 0) {
+          const outcome = await waitFirstMergeWindow(state, messageID);
+          if (outcome === "cancel") {
+            // 打断优先级最高：不派发，清空待读文本/预取（与上面打断分支同语义）
+            discardPrefetch(state);
+            state.queue.length = 0;
+            state.carry = "";
+            if (state.worker) await closeWorker(state);
+            break;
+          }
+          state.firstDispatchDone = true;
+          log.info(
+            `自动朗读首句合并窗：message=${messageID} outcome=${outcome} windowMs=${lastMergeWindowMs}`,
+          );
+          const mergedFirst = mergeNewSentencesIntoFirstUnit(state, batchUnits[0]);
+          batchUnits = [mergedFirst.unit, ...mergedFirst.rest];
+        } else if (batchUnits.length > 0) {
+          state.firstDispatchDone = true;
+        }
+        for (let index = 0; index < batchUnits.length; index += 1) {
+          const unit = batchUnits[index];
           if (unit.trim().length === 0) continue;
-          await deliverUnit(state, unit, messageID);
+          // 同批的下一单元正文已确定：在**当前单元开始播放后**预取它（深度 1；优先于队列）
+          const following = batchUnits[index + 1];
+          await deliverNext(state, unit, messageID, following);
           // worker 死亡/打断置位后不再继续投递本批剩余单元
           if (interrupted.has(messageID)) break;
         }
+        if (interrupted.has(messageID)) {
+          discardPrefetch(state);
+          state.queue.length = 0;
+          state.carry = "";
+          break;
+        }
+        // 已预取的下一单元必须先交播（它在队列里更靠前）；硬切留到下一轮，避免丢句/乱序
+        if (state.prefetch) continue;
         // 无标点超长尾巴兜底：累计 carry 超上限＝「单句超上限」唯一场景 → 句内硬切（防无限攒到 done）
-        if (!state.done && !interrupted.has(messageID) && state.carry.length > DRAIN_MERGE_MAX_CHARS) {
+        if (!state.done && state.carry.length > DRAIN_MERGE_MAX_CHARS) {
           const head = state.carry.slice(0, DRAIN_MERGE_MAX_CHARS);
           state.carry = state.carry.slice(DRAIN_MERGE_MAX_CHARS);
-          await deliverUnit(state, head, messageID);
+          state.firstDispatchDone = true;
+          await deliverNext(state, head, messageID);
         }
       }
-    } finally {
-      state.active = false;
-    }
+    })();
+    state.loop = loop.finally(() => {
+      state.loop = null;
+    });
+    return state.loop;
   };
+
+  /**
+   * 当前待读文本里是否已有**完整句单元**（首句合并窗可立即并入首单元）。
+   * 只在合并窗等待期间调用——否则每个增量都做一次切句是浪费。
+   * @param state 消息状态
+   * @returns 有可合并的完整句返回 true
+   */
+  const hasMergeableUnit = (state: StreamState): boolean =>
+    splitDrainUnits(state.carry + state.queue.join("")).units.length > 0;
 
   /**
    * 把一块待读文本加入队列并触发串行播放（同时累计诊断）。
@@ -1125,7 +1614,20 @@ export function createAutoReader(deps: AutoReaderDeps): AutoReader {
     const counters = diagFor(messageID, state.sessionID);
     counters.chunks += 1;
     counters.chars += chunk.length;
+    // 观测「句间到达间隔」（与切句同一口径：本块含句末标点即视为一句到达）：
+    // 只统计同一消息内的相邻句，最终用于**下一条消息**首句合并窗的自适应上限。
+    if (splitSentenceSpans(chunk).spans.length > 0) {
+      const now = Date.now();
+      if (lastSentenceBoundary?.messageID === messageID) {
+        lastObservedSentenceGapMs = now - lastSentenceBoundary.at;
+      }
+      lastSentenceBoundary = { messageID, at: now };
+    }
     void drain(state, messageID);
+    // 首句合并窗等待中又完成了一整句：立即结算并合并（不必等满窗口）——只在真有可合并单元时唤醒
+    if (state.wakeFirstWindow && hasMergeableUnit(state)) state.wakeFirstWindow("arrived");
+    // 播放中到达的文本：一形成完整句就提前合成下一单元（预取的最大收益路径）
+    maybeStartPrefetch(state, messageID);
   };
 
   /**
@@ -1152,10 +1654,12 @@ export function createAutoReader(deps: AutoReaderDeps): AutoReader {
       parts: new Map<string, PartStreamState>(),
       queue: [],
       carry: "",
-      active: false,
+      loop: null,
       done: false,
       chunker: createStreamChunker({ minChars: effectiveMinChars }),
       followBroken: false,
+      firstDispatchDone: false,
+      playing: false,
     };
     streams.set(messageID, created);
     return created;
@@ -1337,6 +1841,7 @@ export function createAutoReader(deps: AutoReaderDeps): AutoReader {
       interrupted.delete(messageID);
       rememberSeen(sessionID, messageID);
       if (state) {
+        discardPrefetch(state);
         for (const partID of state.parts.keys()) partMeta.delete(partID);
         streams.delete(messageID);
         logSummary(messageID, sessionID, "stream");
@@ -1356,12 +1861,25 @@ export function createAutoReader(deps: AutoReaderDeps): AutoReader {
     state.done = true;
     flushPending(state, messageID);
     for (const chunk of state.chunker.flush()) enqueue(state, chunk, messageID);
+    // 首句合并窗等待者立即推进（流已结束：不再等窗口，直接派发当前首单元）
+    state.wakeFirstWindow?.("done");
     // 无新块入队时也触发一轮 drain：终态收敛（关 follow worker / 空转即退）
-    void drain(state, messageID);
+    const settlement = drain(state, messageID);
     rememberSeen(sessionID, messageID);
     logSummary(messageID, sessionID, "stream");
-    for (const partID of state.parts.keys()) partMeta.delete(partID);
-    streams.delete(messageID);
+    // **状态回收推迟到 drain 收敛之后**（2026-10-22 审计修复）：finalize 只代表「文本已完整」，
+    // 队列/carry 还在异步播放。旧实现此刻就删 streams/partMeta ⇒ 之后 interrupt(sessionID) 看不到
+    // 这条消息，尾段照念。改为在 settlement 收敛后统一摘除（完成后必清、不泄漏）。
+    void settlement
+      .catch((err: unknown) => {
+        log.warn("自动朗读收尾失败（状态仍会清理）", err as Error);
+      })
+      .finally(() => {
+        // 收敛后状态回收：预取槽若仍在（异常路径）一并取消，绝不残留子进程/临时文件
+        discardPrefetch(state);
+        if (streams.get(messageID) === state) streams.delete(messageID);
+        for (const partID of state.parts.keys()) partMeta.delete(partID);
+      });
   };
 
   return {
@@ -1399,6 +1917,9 @@ export function createAutoReader(deps: AutoReaderDeps): AutoReader {
     },
     interrupt(sessionID?: string): void {
       stopInFlight(sessionID);
+    },
+    dispose(): void {
+      stopInFlight();
     },
   };
 }

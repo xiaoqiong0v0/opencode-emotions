@@ -10,6 +10,7 @@ import type { Logger } from "@xiaoqiong0v0/opencode-plugin-logger";
 
 import { loadVoiceConfig, type VoiceConfig } from "../config.js";
 import { resolveMimoApiKey } from "../credentials.js";
+import type { AudioSink } from "./audio-sink.js";
 import { AliyunProvider } from "./aliyun.js";
 import { MiMoProvider } from "./mimo.js";
 import { SapiProvider } from "./sapi.js";
@@ -72,6 +73,8 @@ export {
 export {
   buildWavHeader,
   createAudioSink,
+  createProviderSink,
+  PcmFileSink,
   selectAudioStrategy,
   MAX_SEGMENT_SECONDS,
   PCM_BITS,
@@ -79,7 +82,9 @@ export {
   WAV_HEADER_BYTES,
   type AudioSink,
   type AudioStrategy,
+  type PcmFileSinkOptions,
   type SelectAudioStrategyOptions,
+  type SinkSourceOptions,
 } from "./audio-sink.js";
 export { splitSentences, type SentenceSplit } from "./sentences.js";
 export {
@@ -100,6 +105,11 @@ export interface SpeakOptions {
   env?: NodeJS.ProcessEnv;
   /** 预加载的语音配置；缺省从 emotions.jsonc 读取（测试可注入以隔离 IO）。 */
   config?: VoiceConfig;
+  /**
+   * 自定义音频落地（仅 CLI `speak --pcm-out` 使用）：给定采样率返回 sink。
+   * 缺省走正常播放路径（流式/分段）。
+   */
+  sinkFactory?: (sampleRate: number) => AudioSink;
 }
 
 /** 已创建的 provider 实例（按名缓存，保证并发/打断状态唯一）。 */
@@ -192,7 +202,26 @@ export function speak(request: TtsRequest, options: SpeakOptions = {}): SpeakRes
     streamMinChars: resolved.streamMinChars,
     credentials: config.tts.credentials,
     mimoApiKey,
+    sinkFactory: options.sinkFactory,
   });
+}
+
+/**
+ * 按当前解析链判定 provider 是否支持**只合成不出声**（`speak --pcm-out`，预取依赖它）。
+ * 供生产接线（server 插件把结果传给 auto-read 决定是否启用下一单元预取）。
+ * 解析失败/未知 provider 一律按 false 降级（回串行路径，不阻塞朗读）。
+ * @param env 环境变量表（默认 process.env）
+ * @param config 预加载配置；缺省读 emotions.jsonc
+ * @returns 支持 PCM 输出返回 true
+ */
+export function resolvePcmOutputSupport(env: NodeJS.ProcessEnv = process.env, config?: VoiceConfig): boolean {
+  try {
+    const cfg = config ?? loadVoiceConfig({ env });
+    const resolved = resolveTtsConfig({ text: "" }, env, cfg.tts);
+    return getProvider(resolved.provider).pcmOutputSupport === true;
+  } catch {
+    return false;
+  }
 }
 
 /**

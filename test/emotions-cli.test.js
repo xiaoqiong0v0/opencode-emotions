@@ -154,11 +154,11 @@ test("slot：单个指示符形态（🎙 恒静态 + 1 列盲文音量列 + 图
   // 同日（第十一批）：恢复 🎙 麦克风段于最前；输入组图标 ⇥(U+21E5)→↧(U+21A7)（⇥ 与 F8 重叠；↧ 仍窄计 1 列）。
   // 2026-10-22（第十三批，推翻第十二批/第八批的 emoji 帧轮播）：`🎙 ` **恒静态**，其后恒 1 列**盲文音量列**；
   // 三态各取一个字形：idle→空白、connecting→spinner 首帧 ⠋、listening→电平档（0→⠁、满→⠿）。
-  assert.equal(formatSlotIndicator(zh, { mode: "inject", meter: meterState("idle") }), "🎙  ↧F8/⤉F9 🔊 F10");
-  assert.equal(formatSlotIndicator(zh, { mode: "input", meter: meterState("connecting") }), "🎙 ⠋↧F8/⤉F9 🔊 F10");
-  assert.equal(formatSlotIndicator(zh, { mode: "input", meter: meterState("listening", 1) }), "🎙 ⠿↧F8/⤉F9 🔊 F10");
-  assert.equal(formatSlotIndicator(zh, { mode: "input", meter: meterState("listening", 0) }), "🎙 ⠁↧F8/⤉F9 🔊 F10");
-  assert.equal(formatSlotIndicator(en, { mode: "input", meter: meterState("idle") }), "🎙  ↧F8/⤉F9 🔊 F10", "英文与中文同串（分段全为常量文本）");
+  assert.equal(formatSlotIndicator(zh, { mode: "inject", meter: meterState("idle") }), `${MIC_ICON}  ↧F8/⤉F9 🔊 F10`);
+  assert.equal(formatSlotIndicator(zh, { mode: "input", meter: meterState("connecting") }), `${MIC_ICON} ⠋↧F8/⤉F9 🔊 F10`);
+  assert.equal(formatSlotIndicator(zh, { mode: "input", meter: meterState("listening", 1) }), `${MIC_ICON} ⠿↧F8/⤉F9 🔊 F10`);
+  assert.equal(formatSlotIndicator(zh, { mode: "input", meter: meterState("listening", 0) }), `${MIC_ICON} ⠁↧F8/⤉F9 🔊 F10`);
+  assert.equal(formatSlotIndicator(en, { mode: "input", meter: meterState("idle") }), `${MIC_ICON}  ↧F8/⤉F9 🔊 F10`, "英文与中文同串（分段全为常量文本）");
   // mic 段与旧「共用格」的区别：mic 段文本永远不变（idle/connecting/listening 三态下第 1 段都是 `🎙 `）
   for (const phase of ["idle", "connecting", "listening"]) {
     assert.equal(formatSlotSegments(zh, { mode: "input", meter: meterState(phase), injectOn: false, inputOn: false, autoReadOn: false })[0].text, `${MIC_ICON} `, `${phase}：mic 段恒为 🎙（不做 emoji 动画）`);
@@ -169,13 +169,19 @@ test("slot：单个指示符形态（🎙 恒静态 + 1 列盲文音量列 + 图
   assert.equal(AUTO_READ_KEY, "f10");
 });
 
-test("slot：显示宽度口径（与渲染库 string-width@7 一致）", () => {
+test("slot：显示宽度口径（优先宿主 Bun.stringWidth；Node 回退近似实现）", () => {
   assert.equal(displayWidth("↧"), 1, "歧义宽度箭头（U+21A7，原 ⇥ U+21E5 的替换字形）按窄计");
   assert.equal(displayWidth("⤉"), 1, "歧义宽度箭头（U+21C9）按窄计");
   assert.equal(displayWidth("⏳"), 2, "emoji 计双列（⏳ 已从槽位移除，此断言锁住「emoji 双列」口径 = 弃用 emoji 的证据）");
   assert.equal(displayWidth("🔊"), 2, "emoji 计双列");
-  assert.equal(displayWidth("🎙"), 2, "emoji 计双列（常驻麦克风图标）");
-  assert.equal(displayWidth("🎙 "), 3, "🎙 段 = 图标 2 + 其后必留空格 1（防重叠）");
+  // 宿主实测（BUN_BE_BUN=1 opencode.exe）：裸 `🎙`=1（默认文本呈现，属歧义区）、`🎙+VS16`=2。
+  // 故常驻图标必须是 `🎙\uFE0F`（MIC_ICON），不能再用裸字形；下面的期望值全部取自宿主同口径。
+  assert.equal(displayWidth(MIC_ICON), 2, "宿主实测：🎙+VS16 计 2 列（裸 🎙 在宿主只算 1，这正是宽度漂移根因）");
+  assert.equal(displayWidth(`${MIC_ICON} `), 3, "mic 段 = 图标 2 + 1 列间隔");
+  assert.ok(
+    displayWidth(`${MIC_ICON} `) - displayWidth(MIC_ICON) >= 1,
+    "mic 图标与 meter 列之间至少 1 列间隔（防盲文贴住图标）",
+  );
   // 第十三批 meter 列选型依据：盲文块（U+2800–U+28FF）EA=Neutral ⇒ **恒 1 列**、单色可着色、无字形差异
   assert.equal(displayWidth("⠿"), 1, "盲文电平条满档 ⠿（U+283F）按窄计 1 列");
   assert.equal(displayWidth("⠋"), 1, "盲文 spinner 首帧 ⠋（U+280B）按窄计 1 列");
@@ -192,7 +198,7 @@ test("slot：显示宽度口径（与渲染库 string-width@7 一致）", () => 
   assert.equal(displayWidth("\u23F3\uFE0E"), 2, "⏳+VS15 仍按 2 列（本插件口径不变）");
 });
 
-test("slot：任意 meter 三态 × 电平 × 帧索引 × 模式 × 语言，拼接总宽恒定（第十三批 meter 列 ⇒ 17 → 18）", () => {
+test("slot：任意 meter 三态 × 电平 × 帧索引 × 模式 × 语言，拼接总宽恒定（宿主口径 = 18；裸 🎙 时代宿主实宽 17）", () => {
   const phases = ["idle", "connecting", "listening"];
   const modes = ["inject", "input"];
   // 覆盖**越界与非法**：level > 1 / 负 / NaN / +Infinity；frame 超界 / 负数 / NaN ⇒ 都不许改变宽度（也不许抛）
@@ -215,7 +221,7 @@ test("slot：任意 meter 三态 × 电平 × 帧索引 × 模式 × 语言，�
   }
   // 末端 F10 段为固定串（前置空格 + 🔊 + 空格 + F10 = 7 列），不随状态变 ⇒ 总宽恒定不被破坏
   assert.equal(displayWidth(" 🔊 F10"), 7, "追加段固定 7 列");
-  // 宽度口径（第十三批）：3（`🎙 ` 恒静态 = emoji 2 + 空格 1）+ 1（meter 盲文列）+ 3（↧F8）+ 1（/）+ 3（⤉F9）+ 7（🔊 F10）= 18
+  // 宽度口径（宿主实测）：3（`🎙️ ` = VS16 emoji 2 + 1 列间隔）+ 1（meter 盲文列）+ 3（↧F8）+ 1（/）+ 3（⤉F9）+ 7（🔊 F10）= 18
   assert.equal(displayWidth(formatSlotIndicator(getPhrases("zh"), { mode: "inject", meter: meterState("listening", 1) })), 18, "zh 总宽 = 18（第十三批新增 1 列 meter）");
   assert.equal(displayWidth(formatSlotIndicator(getPhrases("en"), { mode: "inject", meter: meterState("connecting", 0, 3) })), 18, "en 总宽 = 18（分段与语言无关）");
   // 分段文本与语言无关 ⇒ 中/英总宽相等
@@ -232,7 +238,7 @@ test("slot：分段配色角色（6 段：文本拼接与颜色分离；🎙 恒
   assert.equal(on.length, 6, "分段数：🎙 + meter + ↧F8 + / + ⤉F9 + 🔊F10 共 6 段（第十三批新增 meter 列）");
   assert.equal(
     on.map((segment) => segment.text).join(""),
-    "🎙 ⠿↧F8/⤉F9 🔊 F10",
+    `${MIC_ICON} ⠿↧F8/⤉F9 🔊 F10`,
     "分段拼接等于纯文本（在听·满电平：meter 列为 ⠿）",
   );
   assert.deepEqual(
@@ -241,14 +247,14 @@ test("slot：分段配色角色（6 段：文本拼接与颜色分离；🎙 恒
     "注入激活 → ⤉F9 整组（第 5 段）高亮、↧F8 整组（第 3 段）暗色、朗读关暗色；第 1 段角色恒 mic、第 2 段恒 meter",
   );
   // mic 段：文本与角色**恒不变**（第十三批起不做 emoji 动画，只作语音功能的静态标记）
-  assert.equal(on[0].text, "🎙 ", "mic 段：恒 `🎙 `（emoji + 尾随空格，防重叠）");
+  assert.equal(on[0].text, `${MIC_ICON} `, "mic 段：恒 `🎙️ `（VS16 emoji + 1 列间隔，防 meter 贴图标）");
   assert.equal(on[0].role, "mic", "mic 段：角色恒 `mic`（渲染层取中性色 accent，不随模式/朗读开关变）");
   assert.equal(on[1].role, "meter", "meter 列：角色恒 `meter`（渲染层按三态静态取色：在听 accent、连接中/关 textMuted）");
   // 显示顺序按物理键序恒定：第 3 段恒为 ↧F8、第 5 段恒为 ⤉F9
   assert.equal(on[2].text, "↧F8", "物理顺序：第 3 段恒为 ↧F8（图标贴键、无空格；2026-10-21 ⇥→↧）");
   assert.equal(on[4].text, "⤉F9", "物理顺序：第 5 段恒为 ⤉F9（图标贴键、无空格）");
   const off = formatSlotSegments(zh, { mode: "input", meter: meterState("idle"), injectOn: false, inputOn: false, autoReadOn: false });
-  assert.equal(off.map((segment) => segment.text).join(""), "🎙  ↧F8/⤉F9 🔊 F10", "关态：meter 列为空白（mic 段仍显 🎙 ）");
+  assert.equal(off.map((segment) => segment.text).join(""), `${MIC_ICON}  ↧F8/⤉F9 🔊 F10`, "关态：meter 列为空白（mic 段仍显 🎙 ）");
   assert.deepEqual(
     off.map((segment) => segment.role),
     ["mic", "meter", "keyInactive", "separator", "keyInactive", "autoReadInactive"],
@@ -274,7 +280,7 @@ test("slot：自动朗读末端段两态（文本恒定只换角色；任意状�
   assert.equal(segOn.role, "autoReadActive", "自动朗读激活：亮色角色");
   assert.equal(segOff.role, "autoReadInactive", "未激活：暗色角色");
   // 宽度恒定：任意 meter 三态 × 电平 × 帧索引 × 模式 × 注入/输入开关 × 朗读开关，分段拼接总宽都等于定值
-  // （第十三批：原「任意组合等宽」断言**没有放松**，只是把 mic 维度换成 meter 三态并加上电平/帧索引两维，定值 17 → 18）
+  // （第十三批：原「任意组合等宽」断言**没有放松**，只是把 mic 维度换成 meter 三态并加上电平/帧索引两维；\n  // 2026-10-22 审计修复后 `🎙️`（VS16）在宿主恒 2 列 ⇒ 宿主口径定值 18；旧裸 🎙 时代宿主实宽 17）
   const widthOf = (state) => displayWidth(formatSlotSegments(zh, state).map((s) => s.text).join(""));
   const expected = widthOf({ mode: "inject", meter: meterState("idle"), injectOn: false, inputOn: false, autoReadOn: false });
   for (const phase of ["idle", "connecting", "listening"]) {
@@ -289,7 +295,7 @@ test("slot：自动朗读末端段两态（文本恒定只换角色；任意状�
                 assert.equal(widthOf(state), expected, `宽度恒定：${tag}`);
                 const segments = formatSlotSegments(zh, state);
                 // 第 1 段（mic）在全组合下恒为 `🎙 ` / 角色 mic；第 2 段（meter）角色恒 meter、字形恒 1 列
-                assert.equal(segments[0].text, "🎙 ", `mic 段恒静态：${tag}`);
+                assert.equal(segments[0].text, `${MIC_ICON} `, `mic 段恒静态：${tag}`);
                 assert.equal(segments[0].role, "mic", `mic 段角色恒定：${tag}`);
                 assert.equal(segments[1].role, "meter", `meter 段角色恒定：${tag}`);
                 assert.equal(displayWidth(segments[1].text), 1, `meter 段字形恒 1 列：${tag} → ${segments[1].text}`);
@@ -300,7 +306,7 @@ test("slot：自动朗读末端段两态（文本恒定只换角色；任意状�
       }
     }
   }
-  assert.equal(expected, 18, "定值宽度 = 18（第十三批：🎙 恒静态 3 + meter 盲文列 1 + 其余常量段）");
+  assert.equal(expected, 18, "定值宽度 = 18（宿主实测：🎙️ 段 3 + meter 盲文列 1 + 其余常量段）");
 });
 
 test("meter：meterGlyph 三态取字 + 电平分档 / 帧取模边界（第十三批：动画只用盲文、不用 emoji）", () => {
@@ -447,6 +453,16 @@ test("CLI 解析：--text-file 作为正文来源（可无 --text）", () => {
   const both = parseCliArgs(["speak", "--text", "hi", "--text-file=a.txt"]);
   assert.equal(both.text, "hi");
   assert.equal(both.textFile, "a.txt", "支持 --text-file=value");
+});
+
+test("CLI 解析：--text-stdin 作为正文来源（工具层长文本/特殊字符通道；与 --text/--text-file/--follow 互斥）", () => {
+  const fromStdin = parseCliArgs(["speak", "--text-stdin", "--background"]);
+  assert.equal(fromStdin.kind, "speak");
+  assert.equal(fromStdin.textStdin, true);
+  assert.equal(fromStdin.background, true);
+  assert.equal(parseCliArgs(["speak", "--text", "hi", "--text-stdin"]).kind, "error");
+  assert.equal(parseCliArgs(["speak", "--text-file", "a.txt", "--text-stdin"]).kind, "error");
+  assert.equal(parseCliArgs(["speak", "--follow", "--text-stdin"]).kind, "error");
 });
 
 test("CLI 解析：auto_tts 子命令已移除（视为未知命令报错，无任何旁路）", () => {

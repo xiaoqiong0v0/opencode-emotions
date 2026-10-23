@@ -25,7 +25,7 @@ import type { Logger } from "@xiaoqiong0v0/opencode-plugin-logger";
 import WebSocket from "ws";
 
 import { redact, resolveCredentials, type CredentialFileConfig, type Credentials } from "../credentials.js";
-import { createAudioSink, selectAudioStrategy, type AudioSink } from "./audio-sink.js";
+import { createProviderSink, type AudioSink } from "./audio-sink.js";
 import { splitSentences } from "./sentences.js";
 import { createStreamChunker, normalizeStreamMinChars, DEFAULT_STREAM_MIN_CHARS, MAX_CONTINUE_CHARS, MAX_TOTAL_CHARS } from "./stream.js";
 import type { ResolvedTtsOptions, SpeakResult, TtsProvider } from "./types.js";
@@ -423,6 +423,8 @@ class CosyVoiceSession {
 /** 阿里云 CosyVoice TTS provider（流式；单实例，新 speak 打断旧朗读）。 */
 export class AliyunProvider implements TtsProvider {
   readonly name = ALIYUN_PROVIDER_NAME;
+  /** 二进制音频帧本就经 AudioSink 落地 ⇒ 支持只合成不出声（预取）。 */
+  readonly pcmOutputSupport = true;
   private readonly log: Logger = createLogger("tts-aliyun");
   private session: CosyVoiceSession | null = null;
   private sink: AudioSink | null = null;
@@ -457,15 +459,15 @@ export class AliyunProvider implements TtsProvider {
       section: "tts",
       providerLabel: "阿里云 TTS",
     });
-    // 播放路径在发起时**同步**选定：无任何可用路径立刻抛清晰错误（不静默）
-    const strategy = selectAudioStrategy({ sampleRate: params.sampleRate });
+    // 音频落地：有 sinkFactory（只合成不出声）时用它；否则在发起时**同步**选定播放路径，
+    // 无任何可用路径立刻抛清晰错误（不静默）
+    const sink = createProviderSink(options, params.sampleRate, this.log);
     this.stop();
     const token = randomBytes(8).toString("hex");
     this.activeToken = token;
     this.params = params;
     this.credentials = credentials;
     this.streamMinChars = normalizeStreamMinChars(options.streamMinChars);
-    const sink = createAudioSink(strategy, params.sampleRate, this.log);
     this.sink = sink;
     const done = this.run(options.text, token).catch((err: unknown) => {
       this.log.error("CosyVoice 合成/播放失败", err instanceof Error ? err : String(err));
@@ -497,10 +499,11 @@ export class AliyunProvider implements TtsProvider {
     const credentials = this.credentials;
     if (!sink || !params || !credentials) return;
     try {
-      if (sink.kind === "stream") {
-        await this.runStream(text, token, params, credentials, sink);
-      } else {
+      // stream / pcm-file 都走纯流式送文；只有分段回退（segments）才按句一会话
+      if (sink.kind === "segments") {
         await this.runSegmented(text, token, params, credentials, sink);
+      } else {
+        await this.runStream(text, token, params, credentials, sink);
       }
     } catch (err) {
       sink.abort();

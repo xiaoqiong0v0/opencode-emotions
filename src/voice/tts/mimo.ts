@@ -27,7 +27,7 @@ import createLogger from "@xiaoqiong0v0/opencode-plugin-logger";
 import type { Logger } from "@xiaoqiong0v0/opencode-plugin-logger";
 
 import { mimoKeyMissingError, redact } from "../credentials.js";
-import { createAudioSink, selectAudioStrategy, type AudioSink } from "./audio-sink.js";
+import { createProviderSink, type AudioSink } from "./audio-sink.js";
 import type { ResolvedTtsOptions, SpeakResult, TtsProvider } from "./types.js";
 
 /** provider 标识。 */
@@ -209,6 +209,8 @@ export async function streamMimoPcm(options: StreamMimoPcmOptions): Promise<void
 /** MiMo TTS provider（SSE 流式；单实例，新 speak 打断旧朗读）。 */
 export class MiMoProvider implements TtsProvider {
   readonly name = MIMO_PROVIDER_NAME;
+  /** SSE 音频帧本就经 AudioSink 落地 ⇒ 支持只合成不出声（预取）。 */
+  readonly pcmOutputSupport = true;
   private readonly log: Logger = createLogger("tts-mimo");
   private sink: AudioSink | null = null;
   private params: MimoParams | null = null;
@@ -232,14 +234,14 @@ export class MiMoProvider implements TtsProvider {
       throw mimoKeyMissingError();
     }
     const params = resolveMimoParams(options);
-    // 播放路径在发起时**同步**选定：无任何可用路径立刻抛清晰错误（不静默）
-    const strategy = selectAudioStrategy({ sampleRate: MIMO_SAMPLE_RATE });
+    // 音频落地：有 sinkFactory（只合成不出声）时用它；否则在发起时**同步**选定播放路径，
+    // 无任何可用路径立刻抛清晰错误（不静默）
+    const sink = createProviderSink(options, MIMO_SAMPLE_RATE, this.log);
     this.stop();
     const token = randomBytes(8).toString("hex");
     this.activeToken = token;
     this.params = params;
     this.apiKey = apiKey;
-    const sink = createAudioSink(strategy, MIMO_SAMPLE_RATE, this.log);
     this.sink = sink;
     const done = this.run(options.text, token).catch((err: unknown) => {
       this.log.error("MiMo 合成/播放失败", err instanceof Error ? err : String(err));

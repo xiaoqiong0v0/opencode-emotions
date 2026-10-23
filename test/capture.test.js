@@ -17,6 +17,7 @@ import {
   TERMUX_CHUNK_SECONDS_ENV,
   buildCaptureArgs,
   buildTermuxRecordArgs,
+  formatCaptureExitFailure,
   listAudioDevices,
   resolveTermuxChunkSeconds,
   selectCaptureBackend,
@@ -115,4 +116,17 @@ test("listAudioDevices：spawn 成功 → 从 stderr 解析 dshow 音频设备",
   assert.equal(devices.length, 1);
   assert.equal(devices[0].name, "麦克风 (USB Audio)");
   assert.equal(devices[0].alternativeName, "@device_cm_{GUID}\\wave_{GUID}");
+});
+
+test("formatCaptureExitFailure：非 0 退出/0 字节都算失败，正常 EOF 不算", () => {
+  // 审计实测的 Windows 退出码（0xFFFFFFFB 的有符号化）
+  const abnormal = formatCaptureExitFailure(4294967291, 0, "Could not find audio device");
+  assert.ok(abnormal !== null);
+  assert.match(abnormal, /未采集到任何音频/);
+  assert.match(abnormal, /4294967291/);
+  assert.match(abnormal, /Could not find audio device/, "错误文本带 stderr 摘要");
+
+  assert.match(formatCaptureExitFailure(0, 0, ""), /未采集到任何音频/, "0 字节同样算失败");
+  assert.match(formatCaptureExitFailure(1, 4096, "boom"), /采集进程异常退出/);
+  assert.equal(formatCaptureExitFailure(0, 4096, ""), null, "退出码 0 且有音频 = 正常结束");
 });

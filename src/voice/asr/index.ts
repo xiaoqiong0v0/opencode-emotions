@@ -17,7 +17,11 @@ export {
   pcmRms,
   splitPcmByMaxBytes,
   DEFAULT_MAX_SEGMENT_MS,
-  ENERGY_VAD_SCALE,
+  thresholdToDbfs,
+  rmsToDbfs,
+  ENERGY_FRAME_MS,
+  ENERGY_DBFS_MIN,
+  ENERGY_DBFS_MAX,
   MAX_BASE64_BYTES,
   WAV_DATA_URL_PREFIX,
 } from "./segment.js";

@@ -12,8 +12,10 @@
  * 读时顺带清 TTL 陈旧条目并落盘。
  * **TUI 退出停播（2026-10-21 第七批）**：`stopPlaybackForSessions()` 逐会话各停一次（mock 注入断言）、
  * 单会话抛错不中断其余、空 id 跳过、接真 stopPlayback 时每会话条目各杀一次。
- * **F10 双态中断判活（2026-10-22）**：`isInterruptablePlaybackActive()` 只看本会话+无主（禁碰其他会话）、
- * playerPid 存活也算、新鲜（TTL 未过）即活跃、陈旧清除后 false、空 sessionID=全部条目。
+ * **F10 双态中断判活 + ASR 静音门（2026-10-22）**：`isInterruptablePlaybackActive()` 只看本会话+无主
+ * （禁碰其他会话）、playerPid 存活也算、空 sessionID=全部条目；
+ * **审计 P1 后口径**：存活优先（`pid`/`playerPid` 探测；EPERM 视为存活）——新鲜但判死 ⇒ 不活跃且清理，
+ * 探测抛错 ⇒ fail-open（不阻断），仅无 pid 的条目用 ≤15s 短 TTL。
  */
 
 import { test } from "node:test";
@@ -23,6 +25,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
+  classifyPlaybackEntry,
   clearPlayback,
   isInterruptablePlaybackActive,
   playbackStatePath,
@@ -30,6 +33,7 @@ import {
   stopPlayback,
   stopPlaybackForSessions,
   writePlayback,
+  PLAYBACK_FRESH_TTL_MS,
   PLAYBACK_OWNERLESS_KEY,
   PLAYBACK_TTL_MS,
 } from "../dist/voice/playback-state.js";
@@ -574,7 +578,7 @@ test("判活：本会话条目存活 → true；只有其它会话条目 → fal
   }
 });
 
-test("判活：无主条目（键 _）对任何会话都算；playerPid 存活也算；新鲜（TTL 未过）即算活跃；空 sessionID=全部条目", () => {
+test("判活：无主条目（键 _）对任何会话都算；playerPid 存活也算；死条目清理；空 sessionID=全部条目", () => {
   const dir = tempConfigDir();
   try {
     const NOW = Date.now();
@@ -585,16 +589,104 @@ test("判活：无主条目（键 _）对任何会话都算；playerPid 存活�
       "无主条目 + 仅 playerPid 存活 → true",
     );
     writePlayback(entry({ sessionID: "ses_other", pid: 444, startedAt: NOW }), { dataDir: dir });
+    // 新口径（审计 P1）：新鲜 ≠ 活跃——pid/playerPid 都判死 ⇒ 不活跃，且无主条目被清理
     assert.equal(
       isInterruptablePlaybackActive("ses_x", NOW, { dataDir: dir, now: () => NOW, isAlive: () => false }),
-      true,
-      "无主条目新鲜（TTL 未过）→ 即便进程判死也算活跃（防刚登记/刚死亡未清的窗口期漏判）",
+      false,
+      "新鲜但进程已死 → 不活跃（修「静默吞语音」）",
+    );
+    assert.deepEqual(
+      Object.keys(readPlayback(undefined, { dataDir: dir, now: () => NOW })),
+      ["ses_other"],
+      "死掉的无主条目已清理；其它会话条目不动",
     );
     // 空 sessionID 口径：全部条目都算（与无参 stop 停全部同口径）
     assert.equal(
       isInterruptablePlaybackActive("", NOW, { dataDir: dir, now: () => NOW, isAlive: () => true }),
       true,
     );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("判活：新鲜但 pid 已死 → 不活跃且条目被清理（修最长 30min 静默吞语音）", () => {
+  const dir = tempConfigDir();
+  try {
+    const NOW = Date.now();
+    writePlayback(entry({ sessionID: "ses_a", pid: 111, startedAt: NOW }), { dataDir: dir });
+    assert.equal(
+      isInterruptablePlaybackActive("ses_a", NOW, { dataDir: dir, now: () => NOW, isAlive: () => false }),
+      false,
+      "条目新鲜（<PLAYBACK_FRESH_TTL_MS）但 pid 已死 ⇒ 不阻断（fail-open 到不丢语音）",
+    );
+    assert.deepEqual(readPlayback(undefined, { dataDir: dir, now: () => NOW }), {}, "死条目已被清理并落盘");
+    assert.equal(
+      isInterruptablePlaybackActive("ses_a", NOW, { dataDir: dir, now: () => NOW, isAlive: () => false }),
+      false,
+      "再次判定不残留阻断",
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("判活：探测抛错 → 不阻断（fail-open），且不清理无法判定的条目", () => {
+  const dir = tempConfigDir();
+  try {
+    const NOW = Date.now();
+    writePlayback(entry({ sessionID: "ses_a", pid: 111, startedAt: NOW }), { dataDir: dir });
+    const throwing = () => {
+      throw new Error("probe unavailable");
+    };
+    assert.equal(
+      isInterruptablePlaybackActive("ses_a", NOW, { dataDir: dir, now: () => NOW, isAlive: throwing }),
+      false,
+      "探测失败/无法判定 → 不阻断（丢语音比多一次回声更不可接受）",
+    );
+    assert.equal(readPlayback("ses_a", { dataDir: dir, now: () => NOW }) !== undefined, true,
+      "无法判定时不清理（避免误删可能仍在播的条目）");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("判活：无 pid 的条目——短 TTL 内 fresh、超过即 dead（classifyPlaybackEntry）", () => {
+  const NOW = Date.now();
+  const noPid = { provider: "aliyun", startedAt: NOW, kind: "speak" };
+  assert.ok(PLAYBACK_FRESH_TTL_MS > 0 && PLAYBACK_FRESH_TTL_MS <= 15_000, "短 TTL 必须 ≤15s");
+  assert.equal(classifyPlaybackEntry(noPid, NOW, () => true), "fresh", "无 pid + 短窗口内 → 视为新鲜");
+  assert.equal(
+    classifyPlaybackEntry(noPid, NOW + PLAYBACK_FRESH_TTL_MS + 1, () => true),
+    "dead",
+    "无 pid + 超过短 TTL → 不活跃",
+  );
+  // 防御：外部/旧格式写入的无 pid 条目在 loadMap 即被丢弃 ⇒ 门不会因此阻断
+  const dir = tempConfigDir();
+  try {
+    writeFileSync(
+      playbackStatePath({ dataDir: dir }),
+      JSON.stringify({ ses_a: { provider: "aliyun", startedAt: NOW, kind: "speak" } }),
+      "utf8",
+    );
+    assert.equal(
+      isInterruptablePlaybackActive("ses_a", NOW, { dataDir: dir, now: () => NOW, isAlive: () => true }),
+      false,
+      "无 pid 的非法条目被丢弃，不阻断语音",
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("判活：正常播放中不误判（存活条目连续两次判活 → true，条目保留）", () => {
+  const dir = tempConfigDir();
+  try {
+    const NOW = Date.now();
+    writePlayback(entry({ sessionID: "ses_a", pid: 111, playerPid: 222, startedAt: NOW }), { dataDir: dir });
+    assert.equal(isInterruptablePlaybackActive("ses_a", NOW, { dataDir: dir, now: () => NOW, isAlive: (pid) => pid === 222 }), true);
+    assert.equal(isInterruptablePlaybackActive("ses_a", NOW, { dataDir: dir, now: () => NOW, isAlive: (pid) => pid === 222 }), true);
+    assert.equal(readPlayback("ses_a", { dataDir: dir, now: () => NOW }) !== undefined, true, "正常播放条目不得被清理");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -616,14 +708,14 @@ test("判活：陈旧条目（超 TTL）已被 loadMap 清除 → false（与杀
   }
 });
 
-test("判活：无状态文件/空 map → false；nowMs 缺省走 Date.now 口径（新鲜条目为真）", () => {
+test("判活：无状态文件/空 map → false；nowMs 缺省走 Date.now 口径（存活条目为真）", () => {
   const dir = tempConfigDir();
   try {
     assert.equal(isInterruptablePlaybackActive("ses_a", undefined, { dataDir: dir, isAlive: () => true }), false,
       "缺文件 → 无条目 → false");
     writePlayback(entry({ sessionID: "ses_a", pid: 111 }), { dataDir: dir }); // startedAt=Date.now()
-    assert.equal(isInterruptablePlaybackActive("ses_a", undefined, { dataDir: dir, isAlive: () => false }), true,
-      "nowMs 缺省：新鲜条目未过 TTL → true");
+    assert.equal(isInterruptablePlaybackActive("ses_a", undefined, { dataDir: dir, isAlive: () => true }), true,
+      "nowMs 缺省：pid 存活 → true");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

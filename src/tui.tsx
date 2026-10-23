@@ -6,8 +6,8 @@
  * 故旧 `voice-server`（HTTP 网关 + session-tracker + process-manager）整套删除。
  *
  * 能力：
- * - 在 `session_prompt_right` 渲染**单个**状态指示 `[🎙 恒静态][meter 1 列盲文音量][↧F8/⤉F9][🔊 F10]`
- *   （如关 `🎙  ↧F8/⤉F9 🔊 F10`、连接中 `🎙 ⠹↧F8/⤉F9 🔊 F10`、在听满电平 `🎙 ⠿↧F8/⤉F9 🔊 F10`）：
+ * - 在 `session_prompt_right` 渲染**单个**状态指示 `[🎙️ 恒静态][meter 1 列盲文音量][↧F8/⤉F9][🔊 F10]`
+ *   （如关 `🎙️  ↧F8/⤉F9 🔊 F10`、连接中 `🎙️ ⠹↧F8/⤉F9 🔊 F10`、在听满电平 `🎙️ ⠿↧F8/⤉F9 🔊 F10`）：
  *   **2026-10-21 用户指令（第十批）**：`●`/`○`/`⏳` 状态圆圈段删除，改为
  *   **两个模式图标紧贴各自键位成组**（输入/F8、注入/F9）。
  *   **2026-10-21 用户指令（第十一批）**：① `🎙` 麦克风图标段**恢复**为最前静态前缀（样式仿末端
@@ -16,14 +16,14 @@
  *   **历史（第十二批 / 2026-10-22 缺陷一+二）**：`⏳`/`🎙`/`🎤` 曾**共用最前一格**做 mic 三态 + emoji 帧轮播；
  *   **2026-10-22 用户指令（第十三批）全部推翻删除**——emoji 的字形与进格宽度由终端/字体决定，
  *   轮播会**跳位、视觉重心不齐**（且不居中、丑），emoji 也**不吃终端前景色**（变色动画同样无效）。
- *   **现状（第十三批）**：① `🎙 ` **永远静态**（不换字形、不变色）；② 其后是**恒定 1 列盲文音量列**（`meter` 段），
+ *   **现状（第十三批；2026-10-22 审计修正图标宽度）**：① `🎙️ `（VS16 强制 emoji 呈现，宿主恒 2 列）**永远静态**（不换字形、不变色）；② 其后是**恒定 1 列盲文音量列**（`meter` 段），
  *   三态由 `asrReady` × 开关推导：`idle`（关）→ 空白、`connecting`（开但未连上 ASR）→ 盲文 spinner（每 100ms 换帧）、
  *   `listening`（已就绪）→ 盲文电平条（6 档，由 runtime NDJSON `level` 事件的**真实麦克风电平**驱动 ⇒ **有音频输入才动**）；
- *   选字与宽度口径见 `src/voice/slot.ts`（盲文 EA=Neutral 恒 1 列），整条总宽 **恒 18**（zh/en 一致，上批 17）。
+ *   选字与宽度口径见 `src/voice/slot.ts`（`displayWidth` 优先委托宿主 `Bun.stringWidth`），整条总宽**宿主口径恒 18**（zh/en 一致；旧裸 `🎙` 时代宿主实宽 17）。
  *   当前模式（**无模式文字段**，第九批删 `注入`/`输入`）**= 哪一组「图标+键位」整组亮**：
  *   **`↧F8` 亮=输入、`⤉F9` 亮=注入**）+ 两组热键（段恒为 `↧F8/⤉F9`）
  *   + 末端**自动朗读状态段** `🔊 F10`（恒为固定文本，仅配色表达开关：亮=开、暗=关；**不是模式**、不进模式语义）；
- * - 两个**点按开关**热键（不能按住：长按会键重复且松键不上报，见 spike 结论）：
+ * - 两个**点按开关**热键（长按会键重复 ⇒ 与 F10 共用 700ms 尾沿静默抑制，按住只算一次；见 `lib/key-repeat.ts`）：
  *   - `F8` = 模式 B「语音输入」：识别结果经 `client.tui.appendPrompt` 增量追加进输入框，由用户编辑后发送；
  *   - `F9` = 模式 A「语音注入」：识别结果经 `client.session.prompt` 变成一条带 🎙 标记的新消息；
  *   - `F10` = **自动朗读双态**（模型不可切换，独占于热键）：**本会话（或无主）有活跃播放**时点按 = **只中断播放、
@@ -34,7 +34,7 @@
  *   （每会话目录 `<root>/<sessionID>/auto-tts`，内容 `on`/`off`，缺省=关；一个会话的开关不影响其它会话）；
  *   关闭时立即 `stopPlayback({ sessionID })` 停掉**本会话**正在朗读的那段（跨会话不误杀、无主播放仍可停），开启只影响后续助手回复、**不**补读历史。
  *   **键重复抑制**：按住 F10 会被 OS 连发按键事件（长按会键重复），逐事件切换会偶数次翻转净回「关」，
- *   故一次按键事件流只算一次切换（尾沿静默窗口见 `shouldAcceptAutoTtsToggle`）。
+ *   故一次按键事件流只算一次切换（尾沿静默窗口见 `KeyRepeatGuard`）。
  *   子会话（subagent）不支持：按 F10 时 toast 提示「子会话不自动朗读」，不写状态文件。
  *   槽位末端 `🔊 F10` 段只做**状态显示**（响应式跟随当前会话：初值/切换会话/F10 后重算）。
  *   （运行时消费该状态并派生 CLI 朗读，见 `voice/auto-read.ts` / `voice/auto-tts.ts`。）
@@ -47,7 +47,7 @@
  *
  * 进程边界：TUI 运行在 Bun 宿主内，通过相对导入复用 `voice/ndjson.js` 的契约解析（同一构建产物内相对解析）。
  * 装载：`tui.json` 的 `plugin` 指向**编译产物**（`.opencode/plugin/tui.js`，即镜像后的 `dist/tui.js`）。
- * 构建：`.tsx` **不参与主 `tsc` 构建**，由 `scripts/build-tui.mjs` 用**宿主同款 Babel 链**
+ * 构建：`.tsx` **不参与主 `tsc` 构建**（但由 `tsconfig.tui.json` 单独 `--noEmit` 类型检查，`npm run build` 前置），由 `scripts/build-tui.mjs` 用**宿主同款 Babel 链**
  *   （`babel-preset-solid` universal + `@babel/preset-typescript`）编译成 `dist/tui.js`——
  *   必须走 Solid 编译（JSX 会被包成 `createElement`/`insert`/`setProp` + `effect` 的响应式结构）；
  *   若改用 `tsc` 的 `jsx()` 产物，props/children 不会被包成访问器，槽位将失去响应式。
@@ -59,13 +59,14 @@ import { spawn, type ChildProcess } from "node:child_process";
 
 import { createSignal } from "solid-js";
 
-import type { TuiPlugin, TuiPluginApi, TuiPluginModule } from "@opencode-ai/plugin/tui";
+import type { TuiPlugin, TuiPluginApi, TuiPluginModule, TuiSlotContext } from "@opencode-ai/plugin/tui";
 import createLogger from "@xiaoqiong0v0/opencode-plugin-logger";
 import type { Logger } from "@xiaoqiong0v0/opencode-plugin-logger";
 
-import { DEFAULT_LANGUAGE, format, getPhrases, type Phrases } from "./lib/i18n.js";
+import { format, getPhrases } from "./lib/i18n.js";
+import { KeyRepeatGuard } from "./lib/key-repeat.js";
 import { pickStderrSummary, resolveRuntimeScript, selfDirFromModuleUrl } from "./lib/runtime-diagnostics.js";
-import { loadVoiceConfig } from "./voice/config.js";
+import { loadVoiceConfigWithWarnings } from "./voice/config.js";
 import { ASR_GATE_TAIL_MS, shouldDropAsrFinal } from "./voice/asr-gate.js";
 import {
   AUTO_READ_DEFAULT_NODE_BIN,
@@ -75,7 +76,6 @@ import {
   autoTtsStatePath,
   readAutoTts,
   resetAutoTtsSessionOnce,
-  shouldAcceptAutoTtsToggle,
   writeAutoTts,
   writeInterruptRequest,
 } from "./voice/auto-tts.js";
@@ -100,6 +100,7 @@ import {
   type SlotMode,
   type SlotSegment,
 } from "./voice/slot.js";
+import { SpinTicker } from "./voice/spin-ticker.js";
 
 /** 文件来源插件必须导出 id。 */
 const PLUGIN_ID = "voice-tui";
@@ -110,6 +111,18 @@ const PLUGIN_ID = "voice-tui";
 const LOG_NAME = "emotions-tui";
 /** 诊断日志（未启用时 createLogger 返回空实现，零开销、绝不影响 TUI）。 */
 const log: Logger = createLogger(LOG_NAME);
+/**
+ * 调试日志显式开关（`EMOTIONS_DEBUG=1`）：本项目 logger 只有 info/warn/error 三档，
+ * 高频/低价值事件（如按键重复抑制）默认不落盘，仅在显式开启调试时以 `[debug]` 前缀走 info 通道。
+ */
+const DEBUG_ENABLED = process.env.EMOTIONS_DEBUG === "1";
+/**
+ * 写一条调试日志（默认静默；`EMOTIONS_DEBUG=1` 时才落 info）。
+ * @param message 日志正文
+ */
+function debugLog(message: string): void {
+  if (DEBUG_ENABLED) log.info(`[debug] ${message}`);
+}
 /**
  * 指示读路径诊断（低噪）：上一次 `autoReadOn` 求值所用的会话 id；`null` 表示尚未求值过。
  * 仅当本次 sid 与上次不同才打一条 `indicator session=…`，用于实测「切会话是否重算、两源各是什么」。
@@ -150,8 +163,14 @@ const STDERR_TOAST_MAX = 120;
 const INJECT_MARKER = "🎙";
 /** 等待子进程 spawn 的超时（毫秒）。 */
 const SPAWN_TIMEOUT_MS = 5000;
-/** 停止子进程时等待其退出的上限（毫秒）。 */
+/** 停止子进程时等待其退出的上限（毫秒）：强制 kill 的兜底窗口。 */
 const STOP_TIMEOUT_MS = 2000;
+/**
+ * 优雅停止的等待上限（毫秒）：先写 stdin `stop` 让 runtime 走 `finish()`（冲刷最后一段并等 ASR
+ * 回包，按段链路一次 HTTP 可能数秒），超时才 kill 兜底。取 10s：宁可多等一次收尾，
+ * 也不要每次停止都丢掉最后一句。
+ */
+const GRACEFUL_STOP_TIMEOUT_MS = 10_000;
 /** toast 里预览文本的最大长度。 */
 const PREVIEW_LEN = 24;
 /**
@@ -205,15 +224,6 @@ function preview(text: string, max: number = PREVIEW_LEN): string {
 /** 延时。 */
 function delay(ms: number): Promise<void> {
   return new Promise((resolveDelay) => setTimeout(resolveDelay, ms));
-}
-
-/** 读取 UI 文案语言（`uiLanguage`）的文案表（配置读取失败回退默认，绝不影响 TUI）。 */
-function safePhrases(): Phrases {
-  try {
-    return getPhrases(loadVoiceConfig().uiLanguage);
-  } catch {
-    return getPhrases(DEFAULT_LANGUAGE);
-  }
 }
 
 /**
@@ -274,7 +284,21 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
   // `toggleAutoRead` 入口）在**本进程首次见到某会话**时清**该会话目录**（`resetAutoTtsSessionOnce`，
   // 记入模块级 `touchedSessions`，只增不减）：本进程首见 = 该会话从关开始；后开窗口只重置它自己首见的
   // 会话，**不误清其它窗口已激活的会话**（见 `auto-tts.ts` 文件头「重启语义」）。
-  const phrases = safePhrases();
+  // 配置加载（带告警）：解析失败时 UI 仍用默认值启动，但**必须提示用户**（否则「改了配置没生效」无从排查）。
+  const initialConfig = loadVoiceConfigWithWarnings();
+  const phrases = getPhrases(initialConfig.config.uiLanguage);
+  for (const warning of initialConfig.warnings) {
+    if (warning.kind !== "parse-error") continue;
+    try {
+      api.ui.toast({
+        variant: "warning",
+        title: phrases.toast.title,
+        message: format(phrases.toast.configInvalid, { message: warning.message }),
+      });
+    } catch {
+      // toast 不可用（启动早期）时已由 config 模块写 warn 日志，不影响 TUI
+    }
+  }
   const [injectOn, setInjectOn] = createSignal(false);
   const [inputOn, setInputOn] = createSignal(false);
   // ASR 就绪信号（2026-10-22 缺陷一「就绪反馈闭环」）：本会话语音 runtime 已连上 ASR、真在听 = true；
@@ -289,8 +313,13 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
   // 槽位渲染读 `readAutoTts(routeSid || props.session_id || "")`——**路由优先**（与写路径同源取值），
   // props 仅兜底并作为响应依赖（宿主若响应式传参，切会话时 props 变化触发重算）。
   const [autoReadRev, setAutoReadRev] = createSignal(0);
-  // F10 上一次按键事件时刻（键重复抑制的窗口起点；每个事件都刷新，见 shouldAcceptAutoTtsToggle）
-  let lastAutoTtsToggleEventAt = 0;
+  // 键重复抑制器：F8/F9/F10 **各一个实例**（互不抑制），窗口与判据单源在 `lib/key-repeat.ts`。
+  // F10 沿用同一 700ms 尾沿静默语义；F8/F9 新增，修 2026-10-22 审计「按住会连续 toggle」。
+  const modeToggleGuards: Record<VoiceMode, KeyRepeatGuard> = {
+    inject: new KeyRepeatGuard(),
+    input: new KeyRepeatGuard(),
+  };
+  const autoReadToggleGuard = new KeyRepeatGuard();
   /**
    * 静音门**尾音窗口起点**（2026-10-22，半双工兜底；本 TUI 进程内私有，只由 `dispatch()` 读写）：
    * 每次判活为真刷新为当刻，之后 {@link ASR_GATE_TAIL_MS} 内仍丢弃 final（覆盖尾音/混响）。
@@ -322,27 +351,28 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
   //    由 slot.ts 取模选 spinner 盲文字形。阶段本身不单独存信号——由 `anyOn()` × `asrReady()` 现推（见 `meterPhase()`）。
   const [micLevel, setMicLevel] = createSignal(0);
   const [spinFrame, setSpinFrame] = createSignal(0);
-  let spinFrameTimer: ReturnType<typeof setInterval> | null = null;
+  /**
+   * meter spinner 计时器（统一 manager：所有 interval 经它创建、`onDispose` 一次清空）。
+   * **销毁后 `setConnecting` 不再起表**——修 2026-10-22 审计 P1：旧 dispose 先清表、`stopRuntime()` 内部
+   * 又调 `syncSpinFrame()` 把 interval 创建回来（每次重载泄漏一个 100ms interval）。
+   */
+  const spinTicker = new SpinTicker({
+    intervalMs: SPIN_FRAME_INTERVAL_MS,
+    frameCount: METER_SPINNER_FRAMES.length,
+    onFrame: (frame: number): void => {
+      setSpinFrame(frame);
+    },
+  });
   /**
    * 按当前阶段同步 spinner 定时器：**只有「连接中」**（`anyOn()` 且 `!asrReady()`，开了但 ASR 还没连上）才起表轮播，
    * 进入「在听」（动画改由真实电平驱动）或「关」（无动画）时**停表并把帧索引归零**。
    * 触点：handleEvent ready / level（就绪后无需起表）、toggleMode 收尾（finally）、
-   * handleChildGone（runtime 意外退出）、stopRuntime、startRuntime（新 runtime 进入连接中）、onDispose（清表防泄漏）。
+   * handleChildGone（runtime 意外退出）、stopRuntime、startRuntime（新 runtime 进入连接中）、onDispose（销毁管理器）。
+   * **销毁后由 `disposed` 早退**：即使 stopRuntime/handleChildGone 在销毁过程中再触发，也不会重启定时器。
    */
   const syncSpinFrame = (): void => {
-    const connecting = anyOn() && !asrReady();
-    if (connecting && spinFrameTimer === null) {
-      const frameCount = METER_SPINNER_FRAMES.length;
-      spinFrameTimer = setInterval(
-        () => setSpinFrame((v: number) => (v + 1) % frameCount),
-        SPIN_FRAME_INTERVAL_MS,
-      );
-      spinFrameTimer.unref?.();
-    } else if (!connecting && spinFrameTimer !== null) {
-      clearInterval(spinFrameTimer);
-      spinFrameTimer = null;
-      setSpinFrame(0);
-    }
+    if (disposed) return;
+    spinTicker.setConnecting(anyOn() && !asrReady());
   };
 
   /** 弹 toast（安全包装，dispose 后静默）。 */
@@ -444,7 +474,9 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
     try {
       spawned = spawn(bin, [script, "--json"], {
         cwd: process.cwd(),
-        stdio: ["ignore", "pipe", "pipe"],
+        // stdin 走 pipe：优雅停止通道（win32 上 SIGTERM 不可捕获，kill 即 TerminateProcess；
+        // runtime 侧 `createStopController` 监听非 TTY stdin 的 `stop` 行/EOF）
+        stdio: ["pipe", "pipe", "pipe"],
       });
     } catch (err) {
       throw new Error(`无法启动 ${bin}：${errText(err)}`);
@@ -462,13 +494,24 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
     spawned.on("exit", (code: number | null, signal: NodeJS.Signals | null) =>
       handleChildGone(`code=${code ?? "-"} signal=${signal ?? "-"}`),
     );
+    // 优雅停止用 stdin 通道：子进程已退出时写入会 EPIPE，必须监听（否则未处理的 'error' 会炸宿主）
+    spawned.stdin?.on("error", (err: Error) => {
+      log.warn(`runtime stdin 写入失败：${err.message}`);
+    });
 
     await waitForSpawn(spawned, SPAWN_TIMEOUT_MS);
     // 诊断埋点：已收到 spawn 事件确认（startRuntime 成功返回；失败链路里这一条缺席）
     log.info(`startRuntime ready: pid=${spawned.pid ?? "-"}`);
   };
 
-  /** 停止语音运行时并等待其退出。 */
+  /**
+   * 停止语音运行时并等待其退出。
+   *
+   * **优雅优先**（2026-10-22）：先往 runtime stdin 写 `stop`（runtime 侧 `createStopController`
+   * 收到即 `finish()` → 冲刷最后一段 → 等 ASR 回包 → `final` → `done` → 退出），最多等
+   * {@link GRACEFUL_STOP_TIMEOUT_MS}；只有超时才 `kill()` 兜底。原因：win32 上 Node **无法捕获
+   * SIGTERM**，`kill()` 等价 `TerminateProcess`，旧实现每次都把尾段识别清掉（「说完没反应/最后一句丢」）。
+   */
   const stopRuntime = async (): Promise<void> => {
     // 主动停止：立即复位 asrReady（不再在听）、停 spinner；不依赖 exit 事件（超时兜底路径也能复位）。
     setAsrReady(false);
@@ -481,11 +524,23 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
     stopping = true;
     const exited = new Promise<void>((resolveExit) => current.once("exit", () => resolveExit()));
     try {
-      current.kill();
+      if (current.stdin && current.stdin.writable) current.stdin.write("stop\n");
     } catch (err) {
-      console.error(`[voice] 停止子进程失败：${errText(err)}`);
+      console.error(`[voice] 发送优雅停止失败：${errText(err)}`);
     }
-    await Promise.race([exited, delay(STOP_TIMEOUT_MS)]);
+    const graceful = await Promise.race([
+      exited.then(() => true),
+      delay(GRACEFUL_STOP_TIMEOUT_MS).then(() => false),
+    ]);
+    if (!graceful) {
+      // 兜底：runtime 未在时限内收尾（卡在采集/网络）⇒ 强制结束（此时尾段可能丢失，属已知代价）
+      try {
+        current.kill();
+      } catch (err) {
+        console.error(`[voice] 停止子进程失败：${errText(err)}`);
+      }
+      await Promise.race([exited, delay(STOP_TIMEOUT_MS)]);
+    }
     stopping = false;
     if (child === current) child = null;
   };
@@ -552,6 +607,14 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
     log.info(
       `mode toggle: target=${target} next=${!isOn(target)} toggling=${toggling} session=${currentSessionID(api) ?? "-"} childAlive=${childAlive()} anyOn=${anyOn()}`,
     );
+    // 键重复/快速连按抑制（2026-10-22 审计 P1）：按住 F8/F9 会被 OS 连发事件，逐事件 toggle 会反复
+    // spawn/stop runtime、灯闪烁。与 F10 共用 `KeyRepeatGuard`（同一 700ms 尾沿窗口），F8/F9 各自独立。
+    // 窗口内重复事件只记 debug 日志（默认静默，`EMOTIONS_DEBUG=1` 才落盘）、不执行 toggle。
+    const now = Date.now();
+    if (!modeToggleGuards[target].accept(now)) {
+      debugLog(`mode toggle suppressed (key repeat): target=${target} now=${now}`);
+      return;
+    }
     if (toggling) return;
     toggling = true;
     // 打断（barge-in）：按 F8/F9 语音输入时，立刻停掉正在播放的 TTS（按共享状态文件里的 PID）。
@@ -641,9 +704,8 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
     }
     // 键重复/快速连按抑制：接受与否都刷新窗口起点（按住期间连发事件不断后移窗口 → 整次按住只切换一次）
     const now = Date.now();
-    const last = lastAutoTtsToggleEventAt;
-    const accepted = shouldAcceptAutoTtsToggle(now, last);
-    lastAutoTtsToggleEventAt = now;
+    const last = autoReadToggleGuard.lastEventTimestamp;
+    const accepted = autoReadToggleGuard.accept(now);
     // 诊断埋点③b：入口关键变量（accepted=false 表示被键重复抑制吞掉，静默返回是本意行为）
     log.info(`f10 toggle: sessionID=${sessionID} now=${now} last=${last} accepted=${accepted}`);
     if (!accepted) return;
@@ -708,31 +770,29 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
   // **已知取舍**：两窗口开着同一会话时一窗退出会互停该会话的播放。崩溃路径（未及 dispose）孤儿尾巴
   // 属已知残余——CLI/PowerShell 的 stdin 管道 EOF 收尾机制保留（auto-read server 侧进程退出自然死亡）。
   api.lifecycle.onDispose(() => {
+    // 销毁顺序固定：① 置 disposed（所有回调早退）→ ② 停表并锁定定时器管理器 → ③ 再 stopRuntime()。
+    // 旧实现先清表再 stopRuntime，而 stopRuntime 内部会调 syncSpinFrame() 把 interval 建回来（每次重载泄漏）。
     disposed = true;
-    // 清 meter spinner 定时器（组件销毁必须停表，否则 interval 泄漏、setSignal 打在被销毁的 scope 上）
-    if (spinFrameTimer !== null) {
-      clearInterval(spinFrameTimer);
-      spinFrameTimer = null;
-    }
+    spinTicker.dispose();
     void stopRuntime();
     stopPlaybackForSessions(touchedSessions);
   });
 
-  // 常驻 UI：输入框右侧**单个**状态指示 `🎙 [meter]↧F8/⤉F9 🔊 F10`（2026-10-21 用户指令：●/○/⏳ 圆圈段删除、
-  // 模式图标紧贴键位成组；同日第十一批恢复 `🎙` 段、`⇥`→`↧`；**2026-10-22 第十三批**：`🎙 ` 改为**恒静态**、
+  // 常驻 UI：输入框右侧**单个**状态指示 `🎙️ [meter]↧F8/⤉F9 🔊 F10`（2026-10-21 用户指令：●/○/⏳ 圆圈段删除、
+  // 模式图标紧贴键位成组；同日第十一批恢复 `🎙️` 段、`⇥`→`↧`；**2026-10-22 第十三批**：`🎙️ ` 改为**恒静态**、
   // 删除 emoji 帧轮播与 `⏳`，其右侧新增**恒定 1 列盲文音量列**承载语音状态动画；末端 F10 段只显状态不显文字）。
-  // 分段配色：`🎙 ` 段恒为中性 accent（静态标记）；**meter 列按三态静态取色**（在听=accent、连接中/关=textMuted，
+  // 分段配色：`🎙️ ` 段恒为中性 accent（静态标记）；**meter 列按三态静态取色**（在听=accent、连接中/关=textMuted，
   // 动画只体现在字形、不靠变色）；**激活模式的「图标+键位」整组用其模式色**
   // （**模式无文字段，靠 ↧F8/⤉F9 哪组亮表达**）；未激活整组/分隔符/未启用朗读用暗色；关闭态（无激活模式）两组键位都取 `textMuted`；
   // 自动朗读末端段独立着色（开=`success` 亮、关=`textMuted` 暗，文本恒定不随开关变）。
   api.slots.register({
     order: 0,
     slots: {
-      // 宿主**应当**传入 session_id（opencode `packages/tui/src/routes/session/index.tsx` 的
-      // `<pluginRuntime.Slot name="session_prompt_right" session_id={route.sessionID} />`），但 props 在本插件内
-      // **是否响应式从未证实**；故读键以 `currentSessionID(api)` 为准（与写同源，见 `autoReadOn`），
-      // props 仅兜底 + 响应依赖。
-      session_prompt_right(props: { session_id: string }) {
+      // 宿主 slot 渲染器签名 = `(ctx, props)`（`@opentui/core` `SlotRenderer<TNode, TProps, TContext>`），
+      // 第二参才是本槽位 props（类型 `TuiSlotMap.session_prompt_right = { session_id: string }`）。
+      // 旧实现只声明一个参数 ⇒ 实际拿到的是 ctx、`props.session_id` 恒 undefined（类型检查同时报错）。
+      // 读键仍以 `currentSessionID(api)` 为准（与写同源），props 仅兜底 + 响应依赖。
+      session_prompt_right(_ctx: Readonly<TuiSlotContext>, props: { session_id: string }) {
         const theme = api.theme.current;
         /**
          * 盲文音量列（meter 段）当前阶段（2026-10-22 第十三批：取代旧 mic 三态 + emoji 帧轮播）：
@@ -778,7 +838,7 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
         const colorOf = (role: SlotColorRole): (typeof theme)["text"] => {
           switch (role) {
             case "mic":
-              // `🎙 ` 段：恒为中性 accent（2026-10-21 第十一批恢复常驻；第十三批起彻底静态——
+              // `🎙️ ` 段：恒为中性 accent（2026-10-21 第十一批恢复常驻；第十三批起彻底静态——
               // emoji 不吃终端 fg 颜色，变色动画无效，动画全部交给 meter 列的字形）
               return theme.accent;
             case "meter":
@@ -802,9 +862,9 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
           * 依赖信号（`asrReady/micLevel/spinFrame/injectOn/inputOn/mode`），故在渲染表达式中内联调用即保持响应式。
          */
         const seg = (i: number): SlotSegment => segments()[i] ?? { text: "", role: "separator" };
-        // 静态结构 + 响应式内容：固定 6 个 `<text>`（顺序同 `formatSlotSegments`：`🎙 ` 静态段/meter 盲文音量列/↧F8 组/分隔/⤉F9 组/🔊F10；
-        // 「●/○/⏳ 状态字形」段已按 2026-10-21 用户指令改造为「图标贴键成组」，`🎙` 段同日第十一批恢复；
-        // 第十三批删掉「🎙 与 ⏳ 共用一格 + emoji 帧轮播」，改为 `🎙 ` 恒静态 + 其后 1 列盲文音量列），
+        // 静态结构 + 响应式内容：固定 6 个 `<text>`（顺序同 `formatSlotSegments`：`🎙️ ` 静态段/meter 盲文音量列/↧F8 组/分隔/⤉F9 组/🔊F10；
+        // 「●/○/⏳ 状态字形」段已按 2026-10-21 用户指令改造为「图标贴键成组」，`🎙️` 段同日第十一批恢复；
+        // 第十三批删掉「🎙️ 与 ⏳ 共用一格 + emoji 帧轮播」，改为 `🎙️ ` 恒静态 + 其后 1 列盲文音量列），
         // 不再用 `<For>` 逐段重建，避免分段数组变化时节点被销毁/重建造成的闪烁。
         // **必须包进单个内层 `<box gap={0}>`**（防回退，勿再改回 Fragment）：宿主 `right` 槽位外层是
         // `<box flexDirection="row" gap={1} alignItems="center">`（opencode 源码 `packages/tui/src/component/prompt/index.tsx`），
@@ -812,7 +872,7 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
         // 而 `↧F8`/`/`/`⤉F9` 三段自带空格为 0（`src/voice/slot.ts` 分段数组 + `SLOT_KEY_SEPARATOR`），
         // 于是连续两个 gap 叠在接缝上 → 视觉成 `↧F8 / ⤉F9`（即 2026-10-20 修掉的错位根因）。
         // 包成 1 个子项后：外层 gap 只加在整块前后，内部 gap 显式归零 → 各段紧拼，渲染逐字等于
-        // `formatSlotIndicator()` 的格式串（`"🎙  ↧F8/⤉F9 🔊 F10"`，分段内置空格原样保留）。
+        // `formatSlotIndicator()` 的格式串（`"🎙️  ↧F8/⤉F9 🔊 F10"`，分段内置空格原样保留）。
         // **props 一律内联求值为具体值**：`fg` 传 `colorOf(...)` 得到的 `RGBA`、children 传字符串；
         // 内层 box 的 `flexDirection`/`gap`/`alignItems` 是静态字符串/数字，直接写即可。
         // 切勿把访问器函数（`() => color`）当 prop 值传入——Solid 会包成 `Cell`，原生 `fg` setter

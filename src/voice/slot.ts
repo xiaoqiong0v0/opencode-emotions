@@ -1,38 +1,45 @@
 /**
  * TUI 槽位**单个**状态指示的格式化（纯函数，可离线单测）。
  *
- * 形态：`[🎙 恒静态][meter 1 列盲文音量][↧F8][/][⤉F9][🔊 F10]`，例如
- * `🎙  ↧F8/⤉F9 🔊 F10`（关，meter 列空白）/ `🎙 ⠹↧F8/⤉F9 🔊 F10`（连接中，spinner）/
- * `🎙 ⠿↧F8/⤉F9 🔊 F10`（在听，电平拉满）。
+ * 形态：`[🎙️ 恒静态][meter 1 列盲文音量][↧F8][/][⤉F9][🔊 F10]`，例如
+ * `🎙️  ↧F8/⤉F9 🔊 F10`（关，meter 列空白）/ `🎙️ ⠹↧F8/⤉F9 🔊 F10`（连接中，spinner）/
+ * `🎙️ ⠿↧F8/⤉F9 🔊 F10`（在听，电平拉满）。
  * **2026-10-21 用户指令（第十批）**：删除 `●`/`○`/`⏳` 状态圆圈段，改为
  * **两个模式图标紧贴各自键位成组**（输入/F8、注入/F9，图标与键名**无空格**、组间 `/` 分隔）。模式**没有文字段**
  * （第九批已删 `注入`/`输入`）——当前模式 = **哪一组「图标+键位」整组亮**。
  * **2026-10-21 用户指令（第十一批）**：① 恢复 `🎙` 麦克风图标段常驻最前；② 输入组图标 `⇥`（U+21E5）与 `F8`
  * **渲染重叠** ⇒ 换为 `↧`（U+21A7，向下箭头到横线，同样表「写进输入框」，宽度口径仍计 1）；注组图标 `⤉`（U+21C9）**不变**。
- * **历史（第十二批 / 2026-10-22 缺陷一+二）**：最前一格曾做「`⏳ `（连接中）↔ `🎙 `/`🎤 `（在听，帧轮播）」的 mic 三态；
+ * **历史（第十二批 / 2026-10-22 缺陷一+二）**：最前一格曾做「`⏳ `（连接中）↔ `🎙️ `/`🎤 `（在听，帧轮播）」的 mic 三态；
  * **2026-10-22 用户指令（第十三批）已推翻并全部删除**：emoji 帧轮播**视觉重心不齐、丑**，根因是 **emoji 字形与进格宽度由终端/字体决定**
  * （轮播会跳位、不居中，且不吃终端前景色 ⇒ 变色动画同样无效）。
  * **现状（第十三批）**：
- * ① `🎙 ` **永远静态**——不换字形、不变色、无任何动画；
+ * ① `🎙️ ` **永远静态**——不换字形、不变色、无任何动画；
  * ② 其后新增**恒定 1 列的盲文音量列**（`meter` 段，U+2800–U+28FF），由 runtime 上行的**真实麦克风电平**
  *   （NDJSON `level` 事件，10Hz 节流；归一见 `src/voice/meter.ts` 的 `rmsToLevel`）驱动 ⇒ **有音频输入才有动画**；
  * ③ 三态由 `meter.phase` 表达：`idle`→空白占位、`connecting`→盲文 spinner（帧索引轮播）、`listening`→盲文纵向电平条（6 档）。
  * **为何用盲文**：盲文块 East Asian Width = **Neutral** ⇒ 各终端**恒 1 列**、单色可着色、**无字形差异**（不像 emoji 由字体决定外观）；
  * **连接中**的提示也因此从 emoji `⏳` 改为盲文 spinner。
  * **总宽恒定**（任意 meter 三态 × 电平 × 帧索引 × 模式 × 语言 × 自动朗读开关）：
- * - **mic 段恒为 `🎙 `**（emoji 2 列 + 尾随空格 1 列 = 3 列；宽字符紧贴后续字形会重叠 ⇒ 空格必留）；
+ * - **mic 段恒为 `🎙️ `**（`🎙` + VS16 强制 emoji 呈现 ⇒ 宿主宽度恒 2 列 + **1 列间隔** = 3 列；
+ *   没有间隔时盲文 meter 会紧贴/压住图标，见下方「宽度口径」）；
  * - **meter 段恒为 1 列**（空白 / spinner / 电平条字形都是盲文块或空格，`displayWidth` 恒 1）；
  * - 键位段恒为 `↧F8` `/` `⤉F9`（两组都显示，作「可按 F8=输入 / F9=注入 切换」提示），与 keymap 绑定同源、不随模式变；
  *   **显示按物理键序恒定**（`F8` 在前、`F9` 在后），语义为 `F8`=输入、`F9`=注入（2026-10-21 对调，键值单源为本模块常量）；
  * - 末端追加段恒为 ` 🔊 F10`（前置一个空格分隔；自动朗读**状态指示**，图标与键名都是固定串、
  *   文本不随开关变，开关只经配色角色 `autoReadActive`/`autoReadInactive` 表达亮/灰），**不是模式**、不进模式语义。
  *
- * **为何定宽**：mic 段与 meter 段的文本都**不随状态变化**（mic 恒 `🎙 `、meter 恒取 1 列字形），
+ * **为何定宽**：mic 段与 meter 段的文本都**不随状态变化**（mic 恒 `🎙️ `、meter 恒取 1 列字形），
  * 其余分段全是常量 ⇒ 整条总宽与任何状态无关，无需补空格占位（旧 `MIC_BUSY_SEGMENT_WIDTH` / `padToWidth` 早批已删）。
- * 宽度口径 = TUI 渲染库 `@opentui/core` 内联的 `string-width@7`（Bun 宿主下为 `Bun.stringWidth`，`ambiguousIsNarrow:true`）：
- * 歧义宽度字符按窄计、emoji 与 CJK 计 2、ASCII 计 1（`↧` U+21A7 / `⤉` U+21C9 均为歧义宽度箭头，计 1；`🔊`/`🎙` 计 2；
- * **盲文 `⠁`–`⠿`（U+2800–U+28FF）EA=Neutral 计 1**）。
- * 各段文本均与语言无关 ⇒ **中/英总宽相同**（现 **18** = 3 `🎙 ` + 1 meter + 3 `↧F8` + 1 `/` + 3 `⤉F9` + 7 ` 🔊 F10`，见单测；上批 17）。
+ *
+ * **宽度口径（2026-10-22 审计修复，改为宿主同源）**：
+ * - 宿主渲染器 = `Intl.Segmenter` 逐 grapheme + **`Bun.stringWidth`**（opencode 二进制内 `chunk-cxqn9z5z.js`）；
+ *   **实测**（`BUN_BE_BUN=1 opencode.exe`）：`🎙`=1（U+1F399 默认**文本呈现**，属歧义区）、
+ *   `🎙\uFE0F`=2（VS16 强制 emoji 呈现）、`🎤`=2、`🔊`=2、`↧`/`⤉`=1、盲文各帧=1、空格=1。
+ * - 故 mic 图标取 **`🎙\uFE0F`**（宿主恒 2 列）——旧实现用裸 `🎙` 时项目自算 2、宿主算 1，
+ *   终端仍按 2 格画 ⇒ 尾随空格被 emoji 第二格吃掉、meter 紧贴图标、整块比声称窄 1 列。
+ * - {@link displayWidth} **优先委托 `Bun.stringWidth`**（`ambiguousIsNarrow:true`），非 Bun 环境才走本地近似实现
+ *   （本地实现也对 `🎙\uFE0F`/盲文/箭头得出与宿主相同的列宽；仅「裸 emoji + VS16 语义」无法完全复刻）。
+ * - 各段文本均与语言无关 ⇒ **中/英总宽相同**（现 **18** = 3 `🎙️ ` + 1 meter + 3 `↧F8` + 1 `/` + 3 `⤉F9` + 7 ` 🔊 F10`，见单测）。
  *
  * **渲染与文本分离**：本模块只产出**文本 + 配色角色**（`formatSlotSegments`），**不含任何颜色值**；
  * 具体颜色由渲染层（`src/tui.tsx`）按角色映射 `api.theme` 的颜色键。
@@ -91,9 +98,9 @@ export interface SlotRenderState extends SlotState {
 
 /**
  * 槽位分段的**配色角色**（渲染层据此选 theme 颜色键；本模块不涉及具体颜色）。
- * - `mic`：最前 `🎙 ` 段（2026-10-21 第十一批恢复常驻；2026-10-22 第十三批起**永远静态**——
+ * - `mic`：最前 `🎙️ ` 段（2026-10-21 第十一批恢复常驻；2026-10-22 第十三批起**永远静态**——
  *   不换字形、不变色，任何状态都是同一个中性色），静态标记「本槽位属于语音功能」（`icon` 角色的等价位）；
- * - `meter`：`🎙 ` 之后的**盲文音量列**（第十三批新增；恒 1 列）——三态**静态取色**：
+ * - `meter`：`🎙️ ` 之后的**盲文音量列**（第十三批新增；恒 1 列）——三态**静态取色**：
  *   `listening` 用 `accent`（有电平、真在听）、`connecting`/`idle` 用 `textMuted`（暗色，不做变色动画）；
  *   动画只体现在**字形本身**（spinner 换帧 / 电平条换档），不靠颜色；
  * - `keyActive`：当前激活模式的**整组「图标+键位」**（注入激活→`⤉F9`、输入激活→`↧F8`）
@@ -122,8 +129,17 @@ export interface SlotSegment {
   role: SlotColorRole;
 }
 
-/** 麦克风图标（🎙；emoji 宽字符，其后必留一个空格防渲染重叠。2026-10-21 用户指令**恢复为常驻最前段**，样式仿末端 `🔊 F10`；2026-10-22 第十三批起**永远静态**——不做任何帧轮播 / 换字形 / 变色动画）。 */
-export const MIC_ICON = "🎙";
+/**
+ * 麦克风图标：`🎙` + **VS16**（U+FE0F，强制 emoji 呈现）。
+ *
+ * 为什么必须带 VS16（2026-10-22 审计修复）：U+1F399 的 `Emoji_Presentation=No`，裸字形默认按**文本呈现**，
+ * 宿主 `Bun.stringWidth("🎙")=1`，而终端通常按 emoji 画成 2 格——渲染器只排 1 列 ⇒ 尾随空格被图标第二格覆盖，
+ * meter 紧贴图标。加 VS16 后宿主实测恒 2 列，与终端进格一致。
+ *
+ * 2026-10-21 用户指令**恢复为常驻最前段**，样式仿末端 `🔊 F10`；2026-10-22 第十三批起**永远静态**
+ * （不做任何帧轮播 / 换字形 / 变色动画）。
+ */
+export const MIC_ICON = "🎙\uFE0F";
 /**
  * meter 列（盲文音量列）的**关态**字形：空白。
  * 宽度依据：ASCII 空格 = **1 列**（`displayWidth` 口径）。关态没有任何动画，但仍占 1 列——
@@ -163,11 +179,17 @@ export const AUTO_READ_ICON = "🔊";
 export const SLOT_KEY_SEPARATOR = "/";
 /** 分段之间的空格（emoji 宽字符后必须留，防渲染重叠）。 */
 const SLOT_SPACE = " ";
+/**
+ * mic 图标与 meter 列之间的**间隔**（恒 1 列）。
+ * 审计 P1：宿主把裸 `🎙` 按 1 列布局、终端按 2 格绘制，尾随空格被吞 ⇒ meter 贴死图标；
+ * 改用 `🎙\uFE0F`（宿主恒 2 列）后本空格即成为真正的 1 列间隔（单测断言 `mic 段宽 - 图标宽 ≥ 1`）。
+ */
+const MIC_METER_GAP = SLOT_SPACE;
 
 /** 末端「自动朗读状态」段文本：前置空格 + 🔊 + 空格 + F10；**恒为固定串**，开关只影响配色角色不影响宽度。 */
 const AUTO_READ_SEGMENT_TEXT = `${SLOT_SPACE}${AUTO_READ_ICON}${SLOT_SPACE}${AUTO_READ_KEY_LABEL}`;
-/** mic 段文本：`🎙 `（emoji + 尾随空格，宽字符紧贴后续字形会重叠 ⇒ 空格必留）；**恒为固定串**，任何状态都不换字形也不换色（第十三批）。 */
-const MIC_SEGMENT_TEXT = `${MIC_ICON}${SLOT_SPACE}`;
+/** mic 段文本：`🎙️ `（VS16 emoji + 1 列间隔）；**恒为固定串**，任何状态都不换字形也不换色（第十三批）。 */
+const MIC_SEGMENT_TEXT = `${MIC_ICON}${MIC_METER_GAP}`;
 /** 输入组段文本：`↧F8`（图标与键位**紧贴无空格**，整组同色；2026-10-21 用户指令成组、同日把 `⇥` 换成 `↧`）。 */
 const INPUT_SEGMENT_TEXT = `${INPUT_KEY_ICON}${INPUT_KEY_LABEL}`;
 /** 注入组段文本：`⤉F9`（同上）。 */
@@ -215,14 +237,35 @@ function inRanges(codePoint: number, ranges: readonly (readonly [number, number]
 }
 
 /**
- * 终端显示宽度（列数），口径与 TUI 渲染库一致：
+ * 宿主宽度函数的最小形状（Bun 全局；Node 环境不存在 ⇒ 回退本地实现）。
+ * 只声明用到的 `stringWidth`，避免引入 `@types/bun` 与 Node 类型冲突。
+ */
+interface BunStringWidthHost {
+  stringWidth(text: string, options?: { ambiguousIsNarrow?: boolean }): number;
+}
+
+/**
+ * 取宿主 `Bun.stringWidth` 的结果（不存在时返回 `null`）。
+ * 每次调用都读 `globalThis.Bun`：宿主注入时机/测试替身都不依赖模块加载顺序。
+ * @param text 待测文本
+ * @returns 宿主列宽；非 Bun 环境返回 null
+ */
+function hostDisplayWidth(text: string): number | null {
+  const host = (globalThis as { Bun?: BunStringWidthHost }).Bun;
+  if (typeof host?.stringWidth !== "function") return null;
+  // 与宿主渲染器同口径：歧义宽度字符按窄计（`↧`/`⤉` 计 1，emoji 计 2）。
+  return host.stringWidth(text, { ambiguousIsNarrow: true });
+}
+
+/**
+ * 本地宽度近似实现（**仅在非 Bun 环境使用**：Node 单测/CLI）。
  * 组合/控制/零宽字符计 0；emoji 与 East Asian Wide/Fullwidth 计 2；其余（含歧义宽度）计 1。
- * `@opentui/core` 内联 `string-width@7`（Bun 宿主下为 `Bun.stringWidth`，`ambiguousIsNarrow:true`），
- * 故 `↧`/`⤉` 等歧义宽度箭头计 1、`⏳`/`🔊`/`🎙` 计 2、CJK 计 2、ASCII 计 1。
+ * 对槽位实际用到的字形（`🎙\uFE0F`、盲文、箭头、`🔊`、ASCII）与宿主实测一致；
+ * 它无法完全复刻 Bun 的 grapheme/VS16 细节，故生产（Bun 宿主）**优先走** {@link hostDisplayWidth}。
  * @param text 待测文本
  * @returns 显示列宽
  */
-export function displayWidth(text: string): number {
+function fallbackDisplayWidth(text: string): number {
   let width = 0;
   for (const ch of text) {
     const codePoint = ch.codePointAt(0) ?? 0;
@@ -230,6 +273,18 @@ export function displayWidth(text: string): number {
     width += inRanges(codePoint, WIDE_RANGES) ? 2 : 1;
   }
   return width;
+}
+
+/**
+ * 终端显示宽度（列数），**优先委托宿主算法**（`Bun.stringWidth`，与 opencode TUI 渲染器同源），
+ * 非 Bun 环境回退本地近似实现（Node 单测用；对槽位实际字形与宿主同值）。
+ * 口径来源：宿主 `chunk-cxqn9z5z.js` = `Intl.Segmenter` 逐 grapheme + `Bun.stringWidth(ambiguousIsNarrow:true)`；
+ * 实测（2026-10-22）：`🎙`=1、`🎙\uFE0F`=2、`🎤`=2、`↧`/`⤉`=1、盲文各帧=1。
+ * @param text 待测文本
+ * @returns 显示列宽
+ */
+export function displayWidth(text: string): number {
+  return hostDisplayWidth(text) ?? fallbackDisplayWidth(text);
 }
 
 /**
@@ -259,12 +314,12 @@ export function meterGlyph(meter: SlotMeterState): string {
 
 /**
  * 把状态拆成**分段**（文本 + 配色角色），供渲染层逐段上色。
- * 分段顺序：`🎙 `(mic，恒静态) → meter(1 列盲文音量列) → `↧F8`(输入组) → `/` → `⤉F9`(注入组) → ` 🔊 F10`
+ * 分段顺序：`🎙️ `(mic，恒静态) → meter(1 列盲文音量列) → `↧F8`(输入组) → `/` → `⤉F9`(注入组) → ` 🔊 F10`
  * （**两组按物理键序排列**，显示恒为 `↧F8/⤉F9`；**图标与键位同段同色**，整组高亮跟随各自的开关状态
  * ——**这就是模式状态的全部视觉表达**：原「模式描述段」（`注入`/`输入`）与原「`●`/`○` 圆圈段」
  * 均已按 2026-10-21 用户指令删除）；
  * **前两段的职责划分**（2026-10-22 第十三批：删 emoji 帧轮播，改盲文音量列承载全部语音状态动画）：
- *  - mic 段恒为 `🎙 `（角色 `mic`，静态中性色，**任何状态下文本与角色都不变**）；
+ *  - mic 段恒为 `🎙️ `（角色 `mic`，静态中性色，**任何状态下文本与角色都不变**）；
  *  - meter 段按 `state.meter.phase` 取字形（角色 `meter`，恒 1 列）：
  *    `idle`（关模式）→ 空白；`connecting`（开模式但未连上 ASR）→ spinner 帧（告诉用户「还在连、别急着说」）；
  *    `listening`（开模式且已就绪）→ 电平条档（由真实麦克风电平驱动，**有音频输入才动**）。
@@ -288,13 +343,13 @@ export function formatSlotSegments(phrases: Phrases, state: SlotRenderState): Sl
 
 /**
  * 把状态渲染为槽位指示文本（单个元素）。
- * mic 段恒为 `🎙 `（静态、不做动画），第 2 段恒为 meter 列的**单个 1 列盲文字形**（三态取字，见 `meterGlyph`）
+ * mic 段恒为 `🎙️ `（静态、不做动画），第 2 段恒为 meter 列的**单个 1 列盲文字形**（三态取字，见 `meterGlyph`）
  * ⇒ 任意 meter 三态 × 电平 × 帧索引 下拼接总宽恒定（见 `formatSlotSegments`）。
  * 键位段恒为 `↧F8/⤉F9`（两组都显示，作切换提示；**哪组亮即当前模式**，无模式文字段）、
  * 末端恒追加 ` 🔊 F10`（自动朗读状态段），均不随模式/开关变文本。
  * @param phrases 当前语言文案表（透传给 `formatSlotSegments`，当前不被消费）
  * @param state 状态（`mode` 字段不参与渲染；`meter` 决定第 2 段字形；三个开关按「全关」补默认值）
- * @returns 形如 `🎙  ↧F8/⤉F9 🔊 F10`（关，meter 空白）/ `🎙 ⠹↧F8/⤉F9 🔊 F10`（连接中）/ `🎙 ⠿↧F8/⤉F9 🔊 F10`（在听·满电平）
+ * @returns 形如 `🎙️  ↧F8/⤉F9 🔊 F10`（关，meter 空白）/ `🎙️ ⠹↧F8/⤉F9 🔊 F10`（连接中）/ `🎙️ ⠿↧F8/⤉F9 🔊 F10`（在听·满电平）
  */
 export function formatSlotIndicator(phrases: Phrases, state: SlotState): string {
   const segments = formatSlotSegments(phrases, { ...state, injectOn: false, inputOn: false, autoReadOn: false });

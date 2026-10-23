@@ -8,10 +8,82 @@
  *   （按段 ASR 上传 data URL 用；头构造逻辑原先在 `tts/audio-sink.ts`，统一收敛到本模块）。
  */
 
-import { readFileSync } from "node:fs";
+import { closeSync, openSync, readFileSync, readSync } from "node:fs";
 
 /** 一个 WAV 头（PCM）的字节数。 */
 export const WAV_HEADER_BYTES = 44;
+
+/** WAV 头信息（不读 data 区，供流式播放预取文件用）。 */
+export interface WavHeaderInfo {
+  /** 采样率（Hz）。 */
+  sampleRate: number;
+  /** 声道数。 */
+  channels: number;
+  /** 位深（bit）。 */
+  bitsPerSample: number;
+  /** data 区在文件中的起始偏移（字节）。 */
+  dataOffset: number;
+  /** data 区长度（字节；以头部声明为准）。 */
+  dataBytes: number;
+}
+
+/** 扫描 WAV 头时最多读取的字节数（canonical 头只有 44 字节；给扩展块留余量）。 */
+const WAV_HEADER_SCAN_BYTES = 4096;
+
+/**
+ * **只读文件头**解析 WAV 的 fmt/data 信息（不加载 data 区）。
+ *
+ * 用途：自动朗读预取——播放进程拿到合成出的 WAV 后先读头拿采样率/数据区间，再流式喂给播放器。
+ * 与 {@link parseWav} 同一套 chunk 规则（含偶数字节对齐），但只读前 {@link WAV_HEADER_SCAN_BYTES} 字节。
+ * @param path WAV 文件路径
+ * @returns 采样率/声道/位深与 data 区间
+ * @throws Error 不是合法 WAV、缺少 fmt/data 块或头超出扫描上限
+ */
+export function readWavHeader(path: string): WavHeaderInfo {
+  let fd: number | null = null;
+  let buf: Buffer;
+  try {
+    fd = openSync(path, "r");
+    buf = Buffer.alloc(WAV_HEADER_SCAN_BYTES);
+    const read = readSync(fd, buf, 0, buf.length, 0);
+    buf = buf.subarray(0, read);
+  } finally {
+    if (fd !== null) {
+      try {
+        closeSync(fd);
+      } catch {
+        // 关闭失败忽略（只读探测）
+      }
+    }
+  }
+  if (buf.length < 12 || buf.toString("ascii", 0, 4) !== "RIFF" || buf.toString("ascii", 8, 12) !== "WAVE") {
+    throw new Error("不是合法的 WAV 文件（缺少 RIFF/WAVE 标识）");
+  }
+  let fmt: { channels: number; sampleRate: number; bits: number } | null = null;
+  let dataOffset = -1;
+  let dataBytes = 0;
+  let pos = 12;
+  while (pos + 8 <= buf.length) {
+    const id = buf.toString("ascii", pos, pos + 4);
+    const size = buf.readUInt32LE(pos + 4);
+    const body = pos + 8;
+    if (id === "fmt ") {
+      if (body + 16 > buf.length) break;
+      fmt = {
+        channels: buf.readUInt16LE(body + 2),
+        sampleRate: buf.readUInt32LE(body + 4),
+        bits: buf.readUInt16LE(body + 14),
+      };
+    } else if (id === "data") {
+      dataOffset = body;
+      dataBytes = size;
+      break;
+    }
+    pos = body + size + (size % 2);
+  }
+  if (!fmt || dataOffset < 0) throw new Error("WAV 缺少 fmt 或 data 块（或头部超出扫描上限）");
+  return { sampleRate: fmt.sampleRate, channels: fmt.channels, bitsPerSample: fmt.bits, dataOffset, dataBytes };
+}
 
 /** 解析出的 WAV 内容。 */
 export interface WavData {

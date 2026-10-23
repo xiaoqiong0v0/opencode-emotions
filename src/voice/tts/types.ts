@@ -8,6 +8,7 @@
  */
 
 import type { CredentialFileConfig } from "../credentials.js";
+import type { AudioSink } from "./audio-sink.js";
 import { resolveEmotionInstruction } from "./emotion.js";
 import { DEFAULT_STREAM_MIN_CHARS, normalizeStreamMinChars } from "./stream.js";
 
@@ -106,6 +107,12 @@ export interface ResolvedTtsOptions {
   credentials?: CredentialFileConfig;
   /** MiMo 专用 API Key（仅 provider=mimo；由 speak() 按 env `MIMO_API_KEY` > `tts.mimoCredentials.apiKey` 解析后传入）。 */
   mimoApiKey?: string;
+  /**
+   * 自定义音频落地工厂（**仅** CLI `speak --pcm-out` 注入，用于只合成不出声）：
+   * 给定 provider 解析出的采样率，返回写文件的 sink；缺省时 provider 走正常播放路径
+   * （`selectAudioStrategy` + `createAudioSink`）。见 `audio-sink.ts` `createProviderSink()`。
+   */
+  sinkFactory?: (sampleRate: number) => AudioSink;
 }
 
 /** 某一 provider 支持的参数集合（用于忽略不支持项并记日志）。 */
@@ -179,7 +186,14 @@ export interface SpeakResult {
   rate: number;
   /** 云 TTS 任务 ID（供外部记录/取消；本地 provider 无）。 */
   taskId?: string;
-  /** 播放真正结束（成功或失败）时 settle 的 Promise；调用方可 `await` 以保持进程存活。 */
+  /**
+   * 播放真正结束时 settle 的 Promise（契约，所有 provider 都必须返回）：
+   * - **正常播完** → resolve（音已放完，而非「子进程已 spawn」）；
+   * - **被 `stop()`/新一次 `speak()` 主动打断** → resolve（属有意停止，不算失败）；
+   * - **播放失败**（子进程无法启动 / 非 0 退出 / 合成或 HTTP 出错）→ reject 可识别错误；
+   *   云 provider 目前把底层失败记日志后 resolve，本地 provider（sapi/termux）以 reject 报出。
+   * 调用方 `await` 它即可保持进程存活，并在 settle 后清理 `tts-playback` 登记。
+   */
   done?: Promise<void>;
 }
 
@@ -193,6 +207,12 @@ export interface TtsProvider {
    * undefined/false 时 CLI `--follow` 报清晰错误，auto-read 走按块 spawn 旧路径。
    */
   readonly followSupport?: boolean;
+  /**
+   * 是否支持**只合成不出声**（CLI `speak --pcm-out`：把 16bit PCM 写进临时文件）。
+   * 云 provider（aliyun/mimo）为 true（音频帧本来就经 AudioSink）；本地系统 TTS（sapi/termux）
+   * 由系统直接发声、拿不到 PCM ⇒ false（auto-read 据此关闭预取、保持串行路径）。
+   */
+  readonly pcmOutputSupport?: boolean;
   /**
    * 后台开始朗读：立即返回，不等待播放完成；内部负责打断上一次未完成的朗读。
    * @param options 解析后的朗读参数

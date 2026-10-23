@@ -27,7 +27,8 @@ import { trimAnnotationTail } from "./lib/parser.js";
 import { createAutoReader, type PartLike } from "./voice/auto-read.js";
 import { stopPlayback } from "./voice/playback-state.js";
 import { createVoiceTool, resolveCliPath } from "./voice/tool.js";
-import { resolveFollowSupport } from "./voice/tts/index.js";
+import { resolveFollowSupport, resolvePcmOutputSupport } from "./voice/tts/index.js";
+import { resolvePrefetchDepth } from "./voice/tts/prefetch.js";
 
 /** V1 插件标识（本地文件插件必须导出 id）。 */
 const PLUGIN_ID = "emotions";
@@ -83,6 +84,10 @@ const server: Plugin = async (input): Promise<Hooks> => {
       // provider follow 能力（sapi=true）：drain 用 `speak --follow` 常驻 worker（每消息 1 次 spawn），
       // 非 follow provider 退回按块 spawn CLI（句对齐粒度）。解析失败按 false 降级。
       followSupport: resolveFollowSupport(),
+      // 句间停顿优化（2026-10-22 第十四批）：provider 支持只合成不出声（mimo/aliyun）时启用下一单元预取；
+      // depth 默认 1，env `TTS_PREFETCH_DEPTH=0` 可关闭（解析失败按默认，不阻塞朗读）。
+      prefetchSupport: resolvePcmOutputSupport(),
+      prefetchDepth: resolvePrefetchDepth(),
       // message.updated 只带 info（不含 parts）：用 client 取回 { info, parts }
       fetchParts: async (sessionID, messageID) => {
         const response = await input.client.session.message({ path: { id: sessionID, messageID } });
@@ -108,6 +113,15 @@ const server: Plugin = async (input): Promise<Hooks> => {
   }
   return {
     ...(voiceTool ? { tool: voiceTool } : {}),
+    // 宿主 dispose：清场——取消全部会话的待读队列/预取（kill 合成与预热子进程、删缓冲）/朗读子进程。
+    // 单独入口（不是 `interrupt()` 无参）以免与「消息级打断」混淆；异常绝不抛出。
+    dispose: async () => {
+      try {
+        autoReader?.dispose();
+      } catch (err) {
+        log.warn("dispose 清理自动朗读失败", err as Error);
+      }
+    },
     ...(autoReader
       ? {
           event: async ({ event }) => {
