@@ -28,7 +28,9 @@ import { AUDIO_FRAME_MS } from "../voice/aliyun.js";
 import { formatCaptureExitFailure, listAudioDevices, MicCapture } from "../voice/capture.js";
 import { loadVoiceConfig, resolveAsrParams, resolveAsrProvider, voiceConfigPath } from "../voice/config.js";
 import { defaultCredentialsPath, resolveCredentials, resolveMimoApiKey, ASR_MIMO_CREDENTIALS_CONFIG_PATH } from "../voice/credentials.js";
-import { noAudioDeviceGuidance } from "../voice/guidance.js";
+import { ffmpegLaunchFailedGuidance, noAudioDeviceGuidance } from "../voice/guidance.js";
+import { FFMPEG_ENV, resolveFfmpegPath } from "../voice/ffmpeg.js";
+import { ensureFfmpegBinary } from "../voice/ffmpeg-heal.js";
 import { LEVEL_EVENT_INTERVAL_MS, rmsToLevel } from "../voice/meter.js";
 import { annotationForVoiceEmotion } from "../voice/mapping.js";
 import { isTermux } from "../voice/platform.js";
@@ -36,6 +38,8 @@ import { encodeEvent, type RuntimeEvent, type RuntimeFinal } from "../voice/ndjs
 import { readWavAsPcm16, silencePcm } from "../voice/wav.js";
 import { createStopController } from "./stop-signal.js";
 
+/** 强制走 ffmpeg 自愈（排障/测试；生产不需要）。 */
+const FFMPEG_FORCE_HEAL_ENV = "VOICE_FFMPEG_FORCE_HEAL";
 /** 采集统计打印间隔（毫秒）。 */
 const STATS_INTERVAL_MS = 2000;
 /** WAV 自测尾部静音时长（毫秒）：给服务端 VAD 触发断句。 */
@@ -166,7 +170,9 @@ function printDevices(): void {
   console.log("音频输入设备：");
   devices.forEach((device, index) => {
     const alt = device.alternativeName ? `（备用名：${device.alternativeName}）` : "";
-    console.log(`  [${index}] ${device.name}${alt}`);
+    // Linux 的「取值」（pactl source 名 / hw:C,D）与友好名不同时才额外显示
+    const value = device.value && device.value !== device.name ? `（取值：${device.value}）` : "";
+    console.log(`  [${index}] ${device.name}${alt}${value}`);
   });
 }
 
@@ -214,6 +220,42 @@ function createOutput(json: boolean): RuntimeOutput {
 }
 
 /**
+ * 启动前确保 ffmpeg 可用（**在枚举设备之前**调用）。
+ *
+ * 口径：
+ * - `FFMPEG_BIN` / PATH / ffmpeg-static 任一已可用 ⇒ **完全跳过自愈**（不联网、不耗时）；
+ * - 解析失败 ⇒ 发 NDJSON `progress` → `ensureFfmpegBinary()`（每进程一次）；
+ * - 成功（ok/copied/installed）⇒ 进程内把 `FFMPEG_BIN` 指向补齐后的路径（不污染用户持久配置），继续枚举；
+ * - 失败（unavailable/timeout/error）⇒ 抛错（main 统一发 `error` 并退出码 1），文案带原因 + 现有引导。
+ * - Termux 走系统 ffmpeg（`ffmpeg-static` 是 Linux x64 预编译，不适用），直接跳过。
+ * @param out 输出通道
+ * @throws Error 自愈失败（含原因与引导）
+ */
+async function prepareFfmpeg(out: RuntimeOutput): Promise<void> {
+  if (isTermux()) return;
+  if (process.env[FFMPEG_FORCE_HEAL_ENV] !== "1") {
+    try {
+      const existing = resolveFfmpegPath();
+      out.info(`[ffmpeg] 已可用（${existing}），跳过自愈`);
+      return;
+    } catch {
+      // 解析失败：进入自愈
+    }
+  }
+  out.event({ type: "progress", stage: "ffmpeg", message: "正在准备 ffmpeg…" });
+  const result = await ensureFfmpegBinary({ log: (message) => out.info(message) });
+  if (result.status === "ok" || result.status === "copied" || result.status === "installed") {
+    if (result.binaryPath) process.env[FFMPEG_ENV] = result.binaryPath;
+    out.info(`[ffmpeg] 自愈完成（${result.status}）：${result.detail}`);
+    return;
+  }
+  throw new Error(
+    `ffmpeg 自动补齐失败（${result.status}）：${result.detail}。` +
+      ffmpegLaunchFailedGuidance(result.binaryPath ?? "ffmpeg", result.detail),
+  );
+}
+
+/**
  * 解析要使用的设备名（入参已含「命令行 / 环境变量 / 配置」综合结果）。
  * @param explicit 显式设备名（空串/undefined 表示自动）
  * @returns 设备友好名
@@ -228,7 +270,8 @@ function resolveDevice(explicit?: string): string {
     // 枚举成功但 0 设备：给检查/指定设备的引导（ffmpeg 启动失败会先从 listAudioDevices 抛错）
     throw new Error(noAudioDeviceGuidance());
   }
-  return first.name;
+  // Linux：name 是友好 description，真正传给 ffmpeg 的是 value（source 名 / hw:C,D）
+  return first.value ?? first.name;
 }
 
 /**
@@ -456,6 +499,8 @@ async function main(): Promise<void> {
     return;
   }
   if (options.list) {
+    // 列表要枚举设备：同样先确保 ffmpeg（新机器首次运行也能直接看到设备）
+    await prepareFfmpeg(createOutput(options.json));
     printDevices();
     return;
   }
@@ -492,6 +537,8 @@ async function main(): Promise<void> {
     });
   }
   const out = createOutput(options.json);
+  // 麦克风模式：枚举设备前先确保 ffmpeg（`--wav` 不碰采集，跳过硬避免多余联网/耗时）
+  if (!options.wav) await prepareFfmpeg(out);
   const onFinal = (result: AsrResult): void => {
     const text = result.text.trim();
     if (text.length === 0) return;

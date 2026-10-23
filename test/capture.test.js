@@ -23,9 +23,9 @@ import {
   selectCaptureBackend,
 } from "../dist/voice/capture.js";
 
-test("selectCaptureBackend：Termux 环境或 android 平台走 termux，其余走 ffmpeg", () => {
-  assert.equal(selectCaptureBackend("linux", {}), "ffmpeg");
-  assert.equal(selectCaptureBackend("win32", { PREFIX: "/usr" }), "ffmpeg");
+test("selectCaptureBackend：Termux/android 走 termux，Windows 走 dshow，Linux 走 pulse", () => {
+  assert.equal(selectCaptureBackend("linux", {}), "pulse");
+  assert.equal(selectCaptureBackend("win32", { PREFIX: "/usr" }), "dshow");
   assert.equal(selectCaptureBackend("linux", { TERMUX_VERSION: "0.118" }), "termux");
   assert.equal(selectCaptureBackend("linux", { PREFIX: "/data/data/com.termux/files/usr" }), "termux");
   assert.equal(selectCaptureBackend("android", {}), "termux");

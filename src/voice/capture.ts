@@ -1,8 +1,10 @@
 /**
  * 麦克风采集：产出 16kHz/单声道/16bit PCM（s16le）分片，事件 `data` 交给 ASR 喂流。
  *
- * 两个后端（`data` 事件载荷/`start`·`stop` 接口保持一致，调用方无感）：
- * - **ffmpeg**（桌面）：从系统音频输入设备（Windows dshow）直接取裸 PCM；
+ * 后端（`data` 事件载荷/`start`·`stop` 接口保持一致，调用方无感）：
+ * - **dshow**（Windows）：`ffmpeg -f dshow` 从系统音频输入设备直接取裸 PCM；
+ * - **pulse**（Linux 桌面首选）：`ffmpeg -f pulse`，优先 PulseAudio/PipeWire；
+ * - **alsa**（Linux 桌面回退）：`ffmpeg -f alsa`，pulse 启动失败时自动改试一次；
  * - **termux**（Termux/Android）：系统无可用 ffmpeg 音频输入设备，改用 **`termux-microphone-record`**。
  *   该命令没有裸 PCM 编码器，只能录成压缩文件（优先 `opus`，失败退 `aac`）——故采用
  *   **分块录制 → ffmpeg 解码为 16k 单声道 s16le → 连续喂 ASR**（分块顺序解码，跨块拼成连续流）。
@@ -20,7 +22,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { decodeToPcm, resolveFfmpegPath } from "./ffmpeg.js";
-import { ffmpegLaunchFailedGuidance } from "./guidance.js";
+import {
+  ffmpegLaunchFailedGuidance,
+  linuxAudioEnumerationFailedGuidance,
+  unsupportedCapturePlatformGuidance,
+} from "./guidance.js";
 import { commandExists, isTermux, termuxExecutable } from "./platform.js";
 
 /** 采集采样率（Hz）：与阿里云实时 ASR 要求一致。 */
@@ -31,8 +37,15 @@ export const CAPTURE_CHANNELS = 1;
 /** stderr 诊断信息保留的最大字符数。 */
 const STDERR_TAIL_CHARS = 2000;
 
-/** 采集后端：桌面走 ffmpeg（dshow），Termux 走 termux-microphone-record。 */
-export type CaptureBackend = "ffmpeg" | "termux";
+/** 采集后端：Windows dshow / Linux pulse→alsa / Termux termux-microphone-record。 */
+export type CaptureBackend = "dshow" | "termux" | "pulse" | "alsa";
+/** 走 ffmpeg 的后端（Termux 之外）。 */
+export type FfmpegCaptureBackend = Exclude<CaptureBackend, "termux">;
+
+/** Linux 音频设备缺省取值（PulseAudio 默认 source / ALSA 默认设备）。 */
+export const DEFAULT_LINUX_AUDIO_DEVICE = "default";
+/** pulse 启动失败后允许自动回退 alsa 的时间窗（毫秒）：仅「启动即失败」才算。 */
+export const PULSE_FALLBACK_WINDOW_MS = 3000;
 
 /** Termux 录音命令名（`$PREFIX/bin/termux-microphone-record`）。 */
 export const TERMUX_MIC_BIN = "termux-microphone-record";
@@ -82,10 +95,12 @@ export function formatCaptureExitFailure(
 
 /** 音频输入设备。 */
 export interface AudioDevice {
-  /** 友好名（喂给 ffmpeg dshow 的名字）。 */
+  /** 友好名（Windows 即喂给 ffmpeg dshow 的名字；Linux 为 description）。 */
   name: string;
   /** dshow 备用名（可能为空）。 */
   alternativeName?: string;
+  /** 传给采集后端的**取值**（Linux：pulse source 名或 `hw:C,D`；Windows 缺省=name）。 */
+  value?: string;
 }
 
 /** MicCapture 事件表（供类型化 on/emit 使用）。 */
@@ -105,19 +120,46 @@ export interface MicCaptureOptions {
   platform?: NodeJS.Platform;
   /** 环境变量表；默认 `process.env`（可注入以便单测）。 */
   env?: NodeJS.ProcessEnv;
+  /** ffmpeg 可执行路径（测试注入；缺省 `resolveFfmpegPath()`）。 */
+  ffmpegBin?: string;
+  /** 采集子进程 spawn 注入（测试用；缺省 `node:child_process` 的 `spawn`）。 */
+  spawnCapture?: typeof spawn;
 }
 
 /**
- * 选择采集后端：Termux（`android` 平台或 Termux 环境）走 termux，其余走 ffmpeg。
- * @param platform 目标平台
- * @param env 环境变量表
+ * 选择采集后端（纯函数）。
+ *
+ * 分派规则：Termux（`android` 平台或 Termux 环境）→ `termux`；`win32` → `dshow`；
+ * `linux`（非 Termux）→ `pulse`；`preferAlsa` 时 → `alsa`（pulse 回退/显式指定）。
+ * 其它平台（如 `darwin`）**明确抛错**，绝不静默走 dshow。
+ * @param input 平台 / 是否 Termux / 是否强制 ALSA
  * @returns 后端标识
+ * @throws Error 不支持的平台
+ */
+export function resolveCaptureBackend(input: {
+  platform: NodeJS.Platform;
+  isTermux: boolean;
+  preferAlsa?: boolean;
+}): CaptureBackend {
+  const { platform, isTermux: termux, preferAlsa = false } = input;
+  if (termux || platform === "android") return "termux";
+  if (platform === "win32") return "dshow";
+  if (platform === "linux") return preferAlsa ? "alsa" : "pulse";
+  throw new Error(unsupportedCapturePlatformGuidance(platform));
+}
+
+/**
+ * `resolveCaptureBackend` 的环境版包装（保留旧签名）。
+ * @param platform 目标平台
+ * @param env 环境变量表（判定 Termux）
+ * @returns 后端标识
+ * @throws Error 不支持的平台
  */
 export function selectCaptureBackend(
   platform: NodeJS.Platform,
   env: NodeJS.ProcessEnv,
 ): CaptureBackend {
-  return platform === "android" || isTermux(env) ? "termux" : "ffmpeg";
+  return resolveCaptureBackend({ platform, isTermux: isTermux(env) });
 }
 
 /**
@@ -194,6 +236,8 @@ export interface DeviceSpawnResult {
   stderr?: string | Buffer | null;
   /** 启动失败（ENOENT/EACCES 等）——**不许吞**，必须转成明确错误上报。 */
   error?: NodeJS.ErrnoException | null;
+  /** 退出码（`spawnSync` 提供；注入测试可省略，省略按 0 处理）。 */
+  status?: number | null;
 }
 
 /** `listAudioDevices` 的可注入依赖（便于离线单测；生产走默认真 spawnSync/resolveFfmpegPath）。 */
@@ -202,19 +246,168 @@ export interface ListAudioDevicesOptions {
   bin?: string;
   /** `spawnSync` 注入（测试注入）。 */
   spawn?: (bin: string, args: string[], options: { encoding: "utf8" }) => DeviceSpawnResult;
+  /** 目标平台；默认 `process.platform`（可注入）。 */
+  platform?: NodeJS.Platform;
+  /** 环境变量表（判定 Termux）；默认 `process.env`。 */
+  env?: NodeJS.ProcessEnv;
+}
+
+/** Linux 设备枚举的可注入依赖。 */
+export interface LinuxAudioDevicesOptions {
+  /** `spawnSync` 注入（无 shell）。 */
+  spawn?: (bin: string, args: string[], options: { encoding: "utf8" }) => DeviceSpawnResult;
+  /** pactl 可执行名/路径；默认 `pactl`。 */
+  pactlBin?: string;
+  /** arecord 可执行名/路径；默认 `arecord`。 */
+  arecordBin?: string;
+}
+
+/** 命令是否成功（无 spawn 错误且退出码为 0/未知）。 */
+function commandSucceeded(result: DeviceSpawnResult): boolean {
+  return !result.error && (result.status === undefined || result.status === 0);
+}
+
+/** 取命令输出文本（stdout + stderr）。 */
+function commandText(result: DeviceSpawnResult): string {
+  return `${result.stdout ?? ""}${result.stderr ?? ""}`;
 }
 
 /**
- * 枚举本机 dshow 音频输入设备（Windows）。Termux 无 dshow，直接返回空列表。
+ * 解析 `pactl list short sources`（制表符分隔：index/name/driver/spec/state）。
+ * @param text 命令输出
+ * @returns 设备列表（description 暂用 source 名）
+ */
+export function parsePactlShortSources(text: string): AudioDevice[] {
+  const devices: AudioDevice[] = [];
+  for (const rawLine of text.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (line.length === 0) continue;
+    const fields = line.split("\t");
+    if (fields.length < 2) continue;
+    const name = fields[1]?.trim();
+    if (!name) continue;
+    devices.push({ name, value: name });
+  }
+  return devices;
+}
+
+/**
+ * 解析 `pactl list sources`（长格式，取 Name/Description 供友好名）。
+ * @param text 命令输出
+ * @returns 设备列表（value=source 名，name=description）
+ */
+export function parsePactlSources(text: string): AudioDevice[] {
+  const devices: AudioDevice[] = [];
+  let name: string | undefined;
+  for (const rawLine of text.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    const nameMatch = /^Name:\s*(.+)$/.exec(line);
+    if (nameMatch) {
+      name = nameMatch[1].trim();
+      continue;
+    }
+    const descMatch = /^Description:\s*(.+)$/.exec(line);
+    if (descMatch && name) {
+      devices.push({ name: descMatch[1].trim() || name, value: name });
+      name = undefined;
+    }
+  }
+  return devices;
+}
+
+/**
+ * 解析 `arecord -l`：`card 0: PCH [HDA Intel PCH], device 0: ALC257 Analog [ALC257 Analog]`。
+ * @param text 命令输出
+ * @returns 设备列表（value=`hw:C,D`）
+ */
+export function parseArecordDevices(text: string): AudioDevice[] {
+  const devices: AudioDevice[] = [];
+  const re = /^card\s+(\d+):\s*([^\[]+?)\s*\[([^\]]*)\],\s*device\s+(\d+):\s*([^\[]+?)\s*\[([^\]]*)\]/gm;
+  let match: RegExpExecArray | null;
+  while ((match = re.exec(text)) !== null) {
+    const [, cardIndex, cardName, cardLabel, deviceIndex, deviceName, deviceLabel] = match;
+    const value = `hw:${cardIndex},${deviceIndex}`;
+    const description = [cardLabel || cardName, deviceLabel || deviceName]
+      .map((part) => part.trim())
+      .filter((part) => part.length > 0)
+      .join(" ");
+    devices.push({ name: description || value, value });
+  }
+  return devices;
+}
+
+/**
+ * 枚举 Linux 音频输入设备：`pactl list short sources` 优先，失败回退 `arecord -l`。
+ *
+ * 两者都不可用（命令不存在/非 0）时抛明确错误（含安装命令）。pactl 成功但 0 source
+ * 且 arecord 成功但 0 设备 ⇒ 返回空列表（由调用方给「无设备」引导）。
+ * @param options 可注入依赖
+ * @returns 设备列表
+ * @throws Error 两种枚举命令都不可用
+ */
+export function listLinuxAudioDevices(options: LinuxAudioDevicesOptions = {}): AudioDevice[] {
+  const spawn =
+    options.spawn ?? ((target: string, argv: string[], opts: { encoding: "utf8" }) => spawnSync(target, argv, opts));
+  const pactlBin = options.pactlBin ?? "pactl";
+  const arecordBin = options.arecordBin ?? "arecord";
+
+  const pactl = spawn(pactlBin, ["list", "short", "sources"], { encoding: "utf8" });
+  let pactlCause = "";
+  if (commandSucceeded(pactl)) {
+    const sources = parsePactlShortSources(commandText(pactl));
+    if (sources.length > 0) {
+      // 短格式没有 description：再取一次长格式补友好名（失败则用 source 名兜底）
+      const long = spawn(pactlBin, ["list", "sources"], { encoding: "utf8" });
+      const descriptions = new Map<string, string>();
+      if (commandSucceeded(long)) {
+        for (const device of parsePactlSources(commandText(long))) {
+          if (device.value) descriptions.set(device.value, device.name);
+        }
+      }
+      return sources.map((source) => ({
+        name: descriptions.get(source.value ?? source.name) ?? source.name,
+        value: source.value,
+      }));
+    }
+  } else {
+    pactlCause = describeCommandFailure(pactl);
+  }
+
+  const arecord = spawn(arecordBin, ["-l"], { encoding: "utf8" });
+  if (commandSucceeded(arecord)) return parseArecordDevices(commandText(arecord));
+
+  throw new Error(linuxAudioEnumerationFailedGuidance(pactlCause || "无可用 source", describeCommandFailure(arecord)));
+}
+
+/**
+ * 命令失败原因（写进引导文案）。
+ * @param result spawnSync 结果
+ * @returns 原因文本
+ */
+function describeCommandFailure(result: DeviceSpawnResult): string {
+  if (result.error) {
+    const errno = result.error as NodeJS.ErrnoException;
+    return errno.code ? `${errno.code} ${errno.message}` : errno.message;
+  }
+  const stderr = `${result.stderr ?? ""}`.trim().split(/\r?\n/).slice(-1)[0];
+  return `退出码=${result.status ?? "unknown"}${stderr ? `：${stderr}` : ""}`;
+}
+
+/**
+ * 枚举音频输入设备（按平台分派）：Windows dshow / Linux pactl→arecord / Termux 空列表。
  *
  * `spawnSync` 启动失败（ffmpeg 不存在/无权限）**不再静默吞掉**：抛出带可执行路径与底层原因的
  * 明确错误（引导文案见 `guidance.ts`），让真因浮出，而不是解析出空列表后误报「无音频输入设备」。
- * @param options 可注入依赖（bin/spawn；缺省用生产实现）
+ * @param options 可注入依赖（bin/spawn/platform/env；缺省用生产实现）
  * @returns 设备列表（枚举成功但确实没有设备时为空数组）
- * @throws Error ffmpeg 无法启动（result.error，含路径与 ENOENT/EACCES 原因）
+ * @throws Error ffmpeg/枚举命令无法启动，或平台不支持
  */
 export function listAudioDevices(options: ListAudioDevicesOptions = {}): AudioDevice[] {
-  if (isTermux(process.env)) return [];
+  const platform = options.platform ?? process.platform;
+  const env = options.env ?? process.env;
+  if (isTermux(env) || platform === "android") return [];
+  if (platform === "linux") return listLinuxAudioDevices({ spawn: options.spawn });
+  if (platform !== "win32") throw new Error(unsupportedCapturePlatformGuidance(platform));
   const args = ["-hide_banner", "-list_devices", "true", "-f", "dshow", "-i", "dummy"];
   const bin = options.bin ?? resolveFfmpegPath();
   const spawn = options.spawn ?? ((target, argv, opts) => spawnSync(target, argv, opts));
@@ -252,6 +445,127 @@ export function buildCaptureArgs(device: string, sampleRate: number = CAPTURE_SA
   ];
 }
 
+/**
+ * 解析 Linux 采集设备取值：空/纯空白 → `default`，其余原样（source 名或 `hw:C,D`）。
+ * @param backend 采集后端（仅 pulse/alsa 生效；Windows/Termux 原样返回）
+ * @param device 配置的设备
+ * @returns 实际传给 ffmpeg 的取值
+ */
+export function resolveCaptureDevice(backend: CaptureBackend, device: string): string {
+  if (backend !== "pulse" && backend !== "alsa") return device;
+  const trimmed = device.trim();
+  return trimmed.length > 0 ? trimmed : DEFAULT_LINUX_AUDIO_DEVICE;
+}
+
+/**
+ * Linux PulseAudio/PipeWire 采集参数。
+ * @param input 设备与采样率（采样率缺省 CAPTURE_SAMPLE_RATE）
+ * @returns ffmpeg argv（不含可执行文件）
+ */
+export function buildPulseArgs(input: { device: string; sampleRate?: number }): string[] {
+  return [
+    "-hide_banner",
+    "-loglevel",
+    "error",
+    "-f",
+    "pulse",
+    "-i",
+    resolveCaptureDevice("pulse", input.device),
+    "-ac",
+    String(CAPTURE_CHANNELS),
+    "-ar",
+    String(input.sampleRate ?? CAPTURE_SAMPLE_RATE),
+    "-f",
+    "s16le",
+    "-",
+  ];
+}
+
+/**
+ * Linux ALSA 采集参数（pulse 回退）。
+ * @param input 设备与采样率（设备缺省 `default`）
+ * @returns ffmpeg argv（不含可执行文件）
+ */
+export function buildAlsaArgs(input: { device: string; sampleRate?: number }): string[] {
+  return [
+    "-hide_banner",
+    "-loglevel",
+    "error",
+    "-f",
+    "alsa",
+    "-i",
+    resolveCaptureDevice("alsa", input.device),
+    "-ac",
+    String(CAPTURE_CHANNELS),
+    "-ar",
+    String(input.sampleRate ?? CAPTURE_SAMPLE_RATE),
+    "-f",
+    "s16le",
+    "-",
+  ];
+}
+
+/**
+ * 按后端构造 ffmpeg 采集参数（dshow 走原实现，语义不变）。
+ * @param backend ffmpeg 后端
+ * @param device 设备名/取值
+ * @param sampleRate 采样率
+ * @returns ffmpeg argv
+ */
+export function buildFfmpegCaptureArgs(
+  backend: FfmpegCaptureBackend,
+  device: string,
+  sampleRate: number = CAPTURE_SAMPLE_RATE,
+): string[] {
+  if (backend === "pulse") return buildPulseArgs({ device, sampleRate });
+  if (backend === "alsa") return buildAlsaArgs({ device, sampleRate });
+  return buildCaptureArgs(device, sampleRate);
+}
+
+/**
+ * pulse 启动失败是否属于「连接/设备不可用」类（据此决定自动回退 ALSA）。
+ * @param stderr ffmpeg stderr 尾部
+ * @returns 命中 true
+ */
+export function isPulseStartupFailure(stderr: string): boolean {
+  return /connection refused|failed to connect|no such file|cannot open|could not open|no such device|permission denied|device or resource busy/i.test(
+    stderr,
+  );
+}
+
+/** 后端回退决策入参。 */
+export interface PulseFallbackDecision {
+  /** 当前后端。 */
+  backend: CaptureBackend;
+  /** 是否已回退过（保证只重试一次）。 */
+  fallbackAttempted: boolean;
+  /** 用户是否已请求停止。 */
+  stopping: boolean;
+  /** 本次尝试是否收到过音频字节。 */
+  bytes: number;
+  /** 启动耗时（毫秒）。 */
+  elapsedMs: number;
+  /** stderr 尾部。 */
+  stderr: string;
+  /** 子进程是否启动失败（spawn error）。 */
+  spawnError?: boolean;
+}
+
+/**
+ * 是否应从 pulse 自动回退 ALSA（纯函数）。
+ *
+ * 只回退一次；仅 pulse 后端、未在停止中、尚未回退过，且属于「spawn 失败」或
+ * 「启动窗口内 0 字节退出 + stderr 命中连接/设备错误」。
+ * @param input 决策入参
+ * @returns 需要回退 true
+ */
+export function shouldFallbackToAlsa(input: PulseFallbackDecision): boolean {
+  if (input.backend !== "pulse" || input.fallbackAttempted || input.stopping) return false;
+  if (input.bytes > 0) return false;
+  if (input.spawnError === true) return true;
+  return input.elapsedMs <= PULSE_FALLBACK_WINDOW_MS && isPulseStartupFailure(input.stderr);
+}
+
 /** 麦克风采集器（EventEmitter，事件见 MicCaptureEventMap）。 */
 export class MicCapture extends EventEmitter {
   private process: ChildProcess | null = null;
@@ -261,12 +575,24 @@ export class MicCapture extends EventEmitter {
   private readonly env: NodeJS.ProcessEnv;
   private readonly backend: CaptureBackend;
   private readonly termuxChunkSeconds: number;
+  private readonly ffmpegBin: string | undefined;
+  private readonly spawnCapture: typeof spawn;
   private stderrTail = "";
   private running = false;
   private stopping = false;
   private termuxEncoderIndex = 0;
   private waitTimer: NodeJS.Timeout | null = null;
   private waitResolve: (() => void) | null = null;
+  /** 当前 ffmpeg 尝试的后端（回退后变 alsa）。 */
+  private activeBackend: FfmpegCaptureBackend | null = null;
+  /** 是否已回退过 ALSA（保证只重试一次）。 */
+  private fallbackAttempted = false;
+  /** 本次尝试已收到的 PCM 字节数。 */
+  private attemptBytes = 0;
+  /** 本次尝试的启动时刻（毫秒）。 */
+  private attemptStartedAt = 0;
+  /** 尝试序号：旧进程的迟到事件直接丢弃。 */
+  private attemptToken = 0;
 
   /**
    * @param options 采集配置
@@ -279,6 +605,8 @@ export class MicCapture extends EventEmitter {
     this.env = options.env ?? process.env;
     this.backend = selectCaptureBackend(this.platform, this.env);
     this.termuxChunkSeconds = resolveTermuxChunkSeconds(this.env);
+    this.ffmpegBin = options.ffmpegBin;
+    this.spawnCapture = options.spawnCapture ?? spawn;
   }
 
   /** 采集是否进行中。 */
@@ -302,36 +630,93 @@ export class MicCapture extends EventEmitter {
     this.running = true;
     this.stopping = false;
     this.stderrTail = "";
+    this.fallbackAttempted = false;
     if (this.backend === "termux") {
       void this.runTermuxLoop();
       return;
     }
-    const proc = spawn(resolveFfmpegPath(), buildCaptureArgs(this.device, this.sampleRate), {
+    this.startFfmpegBackend(this.backend);
+  }
+
+  /**
+   * 启动一次 ffmpeg 采集尝试（pulse 失败可由此回退 alsa）。
+   * @param backend ffmpeg 后端
+   */
+  private startFfmpegBackend(backend: FfmpegCaptureBackend): void {
+    this.activeBackend = backend;
+    this.attemptBytes = 0;
+    this.attemptStartedAt = Date.now();
+    this.attemptToken += 1;
+    const token = this.attemptToken;
+    const bin = this.ffmpegBin ?? resolveFfmpegPath();
+    const proc = this.spawnCapture(bin, buildFfmpegCaptureArgs(backend, this.device, this.sampleRate), {
       stdio: ["ignore", "pipe", "pipe"],
     });
     this.process = proc;
 
+    let settled = false;
+    const finish = (code: number | null, err: Error | null): void => {
+      if (settled || token !== this.attemptToken) return;
+      settled = true;
+      this.handleFfmpegExit(code, err, token);
+    };
+
     proc.stdout?.on("data", (chunk: Buffer) => {
+      if (token !== this.attemptToken) return;
+      this.attemptBytes += chunk.length;
       this.emit("data", chunk);
     });
     proc.stderr?.on("data", (chunk: Buffer) => {
-      this.stderrTail = (this.stderrTail + chunk.toString()).slice(-STDERR_TAIL_CHARS);
+      if (token !== this.attemptToken) return;
+      this.appendStderr(chunk.toString());
     });
-    proc.on("error", (err: Error) => {
-      this.emit("error", err);
-    });
-    proc.on("close", (code: number | null) => {
-      this.process = null;
-      this.running = false;
-      this.emit("close", code);
-    });
+    proc.on("error", (err: Error) => finish(null, err));
+    proc.on("close", (code: number | null) => finish(code, null));
+  }
+
+  /**
+   * 处理一次 ffmpeg 尝试的结束：pulse 启动失败 → 自动回退 ALSA **一次**；否则按原路径收尾。
+   * @param code 退出码
+   * @param err spawn 错误
+   * @param token 尝试序号
+   */
+  private handleFfmpegExit(code: number | null, err: Error | null, token: number): void {
+    if (token !== this.attemptToken) return;
+    this.process = null;
+    const backend = this.activeBackend;
+    const elapsedMs = Date.now() - this.attemptStartedAt;
+    if (backend !== null && shouldFallbackToAlsa({
+      backend,
+      fallbackAttempted: this.fallbackAttempted,
+      stopping: this.stopping,
+      bytes: this.attemptBytes,
+      elapsedMs,
+      stderr: this.stderrTail,
+      spawnError: err !== null,
+    })) {
+      this.fallbackAttempted = true;
+      this.appendStderr(
+        `\n[采集] PulseAudio 启动失败${err ? `（${err.message}）` : ""}，已自动改用 ALSA 重试一次\n`,
+      );
+      this.startFfmpegBackend("alsa");
+      return;
+    }
+    if (this.fallbackAttempted && backend === "alsa" && err === null && this.attemptBytes === 0) {
+      this.appendStderr("\n[采集] PulseAudio 与 ALSA 两种后端均失败（pulse 已回退 alsa 一次）\n");
+    }
+    this.running = false;
+    if (err) {
+      const suffix = this.fallbackAttempted ? "；已尝试 pulse 与 alsa 两种后端" : "";
+      this.emit("error", new Error(`${err.message}${suffix}`));
+    }
+    this.emit("close", code);
   }
 
   /** 停止采集（ffmpeg 直接结束；Termux 先停止录音再收尾）；未运行时无操作。 */
   stop(): void {
     if (!this.running) return;
     this.stopping = true;
-    if (this.backend === "ffmpeg") {
+    if (this.backend !== "termux") {
       this.process?.kill();
       return;
     }

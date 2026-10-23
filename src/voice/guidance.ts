@@ -25,8 +25,61 @@ export function ffmpegInstallHints(platform: NodeJS.Platform, env: NodeJS.Proces
     case "darwin":
       return "macOS：brew install ffmpeg";
     default:
-      return "Linux：apt install ffmpeg（或 dnf/pacman 安装 ffmpeg）";
+      return "Linux：apt install ffmpeg（Debian/Ubuntu）或 pacman -S ffmpeg（Arch）";
   }
+}
+
+/**
+ * 不支持的采集平台（如 macOS）的可读错误：绝不静默落到 dshow。
+ * @param platform 目标平台
+ * @returns 中文说明
+ */
+export function unsupportedCapturePlatformGuidance(platform: NodeJS.Platform): string {
+  return (
+    `当前平台（${platform}）暂不支持语音采集：仅支持 Windows（dshow）、` +
+    "Termux/Android（termux-api）与 Linux 桌面（PulseAudio/PipeWire，ALSA 回退）。"
+  );
+}
+
+/**
+ * Linux 采集依赖缺失/权限问题的专属提示。
+ * @param problem 问题类型
+ * @param detail 可选细节（命令输出）
+ * @returns 中文可操作提示
+ */
+export function linuxCaptureGuidance(
+  problem: "ffmpeg-missing" | "pulse-missing" | "no-permission",
+  detail?: string,
+): string {
+  const suffix = detail ? `（${detail}）` : "";
+  switch (problem) {
+    case "ffmpeg-missing":
+      return `Linux 未找到 ffmpeg：请执行 apt install ffmpeg（Debian/Ubuntu）或 pacman -S ffmpeg（Arch）${suffix}`;
+    case "pulse-missing":
+      return (
+        `未检测到 PulseAudio/PipeWire（pactl info 失败）${suffix}：` +
+        "可安装 pactl（apt install pulseaudio-utils）或改用 ALSA（arecord -l，ffmpeg -f alsa）。"
+      );
+    default:
+      return (
+        `无麦克风访问权限${suffix}：把当前用户加入 audio 组` +
+        "（sudo usermod -aG audio $USER）后重新登录；或检查 /dev/snd 权限。"
+      );
+  }
+}
+
+/**
+ * Linux 上两条枚举命令（pactl / arecord）都不可用时的错误。
+ * @param pactlCause pactl 失败原因
+ * @param arecordCause arecord 失败原因
+ * @returns 中文可操作提示
+ */
+export function linuxAudioEnumerationFailedGuidance(pactlCause: string, arecordCause: string): string {
+  return (
+    `Linux 上无法枚举音频输入设备：pactl（${pactlCause}）与 arecord（${arecordCause}）均不可用。` +
+    `${linuxCaptureGuidance("pulse-missing")} ` +
+    "请安装：apt install pulseaudio-utils alsa-utils ffmpeg（或 pacman -S libpulse alsa-utils ffmpeg）。"
+  );
 }
 
 /** `ffmpegMissingGuidance` 的入参。 */
@@ -89,15 +142,27 @@ export function ffmpegLaunchFailedGuidance(bin: string, cause: string): string {
  * 枚举**成功**但音频输入设备为 0 个时的用户引导。
  *
  * 只有枚举成功且确实 0 设备才用本文案；ffmpeg 启动失败走 {@link ffmpegLaunchFailedGuidance}。
+ * @param platform 目标平台（Linux 给 pactl/arecord/audio 组提示）
  * @returns 中文可操作提示
  */
-export function noAudioDeviceGuidance(): string {
+export function noAudioDeviceGuidance(platform: NodeJS.Platform = process.platform): string {
+  const listed = "③ 用 node dist/runtime/voice-runtime.js --list 查看设备列表；";
+  const specify = '④ 用 --device "<设备名>" 或环境变量 VOICE_DEVICE 指定设备。';
+  if (platform === "linux") {
+    return (
+      "未找到音频输入设备（枚举成功但结果为 0 个）。请检查：" +
+      "① 系统麦克风是否已连接并启用；" +
+      "② pactl list short sources / arecord -l 是否有 source；" +
+      `${linuxCaptureGuidance("no-permission")} ` +
+      specify
+    );
+  }
   return (
     "未找到音频输入设备（枚举成功但结果为 0 个）。请检查：" +
     "① 系统麦克风是否已连接并启用；" +
     "② Windows：设置 → 隐私和安全性 → 麦克风，允许桌面应用访问；" +
-    "③ 用 node dist/runtime/voice-runtime.js --list 查看设备列表；" +
-    '④ 用 --device "<设备名>" 或环境变量 VOICE_DEVICE 指定设备。'
+    listed +
+    specify
   );
 }
 

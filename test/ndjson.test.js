@@ -7,13 +7,14 @@ import assert from "node:assert/strict";
 
 import { NdjsonLineSplitter, encodeEvent, parseEventLine } from "../dist/voice/ndjson.js";
 
-test("encodeEvent / parseEventLine：五类事件往返一致", () => {
+test("encodeEvent / parseEventLine：六类事件往返一致", () => {
   const events = [
     { type: "ready", model: "qwen3-asr-flash-realtime" },
     { type: "final", text: "你好", emotion: "happy", annotation: "😊(2/3)" },
     { type: "level", level: 0.42 },
     { type: "level", level: 0 },
     { type: "level", level: 1 },
+    { type: "progress", stage: "ffmpeg", message: "正在准备 ffmpeg…" },
     { type: "error", message: "连接失败" },
     { type: "done" },
   ];
@@ -32,6 +33,7 @@ test("parseEventLine：缺省字段补齐与非法输入返回 null", () => {
     annotation: "",
   });
   assert.deepEqual(parseEventLine('{"type":"ready"}'), { type: "ready", model: "" });
+  assert.deepEqual(parseEventLine('{"type":"progress"}'), { type: "progress", stage: "", message: "" });
   assert.deepEqual(parseEventLine('{"type":"error"}'), { type: "error", message: "未知错误" });
 
   const invalid = [

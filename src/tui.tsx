@@ -431,6 +431,10 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
       case "final":
         void dispatch(event);
         break;
+      case "progress":
+        // 启动阶段提示（如 ffmpeg 运行时自愈）：低频一次性事件，只 toast、不写日志
+        toast("info", event.message);
+        break;
       case "error":
         // 配置引导类错误（ffmpeg/设备/凭证）按 120 字符口径展示，保证「哪缺、去哪配」可见
         toast("warning", format(phrases.toast.runtimeError, { message: preview(event.message, ERROR_TOAST_MAX) }));

@@ -1003,7 +1003,7 @@ async function runPlay(): Promise<number> {
 async function runDevices(): Promise<number> {
   const { listAudioDevices } = await import("../voice/capture.js");
   const phrases = getPhrases(loadVoiceConfig().toolLanguage);
-  let devices: Array<{ name: string; alternativeName?: string }>;
+  let devices: Array<{ name: string; alternativeName?: string; value?: string }>;
   try {
     devices = listAudioDevices();
   } catch (error) {
@@ -1017,7 +1017,8 @@ async function runDevices(): Promise<number> {
   out(phrases.cli.devicesHeader);
   devices.forEach((device, index) => {
     const alt = device.alternativeName ? `  [alt: ${device.alternativeName}]` : "";
-    out(`  ${index + 1}. ${device.name}${alt}`);
+    const value = device.value && device.value !== device.name ? `  [value: ${device.value}]` : "";
+    out(`  ${index + 1}. ${device.name}${alt}${value}`);
   });
   return 0;
 }

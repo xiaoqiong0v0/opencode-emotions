@@ -8,6 +8,7 @@
  * - `ready`：运行时已连上 ASR（附带模型名）；
  * - `final`：一句最终识别结果（注入/追加的数据源）；
  * - `level`：麦克风电平（采集期间的节流上行，`level ∈ [0,1]`，供槽位盲文音量列渲染）；
+ * - `progress`：启动阶段进度（如 ffmpeg 运行时自愈；低频、仅提示用，不承载业务数据）；
  * - `error`：运行时错误（已脱敏）；
  * - `done` ：运行时结束（正常或异常）。
  */
@@ -27,6 +28,7 @@ export type RuntimeEvent =
   | { type: "ready"; model: string }
   | { type: "final"; text: string; emotion: string; annotation: string }
   | { type: "level"; level: number }
+  | { type: "progress"; stage: string; message: string }
   | { type: "error"; message: string }
   | { type: "done" };
 
@@ -82,6 +84,12 @@ export function parseEventLine(line: string): RuntimeEvent | null {
       if (typeof data.level !== "number" || !Number.isFinite(data.level)) return null;
       return { type: "level", level: data.level };
     }
+    case "progress":
+      return {
+        type: "progress",
+        stage: asString(data.stage) ?? "",
+        message: asString(data.message) ?? "",
+      };
     case "error":
       return { type: "error", message: asString(data.message) ?? "未知错误" };
     case "done":
