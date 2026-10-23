@@ -1,6 +1,6 @@
 {
   "name": "@xiaoqiong0v0/opencode-emotions",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "description": "OpenCode plugin: emotion-aware voice I/O — realtime speech-to-text with emotion tagging, plus text-to-speech output.",
   "files": [
@@ -23,7 +23,7 @@
     "voice": "node dist/runtime/voice-runtime.js",
     "emotions-cli": "node dist/cli/emotions-cli.js",
     "publish:proj": "npm run build && node scripts/publish-proj.mjs",
-    "prepublishOnly": "npm run build"
+    "prepublishOnly": "npm run build && node --test \"test/**/*.test.js\""
   },
   "keywords": [
     "opencode",
