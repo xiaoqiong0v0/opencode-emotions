@@ -10,6 +10,8 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
+import { dirname } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import {
   pickStderrSummary,
@@ -25,19 +27,29 @@ function existsSet(paths) {
   return (path) => set.has(path);
 }
 
-test("selfDirFromModuleUrl：file: URL → 产物所在目录", () => {
-  assert.equal(selfDirFromModuleUrl("file:///D:/pkg/dist/tui.js"), "D:\\pkg\\dist");
-  // POSIX URL 只在 POSIX 平台是合法路径；Windows 上 fileURLToPath 会抛（无盘符）⇒ 捕获后降级 null
-  if (process.platform === "win32") {
-    assert.equal(selfDirFromModuleUrl("file:///home/user/pkg/dist/tui.js"), null, "非法形态必须降级，不能抛穿插件");
-  } else {
-    assert.equal(selfDirFromModuleUrl("file:///home/user/pkg/dist/tui.js"), "/home/user/pkg/dist");
-  }
+/** 以 Windows 语义调用解析（显式注入平台，断言不随宿主平台漂移）。 */
+function resolveWin(input) {
+  return resolveRuntimeScript({ platform: "win32", ...input });
+}
+
+test("selfDirFromModuleUrl：file: URL → 产物所在目录（按注入平台归一，不依赖宿主）", () => {
+  assert.equal(selfDirFromModuleUrl("file:///D:/pkg/dist/tui.js", "win32"), "D:\\pkg\\dist");
+  assert.equal(selfDirFromModuleUrl("file:///home/user/pkg/dist/tui.js", "linux"), "/home/user/pkg/dist");
+  // POSIX URL 在 Windows 语义下不合法（无盘符）⇒ 捕获后降级 null
+  assert.equal(
+    selfDirFromModuleUrl("file:///home/user/pkg/dist/tui.js", "win32"),
+    null,
+    "非法形态必须降级，不能抛穿插件",
+  );
+  // 默认平台（宿主）的正例：import.meta.url 必须能解出宿主产物目录，不能一律降级
+  const expectedHostDir = dirname(fileURLToPath(import.meta.url));
+  assert.notEqual(selfDirFromModuleUrl(import.meta.url), null, "宿主平台默认解析不得降级为 null");
+  assert.equal(selfDirFromModuleUrl(import.meta.url), expectedHostDir, "默认平台应与宿主 path 归一结果一致");
 });
 
-test("selfDirFromModuleUrl：绝对路径字符串同样可用（宿主直接给路径的形态）", () => {
-  assert.equal(selfDirFromModuleUrl("D:\\pkg\\dist\\tui.js"), "D:\\pkg\\dist");
-  assert.equal(selfDirFromModuleUrl("/home/user/pkg/dist/tui.js"), "/home/user/pkg/dist");
+test("selfDirFromModuleUrl：绝对路径字符串同样可用（按注入平台判定绝对/目录）", () => {
+  assert.equal(selfDirFromModuleUrl("D:\\pkg\\dist\\tui.js", "win32"), "D:\\pkg\\dist");
+  assert.equal(selfDirFromModuleUrl("/home/user/pkg/dist/tui.js", "linux"), "/home/user/pkg/dist");
 });
 
 test("selfDirFromModuleUrl：虚拟命名空间/相对值/空值一律 null（交给兜底）", () => {
@@ -53,7 +65,7 @@ test("selfDirFromModuleUrl：虚拟命名空间/相对值/空值一律 null（�
 test("resolveRuntimeScript：环境变量覆盖最优先（相对值按 cwd 归一，且不把关存在性）", () => {
   const cwd = "C:\\work";
   const env = "C:\\custom\\my-runtime.js";
-  const got = resolveRuntimeScript({
+  const got = resolveWin({
     envScript: env,
     selfDir: "C:\\pkg\\dist",
     cwd,
@@ -64,14 +76,14 @@ test("resolveRuntimeScript：环境变量覆盖最优先（相对值按 cwd 归�
   assert.equal(got.exists, true);
   assert.equal(got.candidates[0], env, "候选顺序里 env 最前");
 
-  const missing = resolveRuntimeScript({ envScript: env, selfDir: null, cwd, exists: existsSet([]) });
+  const missing = resolveWin({ envScript: env, selfDir: null, cwd, exists: existsSet([]) });
   assert.equal(missing.source, "env", "显式覆盖即使不存在仍被尊重（由调用方带绝对路径报错）");
   assert.equal(missing.exists, false);
   assert.equal(missing.script, env);
 });
 
 test("resolveRuntimeScript：env 相对值归一为 cwd 下的绝对路径", () => {
-  const got = resolveRuntimeScript({
+  const got = resolveWin({
     envScript: "tools\\runtime.js",
     cwd: "C:\\work",
     exists: existsSet(["C:\\work\\tools\\runtime.js"]),
@@ -83,7 +95,7 @@ test("resolveRuntimeScript：env 相对值归一为 cwd 下的绝对路径", () 
 test("resolveRuntimeScript：env 空串/空白视为未设置（走自身锚点）", () => {
   const selfScript = `C:\\pkg\\dist\\${RUNTIME_RELATIVE_TO_SELF.join("\\")}`;
   for (const value of ["", "   ", null, undefined]) {
-    const got = resolveRuntimeScript({ envScript: value, selfDir: "C:\\pkg\\dist", cwd: "C:\\work", exists: existsSet([selfScript]) });
+    const got = resolveWin({ envScript: value, selfDir: "C:\\pkg\\dist", cwd: "C:\\work", exists: existsSet([selfScript]) });
     assert.equal(got.source, "self", `env=${JSON.stringify(value)} 应视为未设置`);
     assert.equal(got.script, selfScript);
     assert.equal(got.exists, true);
@@ -91,7 +103,7 @@ test("resolveRuntimeScript：env 空串/空白视为未设置（走自身锚点�
 });
 
 test("resolveRuntimeScript：自身锚点命中即采用，与 cwd 完全无关（修根因主路径）", () => {
-  const got = resolveRuntimeScript({
+  const got = resolveWin({
     selfDir: "C:\\Users\\king-\\.cache\\opencode\\packages\\x\\dist",
     cwd: "C:\\Users\\king-",
     exists: existsSet(["C:\\Users\\king-\\.cache\\opencode\\packages\\x\\dist\\runtime\\voice-runtime.js"]),
@@ -102,7 +114,7 @@ test("resolveRuntimeScript：自身锚点命中即采用，与 cwd 完全无关�
 });
 
 test("resolveRuntimeScript：镜像布局（.opencode/plugin）同级 runtime 同样命中", () => {
-  const got = resolveRuntimeScript({
+  const got = resolveWin({
     selfDir: "C:\\cfg\\.opencode\\plugin",
     cwd: "C:\\Users\\king-",
     exists: existsSet(["C:\\cfg\\.opencode\\plugin\\runtime\\voice-runtime.js"]),
@@ -113,7 +125,7 @@ test("resolveRuntimeScript：镜像布局（.opencode/plugin）同级 runtime �
 
 test("resolveRuntimeScript：自身锚点不存在/不可用时才用 cwd 兜底（source=cwd）", () => {
   const cwdScript = `C:\\work\\${RUNTIME_RELATIVE_TO_CWD.join("\\")}`;
-  const selfMiss = resolveRuntimeScript({
+  const selfMiss = resolveWin({
     selfDir: "C:\\pkg\\dist",
     cwd: "C:\\work",
     exists: existsSet([cwdScript]),
@@ -122,13 +134,13 @@ test("resolveRuntimeScript：自身锚点不存在/不可用时才用 cwd 兜底
   assert.equal(selfMiss.script, cwdScript);
   assert.equal(selfMiss.exists, true);
 
-  const noAnchor = resolveRuntimeScript({ selfDir: null, cwd: "C:\\work", exists: existsSet([cwdScript]) });
+  const noAnchor = resolveWin({ selfDir: null, cwd: "C:\\work", exists: existsSet([cwdScript]) });
   assert.equal(noAnchor.source, "cwd", "锚点不可用（宿主虚拟化）⇒ cwd 兜底");
   assert.deepEqual(noAnchor.candidates, [cwdScript], "无锚点时候选只剩 cwd 拼法");
 });
 
 test("resolveRuntimeScript：候选都不存在 → source=none、exists=false、返回首选并列出全部候选", () => {
-  const got = resolveRuntimeScript({
+  const got = resolveWin({
     selfDir: "C:\\pkg\\dist",
     cwd: "C:\\Users\\king-",
     exists: existsSet([]),
@@ -141,9 +153,67 @@ test("resolveRuntimeScript：候选都不存在 → source=none、exists=false�
     "C:\\Users\\king-\\dist\\runtime\\voice-runtime.js",
   ]);
 
-  const noSelf = resolveRuntimeScript({ selfDir: null, cwd: "C:\\Users\\king-", exists: existsSet([]) });
+  const noSelf = resolveWin({ selfDir: null, cwd: "C:\\Users\\king-", exists: existsSet([]) });
   assert.equal(noSelf.source, "none");
   assert.equal(noSelf.script, "C:\\Users\\king-\\dist\\runtime\\voice-runtime.js");
+});
+
+test("resolveRuntimeScript：POSIX 语义（platform=linux）的归一、优先级与 source", () => {
+  const selfScript = "/opt/pkg/dist/runtime/voice-runtime.js";
+  const cwdScript = "/work/dist/runtime/voice-runtime.js";
+
+  const selfHit = resolveRuntimeScript({
+    platform: "linux",
+    selfDir: "/opt/pkg/dist",
+    cwd: "/work",
+    exists: existsSet([selfScript]),
+  });
+  assert.equal(selfHit.source, "self", "自身锚点存在即采用（POSIX 主路径）");
+  assert.equal(selfHit.script, selfScript);
+  assert.equal(selfHit.exists, true);
+  assert.deepEqual(selfHit.candidates, [selfScript, cwdScript]);
+
+  const cwdHit = resolveRuntimeScript({
+    platform: "linux",
+    selfDir: "/opt/pkg/dist",
+    cwd: "/work",
+    exists: existsSet([cwdScript]),
+  });
+  assert.equal(cwdHit.source, "cwd", "自身锚点不存在才降级 cwd");
+  assert.equal(cwdHit.script, cwdScript);
+  assert.equal(cwdHit.exists, true);
+
+  const envRelative = resolveRuntimeScript({
+    platform: "linux",
+    envScript: "tools/runtime.js",
+    cwd: "/work",
+    exists: existsSet(["/work/tools/runtime.js"]),
+  });
+  assert.equal(envRelative.source, "env", "env 覆盖最优先");
+  assert.equal(envRelative.script, "/work/tools/runtime.js", "相对值按 POSIX cwd 归一");
+  assert.equal(envRelative.exists, true);
+  assert.equal(envRelative.candidates[0], "/work/tools/runtime.js");
+
+  const envAbsolute = resolveRuntimeScript({
+    platform: "linux",
+    envScript: "/opt/custom/runtime.js",
+    cwd: "/work",
+    exists: existsSet([]),
+  });
+  assert.equal(envAbsolute.source, "env");
+  assert.equal(envAbsolute.script, "/opt/custom/runtime.js", "绝对 POSIX 值原样采用");
+  assert.equal(envAbsolute.exists, false, "env 覆盖不把关存在性");
+
+  const none = resolveRuntimeScript({
+    platform: "linux",
+    selfDir: "/opt/pkg/dist",
+    cwd: "/work",
+    exists: existsSet([]),
+  });
+  assert.equal(none.source, "none");
+  assert.equal(none.exists, false);
+  assert.equal(none.script, selfScript, "none 时返回自身锚点首选");
+  assert.deepEqual(none.candidates, [selfScript, cwdScript]);
 });
 
 test("pickStderrSummary：Node 崩溃输出取 `Cannot find module` 关键行，而不是末行的版本号", () => {

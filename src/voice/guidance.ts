@@ -146,15 +146,17 @@ export function ffmpegLaunchFailedGuidance(bin: string, cause: string): string {
  * @returns 中文可操作提示
  */
 export function noAudioDeviceGuidance(platform: NodeJS.Platform = process.platform): string {
-  const listed = "③ 用 node dist/runtime/voice-runtime.js --list 查看设备列表；";
-  const specify = '④ 用 --device "<设备名>" 或环境变量 VOICE_DEVICE 指定设备。';
+  const listCommand = "node dist/runtime/voice-runtime.js --list";
+  const deviceHint = '用 --device "<设备名>" 或环境变量 VOICE_DEVICE 指定设备';
+  const listed = `③ 用 ${listCommand} 查看设备列表；`;
+  const specify = `④ ${deviceHint}。`;
   if (platform === "linux") {
     return (
       "未找到音频输入设备（枚举成功但结果为 0 个）。请检查：" +
       "① 系统麦克风是否已连接并启用；" +
       "② pactl list short sources / arecord -l 是否有 source；" +
-      `${linuxCaptureGuidance("no-permission")} ` +
-      specify
+      `③ ${linuxCaptureGuidance("no-permission")} ` +
+      `④ 用 ${listCommand} 查看设备列表，并${deviceHint}。`
     );
   }
   return (

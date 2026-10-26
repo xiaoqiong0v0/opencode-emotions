@@ -30,6 +30,10 @@ const RUNTIME = fileURLToPath(new URL("../dist/runtime/voice-runtime.js", import
  * @returns {Promise<{code: number|null, events: object[], stderr: string, elapsedMs: number}>}
  */
 function runRuntime(configDir, extraEnv) {
+  // 隔离 PATH：宿主机装没装系统 ffmpeg 不得影响「解析失败」用例（否则会跳过自愈直接真采集）。
+  // 空目录里没有任何可执行文件，ffmpeg-static 的路径来源也由各用例的 FFMPEG_BIN 显式控制。
+  const emptyPath = join(configDir, "empty-path");
+  mkdirSync(emptyPath, { recursive: true });
   return new Promise((resolve, reject) => {
     const startedAt = Date.now();
     const child = spawn(
@@ -41,6 +45,7 @@ function runRuntime(configDir, extraEnv) {
         env: {
           ...process.env,
           EMOTIONS_CONFIG_DIR: configDir,
+          PATH: emptyPath,
           DASHSCOPE_API_KEY: "dummy-key",
           DASHSCOPE_WORKSPACE_ID: "dummy-workspace",
           ...extraEnv,

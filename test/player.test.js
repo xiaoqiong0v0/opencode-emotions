@@ -9,7 +9,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -132,6 +132,8 @@ test("commandExists：按 PATH 探测可执行文件", () => {
   const dir = mkdtempSync(join(tmpdir(), "player-path-"));
   try {
     writeFileSync(join(dir, "fakeplay"), "", "utf8");
+    // POSIX 上「可执行」才等价于命令；Windows 无执行位（chmod 为 no-op）
+    chmodSync(join(dir, "fakeplay"), 0o755);
     const env = { PATH: dir };
     assert.equal(commandExists("fakeplay", env, "linux"), true);
     assert.equal(commandExists("nope-not-here", env, "linux"), false);

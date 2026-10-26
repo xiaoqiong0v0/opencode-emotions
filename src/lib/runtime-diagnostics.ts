@@ -14,7 +14,7 @@
  */
 
 import { existsSync } from "node:fs";
-import { dirname, isAbsolute, join, resolve } from "node:path";
+import { posix as pathPosix, win32 as pathWin32 } from "node:path";
 import { fileURLToPath } from "node:url";
 
 /** 运行时脚本文件名（单源）。 */
@@ -37,6 +37,8 @@ export interface ResolveRuntimeScriptInput {
   selfDir?: string | null;
   /** 当前工作目录（仅用于兜底候选与环境变量的相对归一）。 */
   cwd: string;
+  /** 目标平台（决定 Windows 反斜杠 / POSIX 路径归一；默认宿主）。 */
+  platform?: NodeJS.Platform;
   /** 存在性检查（默认 `fs.existsSync`；测试注入以覆盖各分支）。 */
   exists?: (path: string) => boolean;
 }
@@ -59,14 +61,19 @@ export interface RuntimeScriptResolution {
  * 只接受可靠形态：`file:` URL（Node/Bun 常规）或已是绝对路径的字符串；
  * 虚拟命名空间（如 `plugin:`/`bun:`）一律返回 `null`，交由调用方走兜底。
  * @param moduleUrl `import.meta.url` 的原始值（可空）
+ * @param platform 目标平台（决定 Windows 反斜杠 / POSIX 规则；默认宿主）
  * @returns 产物目录绝对路径；不可靠或缺失时 `null`
  */
-export function selfDirFromModuleUrl(moduleUrl?: string | null): string | null {
+export function selfDirFromModuleUrl(
+  moduleUrl?: string | null,
+  platform: NodeJS.Platform = process.platform,
+): string | null {
   const raw = typeof moduleUrl === "string" ? moduleUrl.trim() : "";
   if (!raw) return null;
+  const path = pathFor(platform);
   try {
-    if (/^file:/i.test(raw)) return dirname(fileURLToPath(raw));
-    if (isAbsolute(raw)) return dirname(raw);
+    if (/^file:/i.test(raw)) return path.dirname(fileURLToPath(raw, { windows: platform === "win32" }));
+    if (path.isAbsolute(raw)) return path.dirname(raw);
     return null;
   } catch {
     // 非法 URL（fileURLToPath 会抛 ERR_INVALID_URL / 非 file 协议）⇒ 视为不可用
@@ -87,18 +94,19 @@ export function selfDirFromModuleUrl(moduleUrl?: string | null): string | null {
  */
 export function resolveRuntimeScript(input: ResolveRuntimeScriptInput): RuntimeScriptResolution {
   const exists = input.exists ?? existsSync;
+  const path = pathFor(input.platform ?? process.platform);
   const cwd = input.cwd;
   const envRaw = typeof input.envScript === "string" ? input.envScript.trim() : "";
-  const selfScript = input.selfDir ? join(input.selfDir, ...RUNTIME_RELATIVE_TO_SELF) : null;
-  const cwdScript = resolve(cwd, ...RUNTIME_RELATIVE_TO_CWD);
+  const selfScript = input.selfDir ? path.join(input.selfDir, ...RUNTIME_RELATIVE_TO_SELF) : null;
+  const cwdScript = path.resolve(cwd, ...RUNTIME_RELATIVE_TO_CWD);
 
   const candidates: string[] = [];
-  if (envRaw) candidates.push(resolve(cwd, envRaw));
+  if (envRaw) candidates.push(path.resolve(cwd, envRaw));
   if (selfScript) candidates.push(selfScript);
   candidates.push(cwdScript);
 
   if (envRaw) {
-    const script = resolve(cwd, envRaw);
+    const script = path.resolve(cwd, envRaw);
     return { script, source: "env", exists: exists(script), candidates };
   }
   if (selfScript && exists(selfScript)) {
@@ -146,6 +154,15 @@ const STDERR_ERROR_MARKERS: readonly string[] = [
   "referenceerror",
   "typeerror",
 ];
+
+/**
+ * 按目标平台选择 path 实现（Windows 用反斜杠与盘符规则，其余用 POSIX 规则）。
+ * @param platform 目标平台
+ * @returns 对应的 path 模块
+ */
+function pathFor(platform: NodeJS.Platform): typeof pathPosix {
+  return platform === "win32" ? pathWin32 : pathPosix;
+}
 
 /**
  * 切分为去空白的非空行。
