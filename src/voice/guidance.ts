@@ -166,6 +166,19 @@ export function noAudioDeviceGuidance(platform: NodeJS.Platform = process.platfo
   );
 }
 
+/**
+ * 自动选到 monitor（输出回环）源时的提示：该源通常永远静音，建议显式指定麦克风。
+ * @param device 选中的 source 名
+ * @returns 中文可操作提示
+ */
+export function monitorSourceFallbackGuidance(device: string): string {
+  return (
+    `未找到真实输入源，自动选到了 monitor 监听源（${device}）——它是输出回环、通常永远静音。` +
+    "请用 --device <麦克风 source 名> 或环境变量 VOICE_DEVICE 显式指定输入设备" +
+    "（pactl list short sources 查看，排除 .monitor）。"
+  );
+}
+
 /** `credentialGuidance` 的入参。 */
 export interface CredentialGuidanceInput {
   /** provider 标签（如 `aliyun-qwen` / `MiMo`），写进「未配置 <provider> 凭证」。 */

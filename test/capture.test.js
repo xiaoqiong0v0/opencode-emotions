@@ -93,6 +93,7 @@ test("listAudioDevices：spawnSync 失败（ENOENT）不再被吞——抛错带
     () =>
       listAudioDevices({
         bin: "C:\\cache\\ffmpeg.exe",
+        platform: "win32",
         spawn: () => ({ stdout: "", stderr: "", error: enoent }),
       }),
     (err) =>
@@ -111,6 +112,7 @@ test("listAudioDevices：spawn 成功 → 从 stderr 解析 dshow 音频设备",
   ].join("\n");
   const devices = listAudioDevices({
     bin: "C:\\ok\\ffmpeg.exe",
+    platform: "win32",
     spawn: () => ({ stdout: "", stderr, error: null }),
   });
   assert.equal(devices.length, 1);

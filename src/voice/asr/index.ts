@@ -18,6 +18,9 @@ export {
   splitPcmByMaxBytes,
   DEFAULT_MAX_SEGMENT_MS,
   thresholdToDbfs,
+  computeGateDbfs,
+  NOISE_MARGIN_DB,
+  VOICE_CONFIRM_FRAMES,
   rmsToDbfs,
   ENERGY_FRAME_MS,
   ENERGY_DBFS_MIN,
@@ -43,7 +46,7 @@ export interface CreateAsrClientOptions {
   /** 领域上下文（当前无 provider 支持）。 */
   context: string;
   /** VAD 覆盖（stream 下发服务端；segment 用于本地能量切段）。 */
-  vad: { threshold: number; silenceDurationMs: number };
+  vad: { threshold: number; silenceDurationMs: number; marginDb: number };
   /** 阿里云凭证（stream 与 `aliyun-qwen-file` 必需）。 */
   credentials?: { workspace: string; apiKey: string };
   /** MiMo API Key（仅 `mimo`；由 `resolveMimoApiKey` 从 `asr.mimoCredentials` 解析后传入）。 */

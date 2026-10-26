@@ -19,12 +19,84 @@
  * （两者都会 `stopPlayback` 停播，门随之自动释放）。
  */
 
+import { PLAYBACK_OWNERLESS_KEY } from "./playback-state.js";
+
 /**
  * 播放结束后的**尾音缓冲**窗口（毫秒）：此窗口内的 ASR final 仍被丢弃。
  * 取值依据：内置 waveOut 播放器 EOF 后只播完已排队的 ≈160ms（`docs/ASYNC.md` 不变量），
  * 加上房间混响与「刚停就开口」的说话起始，500ms 足够覆盖且不至于把用户下一句吞太久。
  */
 export const ASR_GATE_TAIL_MS = 500;
+
+/**
+ * 关闭语音模式后的 **final 宽限窗口**（毫秒）：按 F8/F9 关闭后，runtime 优雅停止时会先冲刷
+ * 最后一段并等 ASR 回包；这段时间模式信号已经是 off，若只按当前开关判定，这条 final 会被静默丢弃
+ * （2026-10-24 根因）。故关闭后、且会话一致的 final 仍按**关闭前的模式**投递：
+ * - **停止进行中**（`stopping=true`）**始终允许**：优雅停止最长 10s、单段 HTTP 超时 60s，按固定 3s
+ *   截断会丢掉慢回包的尾段；
+ * - **停止结束后**再给 {@link STOP_FINAL_GRACE_MS}（3s）宽限，覆盖回调/事件排队的最后一点延迟，
+ *   同时避免把很久以后才到的迟到结果误投到已关闭的模式。
+ */
+export const STOP_FINAL_GRACE_MS = 3000;
+
+/** 语音模式（与 TUI 的 `SlotMode` 同形；本模块只做分发决策，不依赖 UI 模块）。 */
+export type AsrDeliveryMode = "inject" | "input";
+
+/** 「最近一次关闭的语音模式」记录（由 TUI 在模式关闭时写入）。 */
+export interface LastClosedVoiceMode {
+  /** 关闭的模式。 */
+  mode: AsrDeliveryMode;
+  /** 关闭时所在会话；取不到路由时按无主口径（见 {@link resolveFinalDelivery}）。 */
+  sessionID: string | undefined;
+  /** 关闭时刻（毫秒时间戳）。 */
+  at: number;
+}
+
+/** 分发决策：投递（按哪个模式、是否走宽限）或丢弃（原因）。 */
+export type FinalDeliveryDecision =
+  | { delivered: true; mode: AsrDeliveryMode; viaGrace: boolean }
+  | { delivered: false; reason: "no-active-mode" | "session-mismatch" | "grace-expired" };
+
+/**
+ * 决定一条 ASR final 由哪个模式处理（含停止后的宽限投递）。
+ *
+ * 判定顺序：① 当前 `injectOn` → 注入；② 当前 `inputOn` → 追加；③ 都关时，若会话一致且
+ * （**停止进行中** 或 距最近一次关闭 ≤ graceMs）→ 按**那次关闭的模式**投递（`viaGrace=true`）；
+ * ④ 否则丢弃并给出原因。
+ * 会话一致口径复用播放状态的哨兵键：`sessionID ?? PLAYBACK_OWNERLESS_KEY`，取不到路由时只与
+ * 「关闭时也取不到」配对，**不越界匹配其它会话**。
+ * @param params 当前开关、最近关闭记录、当前会话、当前时刻与「是否正在停止」（时刻/停止态可注入，便于单测）
+ * @param graceMs 停止结束后的宽限窗口（毫秒；`<=0` 或非有限值表示关闭宽限；停止进行中不受此限）
+ * @returns 投递/丢弃决策
+ */
+export function resolveFinalDelivery(
+  params: {
+    injectOn: boolean;
+    inputOn: boolean;
+    lastClosed?: LastClosedVoiceMode | null;
+    currentSessionID?: string;
+    now: number;
+    stopping?: boolean;
+  },
+  graceMs: number = STOP_FINAL_GRACE_MS,
+): FinalDeliveryDecision {
+  if (params.injectOn) return { delivered: true, mode: "inject", viaGrace: false };
+  if (params.inputOn) return { delivered: true, mode: "input", viaGrace: false };
+  const last = params.lastClosed;
+  if (!last) return { delivered: false, reason: "no-active-mode" };
+  const closedKey = last.sessionID ?? PLAYBACK_OWNERLESS_KEY;
+  const currentKey = params.currentSessionID ?? PLAYBACK_OWNERLESS_KEY;
+  if (closedKey !== currentKey) return { delivered: false, reason: "session-mismatch" };
+  // 停止进行中：优雅停止可能等 10s、单段 HTTP 可到 60s，固定宽限会误丢慢回包
+  if (params.stopping === true) return { delivered: true, mode: last.mode, viaGrace: true };
+  if (!Number.isFinite(graceMs) || graceMs <= 0) return { delivered: false, reason: "grace-expired" };
+  const ageMs = params.now - last.at;
+  // 时钟回拨（ageMs<0）按过期处理：宽限只服务「刚关闭」，不回退时间
+  if (!Number.isFinite(ageMs) || ageMs < 0 || ageMs > graceMs) {
+    return { delivered: false, reason: "grace-expired" };
+  }
+  return { delivered: true, mode: last.mode, viaGrace: true };
+}
 
 /**
  * 门条件：这条 ASR final 是否应当**丢弃**（播放活跃，或播放刚结束仍在尾音窗口内）。

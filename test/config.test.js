@@ -637,3 +637,42 @@ test("describeJsonError：把 JSONC 解析错误换算成原文行/列/偏移（
   assert.match(described, /第 \d+ 行第 \d+ 列（偏移 \d+）/);
   assert.equal(describeJsonError(new Error("plain failure"), text), "plain failure");
 });
+
+// ==================== 2026-10-24 vad.marginDb ====================
+
+test("vad.marginDb：默认 6、越界夹到 [3,15]、非法值告警并回退默认", () => {
+  assert.equal(DEFAULT_VOICE_CONFIG.vad.marginDb, 6, "默认余量 6dB");
+  const dir = tempDir();
+  try {
+    const path = join(dir, CONFIG_FILE_NAME);
+    writeFileSync(path, JSON.stringify({ vad: { marginDb: 99 } }), "utf8");
+    assert.equal(loadVoiceConfig({ configDir: dir, env: {} }).vad.marginDb, 15, "上界夹到 15");
+    writeFileSync(path, JSON.stringify({ vad: { marginDb: 1 } }), "utf8");
+    assert.equal(loadVoiceConfig({ configDir: dir, env: {} }).vad.marginDb, 3, "下界夹到 3");
+    writeFileSync(path, JSON.stringify({ vad: { marginDb: "abc" } }), "utf8");
+    const invalid = loadVoiceConfigWithWarnings({ configDir: dir, env: {} });
+    assert.equal(invalid.config.vad.marginDb, 6, "非法值回退默认");
+    assert.equal(invalid.warnings.filter((w) => w.kind === "invalid-value").length, 1, "非法值产生一条告警");
+    // 未配置时不告警
+    writeFileSync(path, JSON.stringify({ vad: { threshold: 0.4 } }), "utf8");
+    const absent = loadVoiceConfigWithWarnings({ configDir: dir, env: {} });
+    assert.equal(absent.config.vad.marginDb, 6);
+    assert.equal(absent.warnings.length, 0, "缺省不告警");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("vad.marginDb 环境变量：覆盖生效、越界夹紧、非法回退默认并告警", () => {
+  const dir = tempDir();
+  try {
+    assert.equal(loadVoiceConfig({ configDir: dir, env: { VOICE_VAD_MARGIN_DB: "12" } }).vad.marginDb, 12);
+    assert.equal(loadVoiceConfig({ configDir: dir, env: { VOICE_VAD_MARGIN_DB: "99" } }).vad.marginDb, 15);
+    assert.equal(loadVoiceConfig({ configDir: dir, env: { VOICE_VAD_MARGIN_DB: "1" } }).vad.marginDb, 3);
+    const bad = loadVoiceConfigWithWarnings({ configDir: dir, env: { VOICE_VAD_MARGIN_DB: "abc" } });
+    assert.equal(bad.config.vad.marginDb, 6, "非法环境变量回退默认");
+    assert.equal(bad.warnings.filter((w) => w.kind === "invalid-value").length, 1, "非法环境变量产生告警");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

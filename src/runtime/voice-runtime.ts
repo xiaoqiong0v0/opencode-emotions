@@ -25,10 +25,21 @@
 
 import { createAsrClient, type AsrClient, type AsrResult, type AsrTransport } from "../voice/asr/index.js";
 import { AUDIO_FRAME_MS } from "../voice/aliyun.js";
-import { formatCaptureExitFailure, listAudioDevices, MicCapture } from "../voice/capture.js";
+import {
+  formatCaptureExitFailure,
+  getDefaultPulseSource,
+  listAudioDevices,
+  MicCapture,
+  orderLinuxDevicesForDisplay,
+  resolveLinuxCaptureDevice,
+} from "../voice/capture.js";
 import { loadVoiceConfig, resolveAsrParams, resolveAsrProvider, voiceConfigPath } from "../voice/config.js";
 import { defaultCredentialsPath, resolveCredentials, resolveMimoApiKey, ASR_MIMO_CREDENTIALS_CONFIG_PATH } from "../voice/credentials.js";
-import { ffmpegLaunchFailedGuidance, noAudioDeviceGuidance } from "../voice/guidance.js";
+import {
+  ffmpegLaunchFailedGuidance,
+  monitorSourceFallbackGuidance,
+  noAudioDeviceGuidance,
+} from "../voice/guidance.js";
 import { FFMPEG_ENV, resolveFfmpegPath } from "../voice/ffmpeg.js";
 import { ensureFfmpegBinary } from "../voice/ffmpeg-heal.js";
 import { LEVEL_EVENT_INTERVAL_MS, rmsToLevel } from "../voice/meter.js";
@@ -145,7 +156,7 @@ function printHelp(): void {
     "",
     "选项：",
     "  --list                列出音频输入设备后退出",
-    "  --device <名>         指定麦克风设备（默认取第一个；亦可用 VOICE_DEVICE）",
+    "  --device <名>         指定麦克风设备（未指定时：Linux 取 pactl get-default-source，Windows 取 ffmpeg dshow 枚举第一条；亦可用 VOICE_DEVICE）",
     "  --wav <路径>          用 WAV 文件代替麦克风（非交互自测）",
     "  --seconds <秒>        采集指定秒数后结束（默认一直采到 Ctrl+C）",
     "  --inject <url>        最终结果 POST {text, emotion, annotation} 到该 URL",
@@ -159,7 +170,7 @@ function printHelp(): void {
   console.log(lines.join("\n"));
 }
 
-/** 打印本机音频输入设备。 */
+/** 打印本机音频输入设备（Linux 按系统默认源/真实输入源优先排序）。 */
 function printDevices(): void {
   const devices = listAudioDevices();
   if (devices.length === 0) {
@@ -167,8 +178,10 @@ function printDevices(): void {
     console.log(noAudioDeviceGuidance());
     return;
   }
+  const ordered =
+    process.platform === "linux" ? orderLinuxDevicesForDisplay(devices, getDefaultPulseSource()) : devices;
   console.log("音频输入设备：");
-  devices.forEach((device, index) => {
+  ordered.forEach((device, index) => {
     const alt = device.alternativeName ? `（备用名：${device.alternativeName}）` : "";
     // Linux 的「取值」（pactl source 名 / hw:C,D）与友好名不同时才额外显示
     const value = device.value && device.value !== device.name ? `（取值：${device.value}）` : "";
@@ -255,23 +268,42 @@ async function prepareFfmpeg(out: RuntimeOutput): Promise<void> {
   );
 }
 
+/** 采集目标设备解析结果。 */
+interface ResolveDeviceResult {
+  /** 传给 ffmpeg 的设备取值。 */
+  device: string;
+  /** 是否落在 monitor 回环源（仅自动解析时可能为 true）。 */
+  monitor: boolean;
+}
+
 /**
  * 解析要使用的设备名（入参已含「命令行 / 环境变量 / 配置」综合结果）。
+ *
+ * Linux 未显式指定时：先取 `pactl get-default-source`，再回退到枚举中的非 monitor 真实输入源。
  * @param explicit 显式设备名（空串/undefined 表示自动）
- * @returns 设备友好名
+ * @returns 设备取值与 monitor 标记
  * @throws Error 无可用设备
  */
-function resolveDevice(explicit?: string): string {
-  if (explicit && explicit.trim().length > 0) return explicit;
-  // Termux 无 dshow 设备、采集走 termux-microphone-record；设备名仅占位（由采集器忽略）
-  if (isTermux()) return "termux";
-  const first = listAudioDevices()[0];
-  if (!first) {
-    // 枚举成功但 0 设备：给检查/指定设备的引导（ffmpeg 启动失败会先从 listAudioDevices 抛错）
-    throw new Error(noAudioDeviceGuidance());
+function resolveDevice(explicit?: string): ResolveDeviceResult {
+  const hasExplicit = typeof explicit === "string" && explicit.trim().length > 0;
+  if (hasExplicit && (isTermux() || process.platform !== "linux")) {
+    return { device: explicit, monitor: false };
   }
-  // Linux：name 是友好 description，真正传给 ffmpeg 的是 value（source 名 / hw:C,D）
-  return first.value ?? first.name;
+  // Termux 无 dshow 设备、采集走 termux-microphone-record；设备名仅占位（由采集器忽略）
+  if (isTermux()) return { device: "termux", monitor: false };
+  if (process.platform === "linux") {
+    // 显式指定与自动解析统一走同一生产入口（显式时该函数内部直接返回，不触发 pactl 查询）
+    const resolved = resolveLinuxCaptureDevice({ explicit });
+    if (!resolved) {
+      // 枚举成功但 0 设备：给检查/指定设备的引导（ffmpeg 启动失败会先从 listAudioDevices 抛错）
+      throw new Error(noAudioDeviceGuidance());
+    }
+    return { device: resolved.value, monitor: resolved.monitor };
+  }
+  const first = listAudioDevices()[0];
+  if (!first) throw new Error(noAudioDeviceGuidance());
+  // Windows：name 是友好 description，真正传给 ffmpeg 的是 value
+  return { device: first.value ?? first.name, monitor: false };
 }
 
 /**
@@ -561,7 +593,7 @@ async function main(): Promise<void> {
     languageHints: asrParams.languageHints,
     vocabularyId: asrParams.vocabularyId,
     context: asrParams.context,
-    vad: { threshold: config.vad.threshold, silenceDurationMs: config.vad.silenceDurationMs },
+    vad: { threshold: config.vad.threshold, silenceDurationMs: config.vad.silenceDurationMs, marginDb: config.vad.marginDb },
     credentials,
     mimoApiKey,
     onResult: (result: AsrResult) => {
@@ -586,7 +618,14 @@ async function main(): Promise<void> {
       await runWav(client, options.wav, out, provider.sampleRate, client.transport);
     } else {
       // 麦克风模式：`ready` 由 runMic 在**首包到达**时发（采集进程异常退出则绝不发）
-      await runMic(client, resolveDevice(device), options.seconds, out, provider.sampleRate, model);
+      const target = resolveDevice(device);
+      if (target.monitor) {
+        const notice = monitorSourceFallbackGuidance(target.device);
+        // TUI 只在 runtime 退出时取样 stderr：改用 NDJSON progress 即时 toast；非 json 模式仍打人类日志
+        out.event({ type: "progress", stage: "capture", message: notice });
+        out.info(notice);
+      }
+      await runMic(client, target.device, options.seconds, out, provider.sampleRate, model);
     }
   } finally {
     client.close();

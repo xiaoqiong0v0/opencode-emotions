@@ -188,7 +188,7 @@ test("半双工静音门接在 dispatch 最前（丢弃路径不 toast/不注入
   const code = tuiCode();
   const at = code.indexOf("const dispatch = async");
   assert.ok(at > 0, "找不到 RuntimeFinal 分发入口 dispatch");
-  const head = code.slice(at, at + 700);
+  const head = code.slice(at, at + 4000);
   // ① 归属口径**复用** helper，不另造：读的是 isInterruptablePlaybackActive，门条件走纯函数
   assert.ok(head.includes("isInterruptablePlaybackActive("), "静音门未复用会话归属判活 helper（另造口径风险）");
   assert.ok(head.includes("shouldDropAsrFinal("), "静音门纯函数未接线");
@@ -199,6 +199,10 @@ test("半双工静音门接在 dispatch 最前（丢弃路径不 toast/不注入
     head.indexOf("shouldDropAsrFinal(") < head.indexOf("composeBody(result)"),
     "静音门判定晚于正文组合，final 可能已被消费",
   );
+  // 静音门必须早于宽限/模式决策（播放期间说话先被门拦下，不走宽限投递）
+  const gateInvoke = head.indexOf("shouldDropAsrFinal(");
+  const decisionInvoke = head.indexOf("resolveFinalDelivery(");
+  assert.ok(gateInvoke >= 0 && decisionInvoke > gateInvoke, "静音门未接在 resolveFinalDelivery 之前");
   // ③ 丢弃分支体内不得有任何可见反馈或消费动作
   const gateAt = head.indexOf("shouldDropAsrFinal(");
   const dropBlock = head.slice(gateAt, head.indexOf("return", gateAt));
@@ -256,4 +260,47 @@ test("两处中断出口都写会话级中断请求水位（F10 双态中断 + F
     modeBlock.indexOf("writeInterruptRequest") < modeBlock.indexOf("stopPlayback({"),
     "F8/F9 水位必须写在 stopPlayback 之前",
   );
+});
+
+test("停止后 final 宽限投递接线（2026-10-24）：关闭先记录、dispatch 走统一决策、丢弃必有日志", () => {
+  const code = tuiCode();
+  // ① 决策纯函数已接线（宽限常量/口径在 asr-gate.ts，单测见 test/asr-gate.test.js）
+  assert.ok(code.includes("resolveFinalDelivery("), "dispatch 未接 resolveFinalDelivery（停止后的 final 仍会被静默丢）");
+  // 类型导入会被 Babel 擦除，故只断言**运行时代码**：决策调用必须真的收到最近关闭记录
+  assert.ok(code.includes("lastClosed: lastClosedMode"), "dispatch 未把最近关闭记录传给 resolveFinalDelivery");
+
+  // ② 关闭时**先记录再停 runtime**：否则优雅停止期间冲刷出的 final 看不到记录
+  const recordAt = code.indexOf("lastClosedMode = {");
+  assert.ok(recordAt > 0, "关闭分支未记录 lastClosedMode");
+  const stopAt = code.indexOf("await stopRuntime()", recordAt);
+  assert.ok(stopAt > recordAt, "必须先记录再 stopRuntime（冲刷 final 在 stopRuntime 内到达）");
+  const recordBlock = code.slice(recordAt, stopAt);
+  for (const key of ["mode: target", "sessionID: currentSessionID(api)", "at: Date.now()"]) {
+    assert.ok(recordBlock.includes(key), `关闭记录缺少 ${key}`);
+  }
+
+  // ③ 决策在正文组合/消费之前；投递分支按 decision.mode，不再直接用当前开关
+  const decisionAt = code.indexOf("resolveFinalDelivery(");
+  const dispatchBlock = code.slice(decisionAt, decisionAt + 3000);
+  assert.ok(
+    decisionAt < code.indexOf("composeBody(result)", decisionAt),
+    "分发决策晚于正文组合（丢弃路径应先判、不做无用功）",
+  );
+  assert.ok(dispatchBlock.includes('decision.mode === "inject"'), "注入分支未按决策模式执行");
+  const afterDecision = dispatchBlock.slice(dispatchBlock.indexOf("if (!decision.delivered)"));
+  assert.ok(!/if \(injectOn\(\)\)/.test(afterDecision), "决策之后不得再按当前 injectOn() 分叉");
+  assert.ok(!/if \(inputOn\(\)\)/.test(afterDecision), "决策之后不得再按当前 inputOn() 分叉");
+  assert.ok(dispatchBlock.includes("const sessionID = gateSessionID"), "宽限注入须沿用 final 归属会话（同一个 sessionID）");
+  // 停止进行中必须把 stopping 传进决策（慢回包不受 3s 截断）；Babel 可能输出简写 `stopping`
+  const decisionCall = dispatchBlock.slice(0, dispatchBlock.indexOf("});") + 3);
+  assert.ok(/\bstopping\b/.test(decisionCall), "dispatch 未把 stopping 传给 resolveFinalDelivery");
+
+  // ④ 丢弃日志含 session / 模式 / ageMs / 文本预览（与静音门同为 20 字）
+  const dropAt = code.indexOf("asr final drop:");
+  assert.ok(dropAt > 0, "缺少 final 丢弃日志（静默丢弃无法取证）");
+  const dropLine = code.slice(dropAt, code.indexOf("\n", dropAt));
+  for (const key of ["reason=", "session=", "mode=", "ageMs=", "text=", "ASR_GATE_PREVIEW_LEN"]) {
+    assert.ok(dropLine.includes(key), `丢弃日志缺少 ${key}`);
+  }
+  assert.ok(code.includes("const ASR_GATE_PREVIEW_LEN = 20;"), "丢弃日志预览长度须与静音门一致（20 字）");
 });

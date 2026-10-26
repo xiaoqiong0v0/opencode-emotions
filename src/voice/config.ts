@@ -72,6 +72,8 @@ export const ENV_ASR_LANGUAGE = "VOICE_ASR_LANGUAGE";
 export const ENV_VAD_THRESHOLD = "VOICE_VAD_THRESHOLD";
 /** VAD 句尾静音覆盖环境变量。 */
 export const ENV_VAD_SILENCE_MS = "VOICE_VAD_SILENCE_MS";
+/** 自适应门限相对底噪的余量覆盖环境变量（dB）。 */
+export const ENV_VAD_MARGIN_DB = "VOICE_VAD_MARGIN_DB";
 /** ASR 语言提示覆盖环境变量（逗号分隔）。 */
 export const ENV_ASR_LANGUAGE_HINTS = "VOICE_ASR_LANGUAGE_HINTS";
 /** ASR 热词表 ID 覆盖环境变量。 */
@@ -185,6 +187,11 @@ export const VAD_THRESHOLD_MAX = 1;
 /** VAD 句尾静音范围（毫秒）。 */
 export const VAD_SILENCE_MIN = 200;
 export const VAD_SILENCE_MAX = 6000;
+/** 自适应门限相对底噪的余量默认（dB）：门限 = max(配置基线, 底噪 + 余量)。 */
+export const DEFAULT_VAD_MARGIN_DB = 6;
+/** 自适应门限余量范围（dB）：越小越灵敏（易误触发），越大越抗噪（易漏判）。 */
+export const VAD_MARGIN_MIN_DB = 3;
+export const VAD_MARGIN_MAX_DB = 15;
 /** ASR 热词表 ID 默认（空 = 不下发）。 */
 export const DEFAULT_ASR_VOCABULARY_ID = "";
 /** ASR 领域上下文默认（空 = 不下发）。 */
@@ -226,7 +233,7 @@ export interface VoiceConfig {
   uiLanguage: Language;
   /** 工具文案语言（`emotions_cli` 工具描述 + `emotions-cli --help`）。 */
   toolLanguage: Language;
-  /** 音频输入设备友好名；空 = 自动取第一个输入设备。 */
+  /** 音频输入设备友好名；空 = 自动取系统默认输入源（Linux 走 pactl get-default-source）。 */
   device: string;
   asr: {
     /** provider 预设。 */
@@ -251,6 +258,8 @@ export interface VoiceConfig {
     threshold: number;
     /** 句尾静音判定毫秒 [200,6000]。 */
     silenceDurationMs: number;
+    /** 自适应门限相对底噪的最小余量 dB [3,15]。 */
+    marginDb: number;
   };
   tts: {
     /** 合成后端：sapi（Windows）| aliyun（CosyVoice）| termux（Termux 系统 TTS）。 */
@@ -295,7 +304,7 @@ export const DEFAULT_VOICE_CONFIG: VoiceConfig = {
     credentials: { path: "", apiKey: "", workspaceId: "" },
     mimoCredentials: { apiKey: "" },
   },
-  vad: { threshold: DEFAULT_VAD_THRESHOLD, silenceDurationMs: DEFAULT_VAD_SILENCE_MS },
+  vad: { threshold: DEFAULT_VAD_THRESHOLD, silenceDurationMs: DEFAULT_VAD_SILENCE_MS, marginDb: DEFAULT_VAD_MARGIN_DB },
   tts: {
     provider: DEFAULT_TTS_PROVIDER,
     voice: "",
@@ -324,7 +333,7 @@ export const DEFAULT_CONFIG_TEMPLATE = `// emotions.jsonc —— opencode-emotio
   // 工具文案语言（emotions_cli 工具描述 + emotions-cli --help）：en（默认）| zh（改后重启 opencode 生效）
   "toolLanguage": "en",
   // 旧键 language 已拆成上面两键；两者缺省时回退 language，再缺省用 en（一般无需再写）
-  // 音频输入设备友好名；留空 = 自动取第一个输入设备（可用 voice-runtime --list 查看）
+  // 音频输入设备友好名；留空 = 自动取系统默认输入源（Linux 走 pactl get-default-source；可用 voice-runtime --list 查看）
   "device": "",
   "asr": {
     // aliyun-qwen(默认,stream,16k,7类情绪) | aliyun-8k(stream,8k,3类) | aliyun-v2(stream,16k,无情绪)
@@ -357,7 +366,9 @@ export const DEFAULT_CONFIG_TEMPLATE = `// emotions.jsonc —— opencode-emotio
     // 语音活动检测阈值 [-1,1]；越高越抗噪、越低越灵敏（易误触发）
     "threshold": 0.5,
     // 句尾静音判定毫秒 [200,6000]
-    "silenceDurationMs": 800
+    "silenceDurationMs": 800,
+    // 自适应门限相对底噪的余量 dB [3,15]（越小越灵敏、越大越抗噪；默认 6）
+    "marginDb": 6
   },
   "tts": {
     // sapi(默认,本机 Windows SAPI) | aliyun(阿里云 CosyVoice) | termux(Termux 系统 TTS，termux-tts-speak) | mimo(小米 MiMo，OpenAI 兼容 SSE 流式)
@@ -404,8 +415,8 @@ export interface LoadVoiceConfigOptions {
   env?: NodeJS.ProcessEnv;
 }
 
-/** 配置告警类型：解析失败 / 未知 provider（回退默认）。 */
-export type ConfigWarningKind = "parse-error" | "unknown-provider";
+/** 配置告警类型：解析失败 / 未知 provider / 非法取值（均回退默认）。 */
+export type ConfigWarningKind = "parse-error" | "unknown-provider" | "invalid-value";
 
 /**
  * 一条**不阻断**的配置告警（加载仍成功，但用户需要知道配置没按原样生效）。
@@ -699,6 +710,23 @@ function asProvider(value: unknown, warn?: ConfigWarnSink): AsrProviderId {
 }
 
 /**
+ * 解析 `vad.marginDb`：缺省（undefined/null/空白）回落默认且不告警；
+ * 非数字/非有限值 → 告警并回落默认；数字越界则夹到 [{@link VAD_MARGIN_MIN_DB}, {@link VAD_MARGIN_MAX_DB}]。
+ * @param value 原始值（配置文件为任意 JSON 值，环境变量为字符串）
+ * @param warn 告警回调
+ * @returns 合法的余量 dB
+ */
+function asVadMarginDb(value: unknown, warn?: ConfigWarnSink): number {
+  if (value === undefined || value === null) return DEFAULT_VAD_MARGIN_DB;
+  const numeric = typeof value === "string" ? (value.trim().length > 0 ? Number(value.trim()) : Number.NaN) : value;
+  if (typeof numeric !== "number" || !Number.isFinite(numeric)) {
+    warn?.("invalid-value", `vad.marginDb=${JSON.stringify(value)} 不是有效数字，已回退默认 ${DEFAULT_VAD_MARGIN_DB}`);
+    return DEFAULT_VAD_MARGIN_DB;
+  }
+  return clamp(numeric, VAD_MARGIN_MIN_DB, VAD_MARGIN_MAX_DB);
+}
+
+/**
  * 把任意解析结果归一化为完整配置（缺字段/类型不符逐项回退默认）。
  * @param raw 解析结果
  * @param warn 告警回调（未知 provider 等）
@@ -742,6 +770,7 @@ function normalizeConfig(raw: unknown, warn?: ConfigWarnSink): VoiceConfig {
         VAD_SILENCE_MIN,
         VAD_SILENCE_MAX,
       ),
+      marginDb: asVadMarginDb(vad.marginDb, warn),
     },
     tts: {
       provider: asString(tts.provider, DEFAULT_VOICE_CONFIG.tts.provider),
@@ -825,6 +854,8 @@ function applyEnvOverrides(
   if (threshold !== undefined) out.vad.threshold = clamp(threshold, VAD_THRESHOLD_MIN, VAD_THRESHOLD_MAX);
   const silence = numeric(ENV_VAD_SILENCE_MS);
   if (silence !== undefined) out.vad.silenceDurationMs = clamp(silence, VAD_SILENCE_MIN, VAD_SILENCE_MAX);
+  const marginEnv = text(ENV_VAD_MARGIN_DB);
+  if (marginEnv !== undefined) out.vad.marginDb = asVadMarginDb(marginEnv, warn);
 
   // TTS 环境变量名单源在 `tts/types.ts`（ENV_* 常量组），此处仅按名读取
   const ttsProvider = text(TTS_ENV_PROVIDER);

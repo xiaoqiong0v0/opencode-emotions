@@ -40,7 +40,7 @@
     "url": "https://github.com/xiaoqiong0v0/opencode-emotions/issues"
   },
   "dependencies": {
-    "@xiaoqiong0v0/opencode-plugin-logger": "^1.0.5",
+    "@xiaoqiong0v0/opencode-plugin-logger": "^1.0.6",
     "ws": "^8.22.0"
   },
   "optionalDependencies": {

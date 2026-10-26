@@ -44,6 +44,8 @@ export type FfmpegCaptureBackend = Exclude<CaptureBackend, "termux">;
 
 /** Linux 音频设备缺省取值（PulseAudio 默认 source / ALSA 默认设备）。 */
 export const DEFAULT_LINUX_AUDIO_DEVICE = "default";
+/** `pactl get-default-source` 未设置默认源时可能返回的占位符（不可当作真实 source 名）。 */
+const PACTL_DEFAULT_SOURCE_PLACEHOLDER = "@DEFAULT_SOURCE@";
 /** pulse 启动失败后允许自动回退 alsa 的时间窗（毫秒）：仅「启动即失败」才算。 */
 export const PULSE_FALLBACK_WINDOW_MS = 3000;
 
@@ -379,6 +381,217 @@ export function listLinuxAudioDevices(options: LinuxAudioDevicesOptions = {}): A
   throw new Error(linuxAudioEnumerationFailedGuidance(pactlCause || "无可用 source", describeCommandFailure(arecord)));
 }
 
+/** 默认输入源查询的可注入依赖。 */
+export interface DefaultPulseSourceOptions {
+  /** `spawnSync` 注入（测试注入）。 */
+  spawn?: (bin: string, args: string[], options: { encoding: "utf8" }) => DeviceSpawnResult;
+  /** pactl 可执行名/路径；默认 `pactl`。 */
+  pactlBin?: string;
+}
+
+/**
+ * 查询系统默认输入源（`pactl get-default-source`）。
+ *
+ * 命令缺失 / 非 0 退出 / 输出为空 / 输出为 `@DEFAULT_SOURCE@` 占位符时返回 undefined（不抛错、不阻断）。
+ * @param options 可注入依赖
+ * @returns 有效默认 source 名；无有效默认源时 undefined
+ */
+export function getDefaultPulseSource(options: DefaultPulseSourceOptions = {}): string | undefined {
+  const spawn =
+    options.spawn ?? ((target: string, argv: string[], opts: { encoding: "utf8" }) => spawnSync(target, argv, opts));
+  const pactlBin = options.pactlBin ?? "pactl";
+  const result = spawn(pactlBin, ["get-default-source"], { encoding: "utf8" });
+  if (!commandSucceeded(result)) return undefined;
+  const value = `${result.stdout ?? ""}`.trim();
+  if (value.length === 0 || value === PACTL_DEFAULT_SOURCE_PLACEHOLDER) return undefined;
+  return value;
+}
+
+/**
+ * 是否为 PulseAudio/PipeWire 的 monitor（输出回环）源。
+ * @param name source 名（或设备取值）
+ * @returns monitor 源 true
+ */
+export function isMonitorSource(name: string): boolean {
+  return name.trim().toLowerCase().endsWith(".monitor");
+}
+
+/** 已知 ALSA PCM 设备名前缀（`CARD=`/`DEV=` 形态另由正则判定）。 */
+const ALSA_DEVICE_PREFIXES: readonly string[] = [
+  "hw:",
+  "plughw:",
+  "sysdefault:",
+  "default:",
+  "front:",
+  "rear:",
+  "center_lfe:",
+  "side:",
+  "surround40:",
+  "surround41:",
+  "surround50:",
+  "surround51:",
+  "surround71:",
+  "iec958:",
+  "spdif:",
+  "dmix:",
+  "dsnoop:",
+  "pulse:",
+];
+
+/** 无冒号的 ALSA 设备名（精确匹配）。 */
+const ALSA_DEVICE_EXACT: readonly string[] = ["default", "pulse"];
+
+/**
+ * 是否为 ALSA PCM 设备名（避免 pulse 回退时把合法 ALSA 名误降级为 `default`）。
+ * @param name 设备取值
+ * @returns ALSA 设备名 true
+ */
+export function isAlsaDeviceName(name: string): boolean {
+  const trimmed = name.trim();
+  if (trimmed.length === 0) return false;
+  if (ALSA_DEVICE_EXACT.includes(trimmed)) return true;
+  if (/(?:^|[:,])\s*(?:CARD|DEV)\s*=/i.test(trimmed)) return true;
+  return ALSA_DEVICE_PREFIXES.some((prefix) => trimmed.startsWith(prefix));
+}
+
+/**
+ * 稳定重排设备：真实输入源在前、monitor 源在后，各自保持原相对顺序。
+ * @param devices 原始设备列表
+ * @returns 重排后的新数组（不修改入参）
+ */
+export function prioritizeMicrophoneDevices(devices: readonly AudioDevice[]): AudioDevice[] {
+  const real: AudioDevice[] = [];
+  const monitors: AudioDevice[] = [];
+  for (const device of devices) {
+    const value = device.value ?? device.name;
+    (isMonitorSource(value) ? monitors : real).push(device);
+  }
+  return [...real, ...monitors];
+}
+
+/**
+ * `--list` 展示排序：系统默认源置顶，其余真实输入源次之、monitor 源最后（各组保持原相对顺序）。
+ * @param devices 原始设备列表
+ * @param defaultSource 系统默认 source 名（无则仅做 monitor 后置）
+ * @returns 排序后的新数组（不修改入参）
+ */
+export function orderLinuxDevicesForDisplay(
+  devices: readonly AudioDevice[],
+  defaultSource?: string,
+): AudioDevice[] {
+  const prioritized = prioritizeMicrophoneDevices(devices);
+  if (!defaultSource) return prioritized;
+  const index = prioritized.findIndex((device) => (device.value ?? device.name) === defaultSource);
+  if (index <= 0) return prioritized;
+  const [selected] = prioritized.splice(index, 1);
+  return [selected, ...prioritized];
+}
+
+/** 默认 Linux 设备解析的可注入依赖。 */
+export interface LinuxDefaultDeviceOptions extends LinuxAudioDevicesOptions {
+  /** 默认源查询注入（测试）；缺省走 `getDefaultPulseSource`。 */
+  getDefaultSource?: () => string | undefined;
+  /** 设备枚举注入（测试）；缺省走 `listLinuxAudioDevices`。 */
+  listDevices?: () => AudioDevice[];
+}
+
+/** 默认 Linux 设备解析结果。 */
+export interface LinuxDefaultDevice {
+  /** 传给 ffmpeg 的取值（pulse source 名）。 */
+  value: string;
+  /** 是否来自系统默认源（`pactl get-default-source`）。 */
+  fromDefaultSource: boolean;
+  /** 是否为 monitor 回环源（采集可能静音）。 */
+  monitor: boolean;
+}
+
+/**
+ * 解析 Linux 默认输入设备（调用方未显式指定 device 时使用）。
+ *
+ * 优先级：① `pactl get-default-source` 有效 → 用它；② 否则枚举列表中的真实输入源（非 `.monitor`）
+ * 取第一条；③ 列表只有 monitor → 仍取第一条（`monitor=true`，由调用方提示）。
+ * @param options 可注入依赖
+ * @returns 解析结果；确实无设备时 undefined
+ */
+export function resolveDefaultLinuxDevice(
+  options: LinuxDefaultDeviceOptions = {},
+): LinuxDefaultDevice | undefined {
+  const defaultSource = options.getDefaultSource
+    ? options.getDefaultSource()
+    : getDefaultPulseSource({ spawn: options.spawn, pactlBin: options.pactlBin });
+  if (defaultSource) {
+    return { value: defaultSource, fromDefaultSource: true, monitor: isMonitorSource(defaultSource) };
+  }
+  const devices = options.listDevices
+    ? options.listDevices()
+    : listLinuxAudioDevices({
+        spawn: options.spawn,
+        pactlBin: options.pactlBin,
+        arecordBin: options.arecordBin,
+      });
+  let first = prioritizeMicrophoneDevices(devices)[0];
+  // pactl 只有 monitor 时，再试一次 arecord 的真实硬件设备（pactl 有 source 时原枚举不会走 arecord）
+  if (first && options.listDevices === undefined && isMonitorSource(first.value ?? first.name)) {
+    const spawn =
+      options.spawn ??
+      ((target: string, argv: string[], opts: { encoding: "utf8" }) => spawnSync(target, argv, opts));
+    const alsaFirst = prioritizeMicrophoneDevices(
+      tryArecordDevices(spawn, options.arecordBin ?? "arecord"),
+    )[0];
+    if (alsaFirst && !isMonitorSource(alsaFirst.value ?? alsaFirst.name)) first = alsaFirst;
+  }
+  if (!first) return undefined;
+  const value = first.value ?? first.name;
+  return { value, fromDefaultSource: false, monitor: isMonitorSource(value) };
+}
+
+/** Linux 采集设备解析的可注入依赖。 */
+export interface LinuxCaptureDeviceOptions extends LinuxDefaultDeviceOptions {
+  /** 显式设备（config.device / `--device` / `VOICE_DEVICE`）；非空则原样使用。 */
+  explicit?: string;
+}
+
+/**
+ * 解析 Linux 采集设备：显式指定最高优先（且不触发默认源查询 / 枚举），否则走默认解析。
+ * @param options 可注入依赖与显式设备
+ * @returns 解析结果；确实无设备时 undefined
+ */
+export function resolveLinuxCaptureDevice(
+  options: LinuxCaptureDeviceOptions = {},
+): LinuxDefaultDevice | undefined {
+  const explicit = options.explicit?.trim() ?? "";
+  if (explicit.length > 0) {
+    return { value: explicit, fromDefaultSource: false, monitor: isMonitorSource(explicit) };
+  }
+  return resolveDefaultLinuxDevice(options);
+}
+
+/**
+ * pulse 自动回退 ALSA 时换算设备取值：已是 ALSA 设备名形态则原样保留，
+ * 只把 pulse source 名（如 `alsa_input.*` / `*.monitor`）换算成 `default`。
+ * @param device 当前设备取值（pulse source 名 / ALSA 设备名 / `default`）
+ * @returns 可传给 `-f alsa` 的取值
+ */
+export function resolveAlsaFallbackDevice(device: string): string {
+  const trimmed = device.trim();
+  if (trimmed.length === 0) return DEFAULT_LINUX_AUDIO_DEVICE;
+  return isAlsaDeviceName(trimmed) ? trimmed : DEFAULT_LINUX_AUDIO_DEVICE;
+}
+
+/**
+ * 尽力枚举 `arecord -l` 设备（失败返回空数组，不抛错；用于 monitor-only 时的二次尝试）。
+ * @param spawn 注入的 spawnSync
+ * @param arecordBin arecord 可执行名/路径
+ * @returns 硬件输入设备列表
+ */
+function tryArecordDevices(
+  spawn: (bin: string, args: string[], options: { encoding: "utf8" }) => DeviceSpawnResult,
+  arecordBin: string,
+): AudioDevice[] {
+  const result = spawn(arecordBin, ["-l"], { encoding: "utf8" });
+  return commandSucceeded(result) ? parseArecordDevices(commandText(result)) : [];
+}
+
 /**
  * 命令失败原因（写进引导文案）。
  * @param result spawnSync 结果
@@ -641,17 +854,22 @@ export class MicCapture extends EventEmitter {
   /**
    * 启动一次 ffmpeg 采集尝试（pulse 失败可由此回退 alsa）。
    * @param backend ffmpeg 后端
+   * @param deviceOverride 本次尝试的设备取值（缺省用配置设备）
    */
-  private startFfmpegBackend(backend: FfmpegCaptureBackend): void {
+  private startFfmpegBackend(backend: FfmpegCaptureBackend, deviceOverride?: string): void {
     this.activeBackend = backend;
     this.attemptBytes = 0;
     this.attemptStartedAt = Date.now();
     this.attemptToken += 1;
     const token = this.attemptToken;
     const bin = this.ffmpegBin ?? resolveFfmpegPath();
-    const proc = this.spawnCapture(bin, buildFfmpegCaptureArgs(backend, this.device, this.sampleRate), {
-      stdio: ["ignore", "pipe", "pipe"],
-    });
+    const proc = this.spawnCapture(
+      bin,
+      buildFfmpegCaptureArgs(backend, deviceOverride ?? this.device, this.sampleRate),
+      {
+        stdio: ["ignore", "pipe", "pipe"],
+      },
+    );
     this.process = proc;
 
     let settled = false;
@@ -698,7 +916,7 @@ export class MicCapture extends EventEmitter {
       this.appendStderr(
         `\n[采集] PulseAudio 启动失败${err ? `（${err.message}）` : ""}，已自动改用 ALSA 重试一次\n`,
       );
-      this.startFfmpegBackend("alsa");
+      this.startFfmpegBackend("alsa", resolveAlsaFallbackDevice(this.device));
       return;
     }
     if (this.fallbackAttempted && backend === "alsa" && err === null && this.attemptBytes === 0) {

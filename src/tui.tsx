@@ -67,7 +67,7 @@ import { format, getPhrases } from "./lib/i18n.js";
 import { KeyRepeatGuard } from "./lib/key-repeat.js";
 import { pickStderrSummary, resolveRuntimeScript, selfDirFromModuleUrl } from "./lib/runtime-diagnostics.js";
 import { loadVoiceConfigWithWarnings } from "./voice/config.js";
-import { ASR_GATE_TAIL_MS, shouldDropAsrFinal } from "./voice/asr-gate.js";
+import { ASR_GATE_TAIL_MS, resolveFinalDelivery, shouldDropAsrFinal, type LastClosedVoiceMode } from "./voice/asr-gate.js";
 import {
   AUTO_READ_DEFAULT_NODE_BIN,
   AUTO_READ_NODE_BIN_ENV,
@@ -326,6 +326,12 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
    * `0` = 本进程从未观察到活跃播放。与 `touchedSessions` 同为**窗口级**状态（多窗口各自独立，无需跨进程同步）。
    */
   let lastInterruptableActiveAt = 0;
+  /**
+   * **最近一次关闭的语音模式**（2026-10-24；本 TUI 进程内私有，只由 `toggleMode` 写、`dispatch` 读）：
+   * runtime 优雅停止时会先冲刷最后一段 final，而此刻开关信号已是 off；没有这条记录就只能静默丢弃。
+   * 只在「两个模式都关」时写入，宽限窗口见 `STOP_FINAL_GRACE_MS`。
+   */
+  let lastClosedMode: LastClosedVoiceMode | null = null;
 
   let child: ChildProcess | null = null;
   let splitter = new NdjsonLineSplitter();
@@ -571,9 +577,25 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
       );
       return;
     }
+    const decision = resolveFinalDelivery({
+      injectOn: injectOn(),
+      inputOn: inputOn(),
+      lastClosed: lastClosedMode,
+      currentSessionID: gateSessionID,
+      now: gateNow,
+      stopping,
+    });
+    if (!decision.delivered) {
+      // 2026-10-24 修复：以前「F8 停止后冲刷出的 final」在这里既无注入/追加、也无日志（静默丢弃）。
+      log.info(
+        `asr final drop: reason=${decision.reason} session=${gateSessionID ?? "-"} mode=${lastClosedMode?.mode ?? "-"} ageMs=${lastClosedMode ? gateNow - lastClosedMode.at : "-"} text=${preview(result.text, ASR_GATE_PREVIEW_LEN)}`,
+      );
+      return;
+    }
     const body = composeBody(result);
-    if (injectOn()) {
-      const sessionID = currentSessionID(api);
+    if (decision.mode === "inject") {
+      // 宽限投递沿用 final 的归属会话（= 关闭时记录并已比对一致的那个会话）。
+      const sessionID = gateSessionID;
       if (!sessionID) {
         toast("warning", phrases.toast.notInSession);
         return;
@@ -594,13 +616,11 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
       }
       return;
     }
-    if (inputOn()) {
-      try {
-        await api.client.tui.appendPrompt({ text: ` ${body} ` });
-        toast("success", format(phrases.toast.appended, { text: preview(result.text) }));
-      } catch (err) {
-        toast("error", format(phrases.toast.appendFailed, { message: errText(err) }));
-      }
+    try {
+      await api.client.tui.appendPrompt({ text: ` ${body} ` });
+      toast("success", format(phrases.toast.appended, { text: preview(result.text) }));
+    } catch (err) {
+      toast("error", format(phrases.toast.appendFailed, { message: errText(err) }));
     }
   };
 
@@ -670,7 +690,11 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
           toast("info", format(phrases.toast.switched, { label }));
         }
       } else if (!anyOn()) {
+        // 先记录再停：停止进行中冲刷出的 final 靠这条记录按关闭前的模式投递（stopping=true 不限时）；
+        // 停止结束后再把 at 刷新为当刻，给 3s 尾随宽限（覆盖事件排队/慢回调）。
+        lastClosedMode = { mode: target, sessionID: currentSessionID(api), at: Date.now() };
         await stopRuntime();
+        if (lastClosedMode) lastClosedMode = { ...lastClosedMode, at: Date.now() };
         // 诊断埋点：关闭成功
         log.info(`mode off: target=${target} label=${label}`);
         toast("info", format(phrases.toast.modeOff, { label }));

@@ -197,7 +197,7 @@ node dist/cli/emotions-cli.js speak --text "你好" --emotion happy --background
 |---|---|---|---|
 | `uiLanguage` | `en` | **TUI UI 文案**语言：`zh` / `en`。用于槽位指示、toast、命令标题（改后重启 opencode 生效）；缺省回退旧键 `language` | `VOICE_UI_LANGUAGE`（旧名 `VOICE_LANGUAGE` 兜底） |
 | `toolLanguage` | `en` | **工具文案**语言：`zh` / `en`。用于 `emotions_cli` 工具描述（插件加载时本地化）与 `emotions-cli --help`；缺省回退旧键 `language` | `VOICE_TOOL_LANGUAGE`（旧名 `VOICE_LANGUAGE` 兜底） |
-| `device` | `""` | 音频输入设备友好名；空 = 自动取第一个输入设备 | `VOICE_DEVICE` |
+| `device` | `""` | 音频输入设备（Linux 用 pulse source 名，Windows 用 dshow 友好名）；**未指定时**：Linux 取 `pactl get-default-source`（失败回退非 `.monitor` 真实输入源）；Windows 取 ffmpeg dshow 枚举第一条（dshow 无 default 语义，建议显式指定）；Termux 用系统 ffmpeg 默认 | `VOICE_DEVICE` |
 | `asr.provider` | `aliyun-qwen` | ASR 预设，分两类传输——**stream**（WebSocket 实时）：`aliyun-qwen`(realtime,16k,7类情绪) / `aliyun-8k`(inference,8k,3类) / `aliyun-v2`(inference,16k,无情绪)；**segment**（整段音频→HTTP→文本，本地能量静音切段）：`aliyun-qwen-file`(qwen3-asr-flash 同步,16k,7类情绪) / `mimo`(mimo-v2.5-asr,16k,无情绪) | `VOICE_ASR_PROVIDER` |
 | `asr.model` | `""` | 模型名；空 = 按 provider 预设自动选择 | `VOICE_ASR_MODEL` |
 | `asr.language` | `""` | 识别语言；**空 = 自动识别（多语言）**。可选 `zh/yue/en/ja/ko/de/fr/ru/...`（stream 与 `aliyun-qwen-file` 按此表；`mimo` 仅收 zh/en，其余映射为 auto） | `VOICE_ASR_LANGUAGE` |
@@ -208,8 +208,9 @@ node dist/cli/emotions-cli.js speak --text "你好" --emotion happy --background
 | `asr.credentials.apiKey` | `""` | **仅 ASR 用**；直接给出的 API Key（与 `tts.credentials` 各自独立） | `DASHSCOPE_API_KEY` |
 | `asr.credentials.workspaceId` | `""` | **仅 ASR 用**；直接给出的业务空间 ID | `DASHSCOPE_WORKSPACE_ID` |
 | `asr.mimoCredentials.apiKey` | `""` | **仅 mimo ASR 用**；MiMo API Key（无需 workspace；与 `tts.mimoCredentials` 相互独立，留空回退环境变量） | `MIMO_API_KEY` |
-| `vad.threshold` | `0.5` | 语音活动检测**短帧能量门限**（30ms 短帧，按段 ASR 生效）。**有效区间 [0,1]**（`<0` 在映射时被夹到 0），映射为 dBFS：`0→-50 dBFS`（最灵敏）、`0.5→-35 dBFS`（默认）、`1→-20 dBFS`（最抗噪）。**越高越抗噪**、越低越灵敏（易误触发） | `VOICE_VAD_THRESHOLD` |
+| `vad.threshold` | `0.5` | 语音活动检测**短帧能量门限的配置基线**（30ms 短帧，按段 ASR 生效）。**有效区间 [0,1]**（`<0` 在映射时被夹到 0），映射为 dBFS：`0→-50 dBFS`（最灵敏）、`0.5→-35 dBFS`（默认）、`1→-20 dBFS`（最抗噪）。实际门限按底噪自适应：`clamp(max(基线, 底噪估计+vad.marginDb), -50, -20)`（底噪 = 最近 **5s** 的 30ms 帧 **p10 滑动分位**：冷启动偏低 5s 内自愈、说话期间 p10 贴底噪不漂移；连续 5 帧=150ms 越门限才算检出语音）。**越高越抗噪**、越低越灵敏（易误触发） | `VOICE_VAD_THRESHOLD` |
 | `vad.silenceDurationMs` | `800` | 句尾静音判定毫秒 `[200,6000]` | `VOICE_VAD_SILENCE_MS` |
+| `vad.marginDb` | `6` | 自适应门限相对底噪估计的最小余量 dB `[3,15]`（越小越灵敏、越大越抗噪；非法值告警并回退默认） | `VOICE_VAD_MARGIN_DB` |
 | `tts.provider` | `sapi` | 合成后端：`sapi`(本机 Windows SAPI) / `aliyun`(阿里云 CosyVoice) / `termux`(Termux 系统 TTS) / `mimo`(小米 MiMo) | `TTS_PROVIDER` |
 | `tts.voice` | `""` | 音色名；空 = provider 默认（sapi 系统默认 / aliyun `longxiaochun_v2` / mimo `冰糖`） | `TTS_VOICE` |
 | `tts.rate` | `0` | 语速；`sapi` `[-10,10]`（0 中性）、`aliyun` `[0.5,2]`（0 = 未指定 → 1.0）；`mimo` 无原生参数，非 0 时并入风格指令（稍快/稍慢） | `TTS_RATE` |

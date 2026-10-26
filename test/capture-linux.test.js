@@ -14,7 +14,13 @@ import {
   buildCaptureArgs,
   buildFfmpegCaptureArgs,
   buildPulseArgs,
+  getDefaultPulseSource,
   isPulseStartupFailure,
+  orderLinuxDevicesForDisplay,
+  prioritizeMicrophoneDevices,
+  resolveAlsaFallbackDevice,
+  resolveDefaultLinuxDevice,
+  resolveLinuxCaptureDevice,
   listLinuxAudioDevices,
   parseArecordDevices,
   parsePactlShortSources,
@@ -266,4 +272,190 @@ test("MicCapture：pulse 启动失败自动改试 alsa 仅一次；alsa 也失�
   assert.match(capture.diagnostics, /PulseAudio/);
   assert.match(capture.diagnostics, /ALSA/);
   assert.match(capture.diagnostics, /均失败/);
+});
+
+// ---- 默认输入源解析（Linux：pactl get-default-source → 非 monitor 回退） ----
+
+/** 造一个同时响应 get-default-source / list 的 pactl 假 spawn。 */
+function stubPactlSpawn({ defaultSource = "", shortSources = "", longSources = "", arecord = "" } = {}) {
+  const calls = [];
+  const spawn = (bin, args) => {
+    calls.push([bin, ...args]);
+    if (bin !== "pactl") return { stdout: arecord, stderr: "", status: 0 };
+    if (args[0] === "get-default-source") return { stdout: defaultSource, stderr: "", status: 0 };
+    if (args[0] === "list" && args[1] === "short") return { stdout: shortSources, stderr: "", status: 0 };
+    return { stdout: longSources, stderr: "", status: 0 };
+  };
+  return { calls, spawn };
+}
+
+const SHORT_MONITORS_FIRST = [
+  "41\talsa_output.pci-hdmi3.HiFi__HDMI3__sink.monitor\tmod\tspec\tSUSPENDED",
+  "42\talsa_output.pci-hdmi1.HiFi__HDMI1__sink.monitor\tmod\tspec\tSUSPENDED",
+  "43\talsa_input.pci-HiFi__Mic1__source\tmod\tspec\tRUNNING",
+  "44\talsa_input.usb-mic\tmod\tspec\tSUSPENDED",
+].join("\n");
+
+test("getDefaultPulseSource：有效值返回；占位/空/非 0/启动失败一律 undefined", () => {
+  const ok = stubPactlSpawn({ defaultSource: "  alsa_input.pci-HiFi__Mic1__source\n" });
+  assert.equal(getDefaultPulseSource({ spawn: ok.spawn }), "alsa_input.pci-HiFi__Mic1__source");
+  assert.deepEqual(ok.calls, [["pactl", "get-default-source"]]);
+
+  assert.equal(getDefaultPulseSource({ spawn: stubPactlSpawn({ defaultSource: "@DEFAULT_SOURCE@" }).spawn }), undefined);
+  assert.equal(getDefaultPulseSource({ spawn: stubPactlSpawn({ defaultSource: "   " }).spawn }), undefined);
+  assert.equal(getDefaultPulseSource({ spawn: () => ({ stdout: "x", status: 1 }) }), undefined);
+  assert.equal(getDefaultPulseSource({ spawn: () => ({ error: Object.assign(new Error("ENOENT"), { code: "ENOENT" }) }) }), undefined);
+});
+
+test("resolveDefaultLinuxDevice：默认源命中 → 直接用它，不再枚举设备", () => {
+  const stub = stubPactlSpawn({
+    defaultSource: "alsa_input.pci-HiFi__Mic1__source",
+    shortSources: SHORT_MONITORS_FIRST,
+  });
+  const resolved = resolveDefaultLinuxDevice({ spawn: stub.spawn });
+  assert.deepEqual(resolved, {
+    value: "alsa_input.pci-HiFi__Mic1__source",
+    fromDefaultSource: true,
+    monitor: false,
+  });
+  assert.deepEqual(stub.calls, [["pactl", "get-default-source"]], "默认源有效时不应枚举");
+});
+
+test("resolveDefaultLinuxDevice：默认源缺失 → 跳过 monitor，取第一条真实输入源（保持相对顺序）", () => {
+  const stub = stubPactlSpawn({ defaultSource: "", shortSources: SHORT_MONITORS_FIRST });
+  const resolved = resolveDefaultLinuxDevice({ spawn: stub.spawn });
+  assert.deepEqual(resolved, {
+    value: "alsa_input.pci-HiFi__Mic1__source",
+    fromDefaultSource: false,
+    monitor: false,
+  });
+});
+
+test("resolveDefaultLinuxDevice：默认源为占位符时同样回退到非 monitor", () => {
+  const stub = stubPactlSpawn({ defaultSource: "@DEFAULT_SOURCE@", shortSources: SHORT_MONITORS_FIRST });
+  assert.equal(resolveDefaultLinuxDevice({ spawn: stub.spawn })?.value, "alsa_input.pci-HiFi__Mic1__source");
+});
+
+test("resolveDefaultLinuxDevice：只有 monitor 时仍取第一条并标记 monitor=true", () => {
+  const stub = stubPactlSpawn({
+    defaultSource: "",
+    shortSources: [
+      "41\talsa_output.a.monitor\tmod\tspec\tSUSPENDED",
+      "42\talsa_output.b.monitor\tmod\tspec\tSUSPENDED",
+    ].join("\n"),
+  });
+  assert.deepEqual(resolveDefaultLinuxDevice({ spawn: stub.spawn }), {
+    value: "alsa_output.a.monitor",
+    fromDefaultSource: false,
+    monitor: true,
+  });
+});
+
+test("resolveDefaultLinuxDevice：无设备 → undefined", () => {
+  const stub = stubPactlSpawn({ defaultSource: "", shortSources: "" });
+  assert.equal(resolveDefaultLinuxDevice({ spawn: stub.spawn }), undefined);
+});
+
+test("resolveLinuxCaptureDevice：显式 device 最高优先，真实依赖链不触发任何 pactl/arecord 查询", () => {
+  let spawned = 0;
+  const resolved = resolveLinuxCaptureDevice({
+    explicit: "  alsa_input.usb-mic  ",
+    spawn: () => {
+      spawned += 1;
+      return { stdout: "alsa_input.other", stderr: "", status: 0 };
+    },
+  });
+  assert.deepEqual(resolved, { value: "alsa_input.usb-mic", fromDefaultSource: false, monitor: false });
+  assert.equal(spawned, 0, "显式指定时不得查询默认源/枚举");
+});
+
+test("prioritizeMicrophoneDevices：非 monitor 在前，各自保持原相对顺序", () => {
+  const devices = [
+    { name: "m1", value: "a.monitor" },
+    { name: "mic1", value: "alsa_input.one" },
+    { name: "m2", value: "b.monitor" },
+    { name: "mic2", value: "alsa_input.two" },
+  ];
+  assert.deepEqual(prioritizeMicrophoneDevices(devices), [
+    { name: "mic1", value: "alsa_input.one" },
+    { name: "mic2", value: "alsa_input.two" },
+    { name: "m1", value: "a.monitor" },
+    { name: "m2", value: "b.monitor" },
+  ]);
+  assert.equal(devices[0].value, "a.monitor", "不得修改入参");
+});
+
+test("resolveAlsaFallbackDevice：pulse source 名换成 default；各种合法 ALSA 设备名原样保留", () => {
+  assert.equal(resolveAlsaFallbackDevice(""), "default");
+  assert.equal(resolveAlsaFallbackDevice("alsa_input.pci-HiFi__Mic1__source"), "default");
+  assert.equal(resolveAlsaFallbackDevice("alsa_output.a.monitor"), "default");
+  assert.equal(resolveAlsaFallbackDevice("bluez_input.XX_XX"), "default");
+  for (const alsa of [
+    "default",
+    "pulse",
+    "hw:1,0",
+    "hw:CARD=PCH,DEV=0",
+    "plughw:0,0",
+    "plughw:CARD=PCH,DEV=0",
+    "sysdefault:CARD=PCH",
+    "front:CARD=PCH,DEV=0",
+    "surround51:CARD=PCH,DEV=0",
+    "iec958:CARD=PCH,DEV=0",
+    "dmix:CARD=PCH,DEV=0",
+  ]) {
+    assert.equal(resolveAlsaFallbackDevice(alsa), alsa, `${alsa} 不应被改写`);
+  }
+});
+
+test("orderLinuxDevicesForDisplay：默认源置顶 → 非 monitor → monitor（各自稳定）", () => {
+  const devices = [
+    { name: "m1", value: "a.monitor" },
+    { name: "mic1", value: "alsa_input.one" },
+    { name: "mic2", value: "alsa_input.two" },
+    { name: "m2", value: "b.monitor" },
+  ];
+  assert.deepEqual(orderLinuxDevicesForDisplay(devices, "alsa_input.two"), [
+    { name: "mic2", value: "alsa_input.two" },
+    { name: "mic1", value: "alsa_input.one" },
+    { name: "m1", value: "a.monitor" },
+    { name: "m2", value: "b.monitor" },
+  ]);
+  assert.deepEqual(orderLinuxDevicesForDisplay(devices), prioritizeMicrophoneDevices(devices));
+});
+
+test("resolveDefaultLinuxDevice：pactl 只有 monitor 时先试 arecord，命中真实硬件设备", () => {
+  const stub = stubPactlSpawn({
+    defaultSource: "",
+    shortSources: "41\talsa_output.a.monitor\tmod\tspec\tSUSPENDED",
+    arecord: "card 1: USB [USB Audio], device 0: USB Audio [USB Audio]\n",
+  });
+  assert.deepEqual(resolveDefaultLinuxDevice({ spawn: stub.spawn }), {
+    value: "hw:1,0",
+    fromDefaultSource: false,
+    monitor: false,
+  });
+  assert.ok(stub.calls.some((call) => call[0] === "arecord" && call[1] === "-l"), "应重试 arecord");
+});
+
+test("MicCapture：pulse source 名失败回退 alsa 时改用 default，不把 pulse source 名喂给 -f alsa", () => {
+  const calls = [];
+  const procs = [];
+  const capture = new MicCapture({
+    device: "alsa_input.pci-HiFi__Mic1__source",
+    platform: "linux",
+    env: {},
+    ffmpegBin: "ffmpeg",
+    spawnCapture: (_bin, args) => {
+      calls.push(args);
+      const proc = fakeProc();
+      procs.push(proc);
+      return proc;
+    },
+  });
+  capture.start();
+  assert.equal(calls[0][6], "alsa_input.pci-HiFi__Mic1__source");
+  procs[0].stderr.emit("data", Buffer.from("Connection refused"));
+  procs[0].emit("close", 1);
+  assert.equal(calls.length, 2);
+  assert.deepEqual(calls[1].slice(3, 7), ["-f", "alsa", "-i", "default"]);
 });

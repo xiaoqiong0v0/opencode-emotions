@@ -18,7 +18,12 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { ASR_GATE_TAIL_MS, shouldDropAsrFinal } from "../dist/voice/asr-gate.js";
+import {
+  ASR_GATE_TAIL_MS,
+  resolveFinalDelivery,
+  shouldDropAsrFinal,
+  STOP_FINAL_GRACE_MS,
+} from "../dist/voice/asr-gate.js";
 import {
   isInterruptablePlaybackActive,
   PLAYBACK_OWNERLESS_KEY,
@@ -109,4 +114,124 @@ test("静音门：无主（手动 speak）播放算本会话可见 → 拦", () 
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+// ---- 停止后 final 宽限投递（2026-10-24）----
+
+test("分发决策：当前开关优先（注入/输入）", () => {
+  const last = { mode: "input", sessionID: "ses_a", at: T };
+  assert.deepEqual(
+    resolveFinalDelivery({ injectOn: true, inputOn: false, lastClosed: last, currentSessionID: "ses_a", now: T }),
+    { delivered: true, mode: "inject", viaGrace: false },
+  );
+  assert.deepEqual(
+    resolveFinalDelivery({ injectOn: false, inputOn: true, lastClosed: last, currentSessionID: "ses_a", now: T }),
+    { delivered: true, mode: "input", viaGrace: false },
+  );
+});
+
+test("分发决策：关闭后 3s 内、会话一致 → 按关闭前的模式投递（inject 不被丢）", () => {
+  const last = { mode: "inject", sessionID: "ses_a", at: T };
+  assert.deepEqual(
+    resolveFinalDelivery({ injectOn: false, inputOn: false, lastClosed: last, currentSessionID: "ses_a", now: T + 1_000 }),
+    { delivered: true, mode: "inject", viaGrace: true },
+  );
+  // 边界：恰好 3s 仍在宽限内；差 1ms 过期
+  assert.deepEqual(
+    resolveFinalDelivery({ injectOn: false, inputOn: false, lastClosed: last, currentSessionID: "ses_a", now: T + STOP_FINAL_GRACE_MS }),
+    { delivered: true, mode: "inject", viaGrace: true },
+  );
+  assert.deepEqual(
+    resolveFinalDelivery({ injectOn: false, inputOn: false, lastClosed: last, currentSessionID: "ses_a", now: T + STOP_FINAL_GRACE_MS + 1 }),
+    { delivered: false, reason: "grace-expired" },
+  );
+});
+
+test("分发决策：超过 3s 丢弃（不注入/不追加）且原因可区分", () => {
+  const last = { mode: "input", sessionID: "ses_a", at: T };
+  assert.deepEqual(
+    resolveFinalDelivery({ injectOn: false, inputOn: false, lastClosed: last, currentSessionID: "ses_a", now: T + 3_001 }),
+    { delivered: false, reason: "grace-expired" },
+  );
+  // 无关闭记录 → 没有可投递模式
+  assert.deepEqual(
+    resolveFinalDelivery({ injectOn: false, inputOn: false, lastClosed: null, currentSessionID: "ses_a", now: T }),
+    { delivered: false, reason: "no-active-mode" },
+  );
+});
+
+test("分发决策：会话不一致 → 丢弃（不跨会话投递）", () => {
+  const last = { mode: "inject", sessionID: "ses_a", at: T };
+  assert.deepEqual(
+    resolveFinalDelivery({ injectOn: false, inputOn: false, lastClosed: last, currentSessionID: "ses_b", now: T + 100 }),
+    { delivered: false, reason: "session-mismatch" },
+  );
+});
+
+test("分发决策：取不到会话时按无主哨兵口径配对（不越界匹配有主会话）", () => {
+  const ownerless = { mode: "input", sessionID: undefined, at: T };
+  assert.deepEqual(
+    resolveFinalDelivery({ injectOn: false, inputOn: false, lastClosed: ownerless, currentSessionID: undefined, now: T + 100 }),
+    { delivered: true, mode: "input", viaGrace: true },
+    "关闭与当前都无会话 → 同一无主口径，允许投递",
+  );
+  assert.deepEqual(
+    resolveFinalDelivery({ injectOn: false, inputOn: false, lastClosed: ownerless, currentSessionID: "ses_a", now: T + 100 }),
+    { delivered: false, reason: "session-mismatch" },
+    "关闭时无主、当前有会话 → 不匹配",
+  );
+  const owned = { mode: "input", sessionID: "ses_a", at: T };
+  assert.deepEqual(
+    resolveFinalDelivery({ injectOn: false, inputOn: false, lastClosed: owned, currentSessionID: undefined, now: T + 100 }),
+    { delivered: false, reason: "session-mismatch" },
+    "关闭时有会话、当前无会话 → 不匹配",
+  );
+});
+
+test("分发决策：时钟回拨按过期处理；graceMs<=0 关闭宽限", () => {
+  const last = { mode: "inject", sessionID: "ses_a", at: T };
+  assert.deepEqual(
+    resolveFinalDelivery({ injectOn: false, inputOn: false, lastClosed: last, currentSessionID: "ses_a", now: T - 10 }),
+    { delivered: false, reason: "grace-expired" },
+  );
+  assert.deepEqual(
+    resolveFinalDelivery({ injectOn: false, inputOn: false, lastClosed: last, currentSessionID: "ses_a", now: T + 10 }, 0),
+    { delivered: false, reason: "grace-expired" },
+  );
+});
+
+test("分发决策：停止进行中（stopping=true）不受 3s 宽限截断，会话一致即投递", () => {
+  const last = { mode: "inject", sessionID: "ses_a", at: T };
+  // 优雅停止可等 10s、单段 HTTP 可到 60s：停止进行中即使 age 远超 3s 也必须投递
+  for (const ageMs of [3_001, 10_000, 60_000]) {
+    assert.deepEqual(
+      resolveFinalDelivery({
+        injectOn: false,
+        inputOn: false,
+        lastClosed: last,
+        currentSessionID: "ses_a",
+        now: T + ageMs,
+        stopping: true,
+      }),
+      { delivered: true, mode: "inject", viaGrace: true },
+      `stopping=true、ageMs=${ageMs} 时应投递`,
+    );
+  }
+  // 停止结束（stopping=false/缺省）后回到 3s 宽限
+  assert.deepEqual(
+    resolveFinalDelivery({ injectOn: false, inputOn: false, lastClosed: last, currentSessionID: "ses_a", now: T + 3_001 }),
+    { delivered: false, reason: "grace-expired" },
+  );
+  // 停止进行中也不跨会话投递
+  assert.deepEqual(
+    resolveFinalDelivery({
+      injectOn: false,
+      inputOn: false,
+      lastClosed: last,
+      currentSessionID: "ses_b",
+      now: T + 10_000,
+      stopping: true,
+    }),
+    { delivered: false, reason: "session-mismatch" },
+  );
 });
