@@ -90,16 +90,19 @@ export interface FfmpegMissingGuidanceInput {
   env: NodeJS.ProcessEnv;
   /** `FFMPEG_BIN` 的原始值（已 trim；未设置则不传）。 */
   override?: string;
-  /** `FFMPEG_BIN` 已设置但指向的文件不存在。 */
-  overrideProblem?: "missing-file";
-  /** `ffmpeg-static` 解析到了路径但文件缺失（未跑 install 下载）。 */
-  staticProblem?: "missing-file";
+  /** `FFMPEG_BIN` 已设置但不可用：文件不存在 / 存在但 `-version` 真执行失败。 */
+  overrideProblem?: "missing-file" | "unusable";
+  /** `ffmpeg-static` 随附二进制不可用：文件不存在（未下载）/ 存在但 `-version` 真执行失败。 */
+  staticProblem?: "missing-file" | "unusable";
 }
 
 /**
- * ffmpeg 全链路不可用（或解析到的文件不存在）时的用户引导。
+ * ffmpeg 全链路不可用时的用户引导。
  *
- * 关键信息在前 120 字符内：缺什么（含具体原因）→ 三种修复方式（环境变量 / 系统安装 / 重装依赖）。
+ * 口径（2026-10-28 第十九批改纯自包含）：**不再引导安装系统 ffmpeg**（非 Termux 下不读 PATH），
+ * 只给三条自包含修复路径：设 `FFMPEG_BIN` / 配代理后重启重新下载 / 重装插件依赖（Termux 例外仍提示 `pkg install ffmpeg`）。
+ *
+ * 关键信息在前 120 字符内：缺什么（含具体原因）→ 怎么修。
  * @param input 入参（见 {@link FfmpegMissingGuidanceInput}）
  * @returns 中文可操作提示
  */
@@ -108,15 +111,26 @@ export function ffmpegMissingGuidance(input: FfmpegMissingGuidanceInput): string
   let reason: string;
   if (input.overrideProblem === "missing-file" && input.override) {
     reason = `FFMPEG_BIN=${input.override} 指向的文件不存在`;
+  } else if (input.overrideProblem === "unusable" && input.override) {
+    reason = `FFMPEG_BIN=${input.override} 无法执行（-version 校验失败）`;
+  } else if (input.staticProblem === "unusable") {
+    reason = "ffmpeg-static 随附二进制无法执行（-version 校验失败）";
   } else if (input.staticProblem === "missing-file") {
     reason = "ffmpeg-static 随附二进制缺失（安装时未下载成功）";
   } else {
-    reason = "FFMPEG_BIN 未设置，PATH 与 ffmpeg-static 均不可用";
+    reason = "FFMPEG_BIN 未设置，ffmpeg-static 随附二进制也不可用";
+  }
+  if (isTermux(env) || platform === "android") {
+    return (
+      `未找到可用的 ffmpeg：${reason}。请任选其一修复：` +
+      `① ${ffmpegInstallHints(platform, env)}；` +
+      "② 设置环境变量 FFMPEG_BIN=<可用 ffmpeg 的路径>。"
+    );
   }
   return (
     `未找到可用的 ffmpeg：${reason}。请任选其一修复：` +
-    "① 设置环境变量 FFMPEG_BIN=<ffmpeg 路径>（Windows 系统环境变量，或启动 opencode 的 shell 环境）；" +
-    `② 安装系统 ffmpeg（${ffmpegInstallHints(platform, env)}）；` +
+    "① 设置环境变量 FFMPEG_BIN=<可用 ffmpeg 的绝对路径>（离线/内网场景）；" +
+    "② 配置网络代理（HTTPS_PROXY / HTTP_PROXY）后重启，让插件重新下载随附二进制；" +
     "③ 重装插件依赖（npm install，或 opencode plugin add @xiaoqiong0v0/opencode-emotions --force）后重试。"
   );
 }
@@ -133,7 +147,7 @@ export function ffmpegLaunchFailedGuidance(bin: string, cause: string): string {
   return (
     `无法启动 ffmpeg 枚举音频设备（路径=${bin}，原因=${cause}）。可尝试：` +
     "① 设置环境变量 FFMPEG_BIN 指向可运行的 ffmpeg；" +
-    `② 安装系统 ffmpeg（${ffmpegInstallHints(process.platform, process.env)}）；` +
+    "② 若是随附二进制：配置代理后重启让插件重新下载（或重装插件依赖）；" +
     "③ Windows 下检查该文件是否被杀毒软件/权限拦截。"
   );
 }

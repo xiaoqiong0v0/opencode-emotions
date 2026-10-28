@@ -49,8 +49,8 @@ TUI 插件（语音输入 UI + 热键）——`tui.json`：
 
 ## 依赖体积（含 `ffmpeg-static`）
 
-- **`ffmpeg-static`（写在 `optionalDependencies`）**：npm 安装时由该包的 `install` 脚本**下载**一个预编译 ffmpeg 二进制到 `node_modules/ffmpeg-static`（Windows `ffmpeg.exe` 实测 **≈ 79 MB**），用于语音采集（及 Termux 分块录音转码）。云 TTS 走**流式 raw PCM**，不再用它转码。代价是首次安装的网络流量与磁盘占用；可用环境变量 `FFMPEG_BIN` 指向系统自带 ffmpeg 以绕开随附二进制。
-- **opencode 自动安装不会执行 `install` 脚本**（源码 `packages/core/src/npm.ts` 硬编码 `ignoreScripts: true`）⇒ 插件缓存里只有包文件、没有 `ffmpeg.exe`。**语音入口会在枚举设备前自动补齐**（优先从同机其它副本拷贝，否则用当前 Node 跑 `ffmpeg-static/install.js`，超时 120s）；补齐失败才给明确引导，不会静默无声。`node scripts/ensure-ffmpeg.mjs` 仍是发布前门禁/离线预取（`--check` 只检查，缺失退出码 1），与运行时共用同一实现。
+- **`ffmpeg-static`（写在 `optionalDependencies`）**：npm 安装时由该包的 `install` 脚本**下载**一个预编译 ffmpeg 二进制到 `node_modules/ffmpeg-static`（Windows `ffmpeg.exe` 实测 **≈ 79 MB**），用于语音采集（及 Termux 分块录音转码）。云 TTS 走**流式 raw PCM**，不再用它转码。代价是首次安装的网络流量与磁盘占用。**不依赖系统 ffmpeg**（非 Termux 下不读 `PATH`）：需要自备时用环境变量 `FFMPEG_BIN` 指向**任何可用 ffmpeg**，且必须通过 `ffmpeg -version` 真执行校验才会被采用。
+- **opencode 自动安装不会执行 `install` 脚本**（源码 `packages/core/src/npm.ts` 硬编码 `ignoreScripts: true`）⇒ 插件缓存里只有包文件、没有 `ffmpeg.exe`。**语音入口在枚举设备前做启动自检**（非 Termux **每次都执行**）：把 `ffmpeg-static` 二进制补齐 —— 先**拷贝同机可用副本**（离线、零下载），没有副本才用当前 Node 跑 `ffmpeg-static/install.js` **下载**（约 **30–80MB**，需 **GitHub Release 可达**，默认超时 120s）；补齐结果一律用 `ffmpeg -version` **真执行校验**（不再只看文件存在）。**离线/内网**用 `FFMPEG_BIN` 指向可用 ffmpeg。`node scripts/ensure-ffmpeg.mjs` 仍是发布前门禁/离线预取（`--check` 只检查，缺失退出码 1），与运行时共用同一实现。
 - `ffmpeg-static` 自身按 **GPL-3.0-or-later** 分发（与本包 MIT 许可相互独立）。
 - `ws`：ASR/TTS 的 WebSocket 客户端（体积小）。
 
@@ -236,19 +236,21 @@ node dist/cli/emotions-cli.js speak --text "你好" --emotion happy --background
 
 - **手动符号入口已移除**：`!!!`/`？？？`/`...`/`666` 不再触发标注；请改用命令（`/angry` 等）。
 - 情绪命令需**真正触发命令**（消息以 `/` 开头）才生效；命令不产出额外模型回合。
-- **npm 安装会拉入 `ffmpeg-static`（≈79 MB 下载）**，见上文「依赖体积」。
-- **新机器首次启动语音会自动补 ffmpeg**：已可用（`FFMPEG_BIN`/PATH/随附二进制）则完全跳过；否则拷贝同机副本或跑 `install.js`（每进程只尝试一次）。**离线且补齐失败时**，用 `FFMPEG_BIN` 指向系统 ffmpeg 后重启 opencode；失败原因会连同引导一起显示。
+- **npm 安装会拉入 `ffmpeg-static`（Windows 实测 ≈79 MB，其它平台约 30–80 MB）**，见上文「依赖体积」。
+- **新机器首次启动语音会自动补 ffmpeg**：**不依赖系统 ffmpeg**（非 Termux 下不读 `PATH`）——`FFMPEG_BIN` 通过 `-version` 校验则跳过自检；否则先拷贝同机可用副本、没有副本再下载（约 30–80MB，需 GitHub Release 可达），**每进程只尝试一次**，补齐结果一律过 `-version` 真执行校验。**离线/内网**用 `FFMPEG_BIN` 指向可用 ffmpeg 后重启 opencode；失败原因会连同引导（设 `FFMPEG_BIN` / 配代理后重启重下 / 重装插件依赖）一起显示。**开了系统代理仍下载失败**（Node 默认不读系统代理）：设 `VOICE_FFMPEG_DOWNLOAD_PROXY=http://127.0.0.1:7897` 后重启重下（Windows 静态系统代理会自动读取，PAC 自动配置脚本不覆盖）。**Termux 例外**：随附二进制在 Android/aarch64 跑不起来，仍需 `pkg install ffmpeg`。
 - **语音采集平台矩阵（2026-10-23 第十八批）**：
 
   | 平台 | 采集后端 | 依赖 |
   | --- | --- | --- |
-  | Windows | `ffmpeg -f dshow` | `ffmpeg`（随附或系统） |
-  | Termux / Android | `termux-microphone-record` | `pkg install termux-api` + Termux:API 应用 |
-  | Linux 桌面 | `ffmpeg -f pulse`（PulseAudio/PipeWire）→ 回退 `ffmpeg -f alsa` **一次** | `ffmpeg`、`pactl`（`apt install pulseaudio-utils`，或 `pacman -S libpulse`）、`arecord`（`apt install alsa-utils`） |
+  | Windows | `ffmpeg -f dshow` | `ffmpeg-static` 随附二进制（启动自动补齐；**不需要**系统 ffmpeg） |
+  | Termux / Android | `termux-microphone-record` | `pkg install termux-api` + Termux:API 应用；转码用系统 `ffmpeg`（`pkg install ffmpeg`） |
+  | Linux 桌面 | `ffmpeg -f pulse`（PulseAudio/PipeWire）→ 回退 `ffmpeg -f alsa` **一次** | `ffmpeg-static` 随附二进制（Linux x64）、`pactl`（`apt install pulseaudio-utils`，或 `pacman -S libpulse`）、`arecord`（`apt install alsa-utils`） |
   | 其它（如 macOS） | **不支持**（明确报错，不静默走 dshow） | — |
 
-  Linux 安装命令：`sudo apt install ffmpeg pulseaudio-utils alsa-utils`（Debian/Ubuntu）或
-  `sudo pacman -S ffmpeg libpulse alsa-utils`（Arch）；麦克风权限不足时把用户加入 `audio` 组
+  Linux 安装命令：`sudo apt install pulseaudio-utils alsa-utils`（Debian/Ubuntu）或
+  `sudo pacman -S libpulse alsa-utils`（Arch）——**不必另装 ffmpeg**（随附二进制优先）；
+  若本机随附二进制不可用（如非 x64 架构），自行装 ffmpeg 并用 `FFMPEG_BIN` 指向它。
+  麦克风权限不足时把用户加入 `audio` 组
   （`sudo usermod -aG audio $USER` 后重新登录）。设备取值：`--device <source 名>` 或 `--device hw:C,D`，
   留空用 `default`；`--list` 会同时显示友好名与取值。
 
@@ -256,7 +258,7 @@ node dist/cli/emotions-cli.js speak --text "你好" --emotion happy --background
   - **Windows**：默认用**内置 waveOut 流式播放器**（`pwsh`/`powershell` + winmm，无 `ffplay` 依赖）；`pwsh` 缺失时回退 `powershell`。若 `pwsh`/`powershell` 都不可用则回退 SoundPlayer **分段**（段边界=句边界，间隙更少）。
   - **Termux**：`play-audio` 只能放文件、不能流式 → 有 `sox`(play) 走流式，否则回退分段。
 - **Termux 限制**：
-  - **采集（ASR）不可用**：`ffmpeg-static` 是 **Linux x64 预编译**二进制，在 Termux（Android/aarch64）跑不起来；需装 Termux 自带的 `ffmpeg` 或 `sox`，并用 `FFMPEG_BIN` 指向它（或在 PATH 上放一个名为 `ffmpeg` 的可执行文件）。`devices` 子命令同样依赖 ffmpeg。
+  - **采集（ASR）不可用**：`ffmpeg-static` 是 **Linux x64 预编译**二进制，在 Termux（Android/aarch64）跑不起来；**Termux 是唯一例外，直接用系统 `ffmpeg`（PATH）**，请 `pkg install ffmpeg`（也可 `FFMPEG_BIN` 指向可用 ffmpeg）。`devices` 子命令同样依赖 ffmpeg。
   - **播放走 `play-audio`**：`pkg install play-audio` 后可用（绝对路径 `$PREFIX/bin/play-audio`）；缺失时报清晰错误并提示安装命令。音频流由 `TTS_STREAM` 控制（默认 `media`）。
   - `sapi` 在 Termux 上必然报错（非 Windows）；请用 `aliyun`（CosyVoice）。
 
@@ -265,7 +267,7 @@ node dist/cli/emotions-cli.js speak --text "你好" --emotion happy --background
 ```bash
 npm install
 npm run build        # 清空 dist/ → tsc 编译 src/**（不含 .tsx）→ npm run typecheck（tsconfig.tui.json）→ Babel 链编译 dist/tui.js
-npm test             # 构建后跑单元测试（node --test，405 例：404 pass + 1 POSIX-only skip）
+npm test             # 构建后跑单元测试（node --test，430 例：429 pass + 1 POSIX-only skip）
 npm run publish:proj # build + 镜像 dist/ → .opencode/plugin/（并指向编译后的 tui.js）
 ```
 

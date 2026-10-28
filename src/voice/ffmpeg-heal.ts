@@ -15,13 +15,13 @@
  * 当前 Node 可执行文件运行，超时 kill。
  */
 
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { chmodSync, copyFileSync, existsSync, readdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, delimiter, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { resolveFfmpegPath } from "./ffmpeg.js";
+import { forgetFfmpegProbe, probeFfmpeg, resolveFfmpegPath } from "./ffmpeg.js";
 
 /** `ffmpeg-static` 包名（亦是其目录名）。 */
 export const FFMPEG_STATIC_PACKAGE = "ffmpeg-static";
@@ -37,6 +37,45 @@ const PACKAGES_CACHE_SEGMENTS = [".cache", "opencode", "packages"] as const;
 const NODE_MODULES = "node_modules";
 /** 包存在性判据文件。 */
 const PACKAGE_JSON = "package.json";
+/** 显式下载代理覆盖（优先级最高；形如 `http://127.0.0.1:7897`）。 */
+export const DOWNLOAD_PROXY_ENV = "VOICE_FFMPEG_DOWNLOAD_PROXY";
+/** 让 Node 子进程按 env 里的代理变量走代理（Node 24+ 生效，低版本忽略无害）。 */
+export const NODE_USE_ENV_PROXY = "NODE_USE_ENV_PROXY";
+/** 视为「用户已配置代理」的环境变量键（按此顺序取第一个非空值）。 */
+const ENV_PROXY_KEYS = ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"] as const;
+/** Windows 系统代理所在的注册表键（HKCU）。 */
+const WINDOWS_INTERNET_SETTINGS_KEY = "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings";
+/** 单次注册表查询超时（毫秒）。 */
+const REG_QUERY_TIMEOUT_MS = 2000;
+
+/** Windows 系统代理信息（`enabled` 且 `server` 都存在才可用）。 */
+export interface SystemProxyInfo {
+  /** 系统代理是否启用。 */
+  enabled: boolean;
+  /** 代理地址（`host:port` 或带 scheme）。 */
+  server?: string;
+}
+
+/** 代理来源（日志/测试用）。 */
+export type ProxySource = "explicit" | "env" | "system" | "none";
+
+/** 解析出的代理及其来源。 */
+export interface ResolvedDownloadProxy {
+  /** 来源：显式 > env > 系统 > 无。 */
+  source: ProxySource;
+  /** 实际使用的代理地址（`none` 时无）。 */
+  proxy?: string;
+}
+
+/** `buildDownloadEnv` 入参。 */
+export interface BuildDownloadEnvInput {
+  /** 基础环境变量表（不改动）。 */
+  env: NodeJS.ProcessEnv;
+  /** 系统代理（Windows 由注册表解析得到）。 */
+  systemProxy?: SystemProxyInfo;
+  /** 显式代理（来自 `VOICE_FFMPEG_DOWNLOAD_PROXY`）。 */
+  explicitProxy?: string;
+}
 
 /** 自愈动作（纯决策结果）。 */
 export type HealAction = "already-ok" | "run-install" | "copy-from-elsewhere" | "give-up";
@@ -75,6 +114,175 @@ export function decideHealAction(input: HealDecisionInput): HealAction {
  */
 export function ffmpegBinaryName(platform: NodeJS.Platform): string {
   return platform === "win32" ? "ffmpeg.exe" : "ffmpeg";
+}
+
+/**
+ * 规范化代理地址：带 scheme 原样返回，否则补 `http://`。
+ * @param server 原始地址（`host:port` 或带 scheme）
+ * @returns 可直接作为 `HTTPS_PROXY` 的值
+ */
+function normalizeProxyUrl(server: string): string {
+  const value = server.trim();
+  return /^[a-z][a-z0-9+.-]*:\/\//i.test(value) ? value : `http://${value}`;
+}
+
+/** env 里第一个非空的代理变量值（无则 undefined）。 */
+function envProxyValue(env: NodeJS.ProcessEnv): string | undefined {
+  for (const key of ENV_PROXY_KEYS) {
+    const value = env[key]?.trim();
+    if (value) return value;
+  }
+  return undefined;
+}
+
+/**
+ * 纯决策：选出生效的下载代理及其来源（不做 IO）。
+ * 优先级：`explicitProxy` > env 已有代理 > 系统代理 > 无。
+ * @param input 见 {@link BuildDownloadEnvInput}
+ * @returns 来源与地址（`none` 时无 `proxy`）
+ */
+export function resolveDownloadProxy(input: BuildDownloadEnvInput): ResolvedDownloadProxy {
+  const explicit = input.explicitProxy?.trim();
+  if (explicit) return { source: "explicit", proxy: normalizeProxyUrl(explicit) };
+  const fromEnv = envProxyValue(input.env);
+  if (fromEnv) return { source: "env", proxy: fromEnv };
+  const server = input.systemProxy?.server?.trim();
+  if (input.systemProxy?.enabled === true && server) return { source: "system", proxy: normalizeProxyUrl(server) };
+  return { source: "none" };
+}
+
+/**
+ * 构造 `install.js` 子进程的环境变量（纯函数，不改动入参）。
+ * 总是设置 `NODE_USE_ENV_PROXY=1`；只在来源为 `explicit` / `system` 时同时注入
+ * `HTTPS_PROXY` 与 `HTTP_PROXY`（env 已有的代理原样保留，`NO_PROXY` 不动）。
+ * @param input 见 {@link BuildDownloadEnvInput}
+ * @returns 新的环境变量对象
+ */
+export function buildDownloadEnv(input: BuildDownloadEnvInput): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...input.env };
+  env[NODE_USE_ENV_PROXY] = "1";
+  const resolved = resolveDownloadProxy(input);
+  if (resolved.proxy !== undefined && (resolved.source === "explicit" || resolved.source === "system")) {
+    env.HTTPS_PROXY = resolved.proxy;
+    env.HTTP_PROXY = resolved.proxy;
+  }
+  return env;
+}
+
+/** 日志里隐藏代理 URL 里的用户信息（`user:pass@` → `***@`）。 */
+function maskProxyForLog(proxy: string): string {
+  return proxy.replace(/^([a-z][a-z0-9+.-]*:\/\/)[^/@]*@/i, "$1***@");
+}
+
+/**
+ * 解析 `reg query ... /v ProxyEnable` 与 `/v ProxyServer` 的输出（纯函数）。
+ * 支持 `host:port` 与 `proto=host:port;...` 两种 `ProxyServer` 形式（优先 `http=`，否则取第一项）。
+ * @param regQueryOutput 两次查询输出拼接后的文本
+ * @returns 系统代理信息；缺键/解析失败 ⇒ `{ enabled: false }`
+ */
+export function parseWindowsProxy(regQueryOutput: string): SystemProxyInfo {
+  const text = typeof regQueryOutput === "string" ? regQueryOutput : "";
+  let enabled: boolean | undefined;
+  let server: string | undefined;
+  for (const line of text.split(/\r?\n/)) {
+    const match = /^\s*(ProxyEnable|ProxyServer)\s+REG_\w+\s+(.*)$/.exec(line);
+    if (!match) continue;
+    const value = match[2].trim();
+    if (match[1] === "ProxyEnable") {
+      enabled = /^(0x0*1|1)$/i.test(value);
+      continue;
+    }
+    if (value) server = parseProxyServerValue(value);
+  }
+  if (enabled !== true) return { enabled: false };
+  return server ? { enabled: true, server } : { enabled: true };
+}
+
+/**
+ * 从 `ProxyServer` 原始值里取地址：`proto=host:port;...` 取 `http=` 项，否则第一项。
+ * @param raw `ProxyServer` 值
+ * @returns 地址（可能为空 ⇒ undefined）
+ */
+function parseProxyServerValue(raw: string): string | undefined {
+  const parts = raw.split(";").map((part) => part.trim()).filter(Boolean);
+  if (parts.length === 0) return undefined;
+  const httpPart = parts.find((part) => /^http=/i.test(part));
+  const chosen = httpPart ?? parts[0];
+  const value = chosen.includes("=") ? chosen.slice(chosen.indexOf("=") + 1).trim() : chosen;
+  return value || undefined;
+}
+
+/** 注册表查询结果（仅 stdout）。 */
+interface RegQueryResult {
+  status: number | null;
+  stdout?: string | Buffer;
+}
+
+/** 可注入的注册表查询（`reg query` 语义）。 */
+export type RegQuery = (args: readonly string[]) => RegQueryResult;
+
+/** 生产注册表查询：`spawnSync reg`（无 shell、有超时）。 */
+const DEFAULT_REG_QUERY: RegQuery = (args) => {
+  const result = spawnSync("reg", [...args], {
+    shell: false,
+    windowsHide: true,
+    timeout: REG_QUERY_TIMEOUT_MS,
+    encoding: "utf8",
+  });
+  return { status: result.status ?? null, stdout: result.stdout ?? "" };
+};
+
+/** `detectWindowsSystemProxy` 入参。 */
+export interface DetectSystemProxyOptions {
+  /** 目标平台（非 win32 直接返回未启用）。 */
+  platform?: NodeJS.Platform;
+  /** 环境变量表（已有代理 / 显式覆盖时跳过注册表查询）。 */
+  env?: NodeJS.ProcessEnv;
+  /** 注册表查询注入。 */
+  regQuery?: RegQuery;
+  /** 调试日志（失败/跳过时一行，不刷屏）。 */
+  log?: (message: string) => void;
+}
+
+/**
+ * 读取 Windows 系统代理（失败静默降级为未启用）。
+ * 仅当 `platform === "win32"`、env 无代理且未设 `VOICE_FFMPEG_DOWNLOAD_PROXY` 时才查注册表。
+ * @param options 注入项
+ * @returns 系统代理信息（绝不抛、绝不阻断）
+ */
+export function detectWindowsSystemProxy(options: DetectSystemProxyOptions = {}): SystemProxyInfo {
+  const platform = options.platform ?? process.platform;
+  const env = options.env ?? process.env;
+  const log = options.log ?? (() => undefined);
+  if (platform !== "win32") return { enabled: false };
+  if (env[DOWNLOAD_PROXY_ENV]?.trim()) {
+    log("[ffmpeg-heal] 已设 VOICE_FFMPEG_DOWNLOAD_PROXY，跳过系统代理查询");
+    return { enabled: false };
+  }
+  if (envProxyValue(env)) {
+    log("[ffmpeg-heal] env 已有代理，跳过系统代理查询");
+    return { enabled: false };
+  }
+  try {
+    const query = options.regQuery ?? DEFAULT_REG_QUERY;
+    const enable = query(["query", WINDOWS_INTERNET_SETTINGS_KEY, "/v", "ProxyEnable"]);
+    if (enable.status !== 0) {
+      log(`[ffmpeg-heal] 读取 ProxyEnable 失败（exit=${enable.status ?? "null"}），按未启用处理`);
+      return { enabled: false };
+    }
+    const enableText = String(enable.stdout ?? "");
+    // 未启用时不必再查 ProxyServer（少一次阻塞调用）
+    if (parseWindowsProxy(enableText).enabled !== true) return { enabled: false };
+    const server = query(["query", WINDOWS_INTERNET_SETTINGS_KEY, "/v", "ProxyServer"]);
+    if (server.status !== 0) {
+      log(`[ffmpeg-heal] 读取 ProxyServer 失败（exit=${server.status ?? "null"}），按未启用处理`);
+      return { enabled: false };
+    }
+    return parseWindowsProxy(`${enableText}\n${String(server.stdout ?? "")}`);
+  } catch (err) {
+    log(`[ffmpeg-heal] 系统代理查询异常，按未启用处理：${(err as Error).message}`);
+    return { enabled: false };
+  }
 }
 
 /** 可注入的 fs 子集（测试用；生产走 node:fs）。 */
@@ -116,7 +324,7 @@ export interface HealChildProcess {
 export type FfmpegHealSpawn = (
   command: string,
   args: readonly string[],
-  options: { cwd: string; stdio: ["ignore", "pipe", "pipe"]; windowsHide: boolean },
+  options: { cwd: string; stdio: ["ignore", "pipe", "pipe"]; windowsHide: boolean; env?: NodeJS.ProcessEnv },
 ) => HealChildProcess;
 
 /** 生产 spawn 实现。 */
@@ -201,6 +409,16 @@ export interface HealStaticDirOptions {
   spawn?: FfmpegHealSpawn;
   /** 日志（摘要行；默认静默）。 */
   log?: (message: string) => void;
+  /** 二进制「可用」判定覆盖（运行时据 `-version` 真执行结果传入：存在但不可执行 ⇒ false）。 */
+  binaryUsable?: boolean;
+  /** 真执行校验实现（默认 `probeFfmpeg`，即 memo 化的 `<bin> -version`）。 */
+  verify?: (path: string) => boolean;
+  /** 下载子进程的基础环境变量（默认 `process.env`；读取 `VOICE_FFMPEG_DOWNLOAD_PROXY` 与 env 代理）。 */
+  env?: NodeJS.ProcessEnv;
+  /** 系统代理（不传则按平台自动检测；测试可注入）。 */
+  systemProxy?: SystemProxyInfo;
+  /** 系统代理读取函数（默认 Windows 查注册表；测试可注入以断言「拷贝分支不读注册表」）。 */
+  readSystemProxy?: () => SystemProxyInfo;
 }
 
 /** 单个 `ffmpeg-static` 目录的补齐结果。 */
@@ -237,9 +455,26 @@ function runInstallScript(
   options: Required<Pick<HealStaticDirOptions, "nodePath" | "fs" | "spawn">> & {
     timeoutMs: number;
     log: (message: string) => void;
+    platform: NodeJS.Platform;
+    env: NodeJS.ProcessEnv;
+    systemProxy?: SystemProxyInfo;
+    readSystemProxy?: () => SystemProxyInfo;
   },
 ): Promise<HealStaticDirResult> {
   const { nodePath, fs, spawn: spawnFn, timeoutMs, log } = options;
+  // 代理决策与注册表读取只在真正下载时发生（拷贝分支不碰注册表）
+  const systemProxy =
+    options.systemProxy ??
+    (options.readSystemProxy
+      ? options.readSystemProxy()
+      : detectWindowsSystemProxy({ platform: options.platform, env: options.env, log }));
+  const explicitProxy = options.env[DOWNLOAD_PROXY_ENV];
+  const resolvedProxy = resolveDownloadProxy({ env: options.env, systemProxy, explicitProxy });
+  const downloadEnv = buildDownloadEnv({ env: options.env, systemProxy, explicitProxy });
+  log(
+    `[ffmpeg-heal] 下载代理 source=${resolvedProxy.source}` +
+      (resolvedProxy.proxy ? ` url=${maskProxyForLog(resolvedProxy.proxy)}` : ""),
+  );
   return new Promise<HealStaticDirResult>((resolveInstall) => {
     let child: HealChildProcess;
     try {
@@ -247,6 +482,7 @@ function runInstallScript(
         cwd: dir,
         stdio: ["ignore", "pipe", "pipe"],
         windowsHide: true,
+        env: downloadEnv,
       });
     } catch (err) {
       resolveInstall({
@@ -325,7 +561,8 @@ export async function healStaticDir(
   const log = options.log ?? (() => undefined);
   const nodePath = options.nodePath ?? process.execPath;
   try {
-    const hasBinary = fs.exists(binaryPath);
+    // `binaryUsable` 由上层据「-version 真执行」结果传入；未传时退回仅看存在性
+    const hasBinary = options.binaryUsable ?? fs.exists(binaryPath);
     const hasInstallScript = fs.exists(join(dir, FFMPEG_INSTALL_SCRIPT));
     // Node 可执行文件存在才认为能跑 install.js（测试注入的假路径走 false 分支）
     const hasNode = nodePath.length > 0 && fs.exists(nodePath);
@@ -376,6 +613,10 @@ export async function healStaticDir(
       spawn: options.spawn ?? DEFAULT_SPAWN,
       timeoutMs: options.timeoutMs ?? DEFAULT_HEAL_TIMEOUT_MS,
       log,
+      platform,
+      env: options.env ?? process.env,
+      systemProxy: options.systemProxy,
+      readSystemProxy: options.readSystemProxy,
     });
   } catch (err) {
     return {
@@ -469,17 +710,38 @@ async function ensureFfmpegUncached(options: EnsureFfmpegOptions): Promise<Ensur
     }
     const binaryName = ffmpegBinaryName(platform);
     const targetBinary = join(target, binaryName);
+    // 纯存在性不算可用：必须 `-version` 真执行通过（否则按「缺失」处理，走拷贝/重新下载）
+    const verify = options.verify ?? ((path: string) => probeFfmpeg(path));
+    const binaryUsable = fs.exists(targetBinary) && verify(targetBinary);
     const others: string[] = [];
     for (const dir of dirs) {
       if (dir === target) continue;
       const candidate = join(dir, binaryName);
-      if (fs.exists(candidate) && !others.includes(candidate)) others.push(candidate);
+      if (fs.exists(candidate) && verify(candidate) && !others.includes(candidate)) others.push(candidate);
     }
     for (const source of options.copySources ?? []) {
-      if (source !== targetBinary && fs.exists(source) && !others.includes(source)) others.push(source);
+      if (source !== targetBinary && fs.exists(source) && verify(source) && !others.includes(source)) others.push(source);
     }
-    (options.log ?? (() => undefined))(`[ffmpeg-heal] target=${target} 其它副本=${others.length}`);
-    return await healStaticDir(target, { ...options, copySources: others });
+    (options.log ?? (() => undefined))(
+      `[ffmpeg-heal] target=${target} binaryUsable=${binaryUsable} 其它副本=${others.length}`,
+    );
+    const healed = await healStaticDir(target, { ...options, copySources: others, binaryUsable });
+    if (
+      (healed.status === "ok" || healed.status === "copied" || healed.status === "installed") &&
+      healed.binaryPath !== undefined
+    ) {
+      // 文件可能刚被拷贝/下载覆盖：先清旧校验缓存再验一次
+      forgetFfmpegProbe(healed.binaryPath);
+      if (!verify(healed.binaryPath)) {
+        return {
+          status: "error",
+          action: healed.action,
+          detail: `二进制存在但 -version 校验失败：${healed.binaryPath}`,
+          binaryPath: healed.binaryPath,
+        };
+      }
+    }
+    return healed;
   } catch (err) {
     return {
       status: "error",
@@ -490,8 +752,11 @@ async function ensureFfmpegUncached(options: EnsureFfmpegOptions): Promise<Ensur
 }
 
 /**
- * 确保 ffmpeg 可用（运行时入口）：解析已可用则跳过；否则找 `ffmpeg-static` 目录，
- * 优先从同机其它副本拷贝，否则就地跑 `install.js`。
+ * 确保 ffmpeg 可用（运行时入口）：解析已可用（**真执行通过**）则跳过；否则找 `ffmpeg-static` 目录，
+ * 优先从同机其它副本拷贝，否则就地跑 `install.js`；结果路径仍要过 `-version` 真执行校验。
+ *
+ * 2026-10-28 第十九批：`FFMPEG_BIN` 未通过校验 / 未设置、随附二进制不可用时**总是**走本函数
+ * （不再「仅当全部解析失败才自愈」，也不再回落系统 PATH）。
  *
  * **每进程只尝试一次**（`memoize !== false` 时），失败结果同样缓存——避免重试风暴。
  * @param options 注入项

@@ -1,74 +1,111 @@
 /**
- * ffmpeg 可执行文件解析兜底链的离线单测（不启动 ffmpeg）。
+ * ffmpeg 可执行文件解析的离线单测（不启动真 ffmpeg，`-version` 校验一律注入）。
  *
- * 覆盖：`FFMPEG_BIN` 优先 → PATH `ffmpeg` → `ffmpeg-static`（可选依赖）→ 清晰报错（含用户引导）。
- * 通过注入 env/platform/isOnPath/staticPath/exists 覆盖各分支，避免依赖本机是否装 ffmpeg。
- * 2026-10-22：每级都做存在性校验——解析到但文件不存在（如缓存安装未跑下载脚本）→ 继续下一级。
+ * 契约（2026-10-28 第十九批，**纯自包含**）：`FFMPEG_BIN`（显式设置且 `-version` 真执行通过）
+ * → `ffmpeg-static`（存在且真执行通过）→ 抛带引导的错。**不再回落到系统 PATH**（Termux 例外）。
+ * 修复前行为：PATH 命中即用（`isOnPath("ffmpeg")` 分支排在 ffmpeg-static 之前）⇒ 下面「PATH 不得入选」
+ * 「FFMPEG_BIN 失效后不得落 PATH」两例在旧实现上必红。
  */
 
-import { test } from "node:test";
+import { beforeEach, test } from "node:test";
 import assert from "node:assert/strict";
 
 import {
   FFMPEG_ENV,
+  FFMPEG_PROBE_TIMEOUT_MS,
   buildPcmDecodeArgs,
   ffmpegInstallHints,
+  resetFfmpegProbeCache,
   resolveFfmpegPath,
 } from "../dist/voice/ffmpeg.js";
 
-test("resolveFfmpegPath：FFMPEG_BIN 最优先（压过 PATH 与 ffmpeg-static）", () => {
+/** 校验通过（退出码 0）。 */
+const OK = () => 0;
+/** 校验失败（退出码非 0）。 */
+const BAD = () => 1;
+
+beforeEach(() => {
+  resetFfmpegProbeCache();
+});
+
+test("resolveFfmpegPath：FFMPEG_BIN 最优先（存在且 -version 通过）", () => {
   const resolved = resolveFfmpegPath({
     env: { [FFMPEG_ENV]: "  /opt/ffmpeg  " },
     platform: "linux",
-    isOnPath: () => true,
     staticPath: () => "/static/ffmpeg",
     exists: () => true,
+    probe: OK,
   });
-  assert.equal(resolved, "/opt/ffmpeg", "环境变量值应去空白后直接返回");
+  assert.equal(resolved, "/opt/ffmpeg", "环境变量值应去空白后返回");
 });
 
-test("resolveFfmpegPath：FFMPEG_BIN 指向的文件不存在 → 不再盲信，落到 PATH", () => {
+test("resolveFfmpegPath：PATH 上有 ffmpeg 也不得被选中（纯自包含）", () => {
+  assert.throws(
+    () =>
+      resolveFfmpegPath({
+        env: {},
+        platform: "linux",
+        isOnPath: (bin) => bin === "ffmpeg",
+        staticPath: () => null,
+        exists: () => false,
+        probe: OK,
+      }),
+    /未找到可用的 ffmpeg/,
+    "旧实现会返回 PATH 的 `ffmpeg`（假阳性），新契约必须抛错",
+  );
+});
+
+test("resolveFfmpegPath：FFMPEG_BIN 指向不存在的文件 → 跳过并走自包含二进制（不落 PATH）", () => {
   const resolved = resolveFfmpegPath({
     env: { [FFMPEG_ENV]: "C:\\broken\\ffmpeg.exe" },
     platform: "win32",
     isOnPath: (bin) => bin === "ffmpeg",
-    staticPath: () => null,
-    exists: () => false,
+    staticPath: () => "C:\\pkg\\ffmpeg.exe",
+    exists: (path) => path === "C:\\pkg\\ffmpeg.exe",
+    probe: OK,
   });
-  assert.equal(resolved, "ffmpeg", "FFMPEG_BIN 失效时应继续下一级（PATH）");
+  assert.equal(resolved, "C:\\pkg\\ffmpeg.exe", "失效的 FFMPEG_BIN 必须跳过，且不得回落到 PATH");
 });
 
-test("resolveFfmpegPath：FFMPEG_BIN 为裸命令名且在 PATH 上 → 可用（不要求 existsSync 命中）", () => {
+test("resolveFfmpegPath：FFMPEG_BIN 存在但 -version 失败 → 视为不可用，走自包含二进制", () => {
   const resolved = resolveFfmpegPath({
-    env: { [FFMPEG_ENV]: "ffmpeg-custom" },
+    env: { [FFMPEG_ENV]: "/opt/ffmpeg" },
     platform: "linux",
-    isOnPath: (bin) => bin === "ffmpeg-custom",
-    staticPath: () => null,
-    exists: () => false,
-  });
-  assert.equal(resolved, "ffmpeg-custom");
-});
-
-test("resolveFfmpegPath：PATH 的 ffmpeg 优先于 ffmpeg-static", () => {
-  const resolved = resolveFfmpegPath({
-    env: {},
-    platform: "linux",
-    isOnPath: (bin) => bin === "ffmpeg",
     staticPath: () => "/static/ffmpeg",
     exists: () => true,
+    probe: (bin) => (bin === "/opt/ffmpeg" ? 1 : 0),
   });
-  assert.equal(resolved, "ffmpeg", "PATH 命中返回命令名，交给 spawn 解析");
+  assert.equal(resolved, "/static/ffmpeg");
 });
 
-test("resolveFfmpegPath：PATH 无、ffmpeg-static 存在则用它", () => {
-  const resolved = resolveFfmpegPath({
-    env: {},
-    platform: "win32",
-    isOnPath: () => false,
-    staticPath: () => "C:\\pkg\\ffmpeg.exe",
-    exists: () => true,
-  });
-  assert.equal(resolved, "C:\\pkg\\ffmpeg.exe");
+test("resolveFfmpegPath：裸命令名 FFMPEG_BIN 也需真执行通过", () => {
+  assert.equal(
+    resolveFfmpegPath({
+      env: { [FFMPEG_ENV]: "ffmpeg-custom" },
+      platform: "linux",
+      staticPath: () => null,
+      exists: () => false,
+      probe: (bin) => (bin === "ffmpeg-custom" ? 0 : 1),
+    }),
+    "ffmpeg-custom",
+  );
+});
+
+test("resolveFfmpegPath：ffmpeg-static 存在但 -version 失败 → 不可用，抛错点名校验失败", () => {
+  assert.throws(
+    () =>
+      resolveFfmpegPath({
+        env: {},
+        platform: "linux",
+        staticPath: () => "/static/ffmpeg",
+        exists: () => true,
+        probe: BAD,
+      }),
+    (err) =>
+      /未找到可用的 ffmpeg/.test(err.message) &&
+      /-version 校验失败/.test(err.message) &&
+      err.message.includes(FFMPEG_ENV),
+  );
 });
 
 test("resolveFfmpegPath：ffmpeg-static 解析到但文件缺失（未跑下载脚本）→ 抛带引导的错", () => {
@@ -77,15 +114,14 @@ test("resolveFfmpegPath：ffmpeg-static 解析到但文件缺失（未跑下载�
       resolveFfmpegPath({
         env: {},
         platform: "win32",
-        isOnPath: () => false,
         staticPath: () => "C:\\pkg\\ffmpeg.exe",
         exists: () => false,
+        probe: OK,
       }),
     (err) =>
       /未找到可用的 ffmpeg/.test(err.message) &&
       /随附二进制缺失/.test(err.message) &&
       err.message.includes(FFMPEG_ENV) &&
-      /winget/.test(err.message) &&
       /重装插件依赖/.test(err.message),
   );
 });
@@ -94,18 +130,66 @@ test("resolveFfmpegPath：win32 防御——静态路径缺 .exe 后缀但补全
   const resolved = resolveFfmpegPath({
     env: {},
     platform: "win32",
-    isOnPath: () => false,
     staticPath: () => "C:\\pkg\\ffmpeg",
     exists: (path) => path === "C:\\pkg\\ffmpeg.exe",
+    probe: OK,
   });
   assert.equal(resolved, "C:\\pkg\\ffmpeg.exe");
 });
 
-test("resolveFfmpegPath：三者都无 → 抛错并附当前平台安装提示", () => {
+test("resolveFfmpegPath：真执行校验有 memo（同进程第二次不重复 spawn）", () => {
+  let calls = 0;
+  const probe = () => {
+    calls += 1;
+    return 0;
+  };
+  const options = {
+    env: {},
+    platform: "linux",
+    staticPath: () => "/static/ffmpeg",
+    exists: () => true,
+    probe,
+  };
+  assert.equal(resolveFfmpegPath(options), "/static/ffmpeg");
+  assert.equal(resolveFfmpegPath(options), "/static/ffmpeg");
+  assert.equal(calls, 1, "第二次解析必须命中校验 memo");
+  assert.equal(FFMPEG_PROBE_TIMEOUT_MS, 3000);
+});
+
+test("resolveFfmpegPath：Termux 例外——用系统 ffmpeg，不触发自包含下载", () => {
+  let staticCalls = 0;
+  const resolved = resolveFfmpegPath({
+    env: { TERMUX_VERSION: "0.118" },
+    platform: "linux",
+    isOnPath: () => true,
+    staticPath: () => {
+      staticCalls += 1;
+      return "/static/ffmpeg";
+    },
+    exists: () => false,
+    probe: () => {
+      throw new Error("Termux 不做自包含真执行校验");
+    },
+  });
+  assert.equal(resolved, "ffmpeg");
+  assert.equal(staticCalls, 0, "Termux 不得走 ffmpeg-static（无 Android 预编译二进制）");
+});
+
+test("resolveFfmpegPath：三者都无 → 抛错（不引导安装系统 ffmpeg，改引导自包含修复）", () => {
   assert.throws(
     () =>
-      resolveFfmpegPath({ env: {}, platform: "linux", isOnPath: () => false, staticPath: () => null, exists: () => false }),
-    /未找到可用的 ffmpeg/,
+      resolveFfmpegPath({
+        env: {},
+        platform: "linux",
+        isOnPath: () => false,
+        staticPath: () => null,
+        exists: () => false,
+        probe: OK,
+      }),
+    (err) =>
+      /未找到可用的 ffmpeg/.test(err.message) &&
+      /HTTPS_PROXY/.test(err.message) &&
+      /重装插件依赖/.test(err.message),
   );
   const win = ffmpegInstallHints("win32", {});
   assert.match(win, /winget/);
@@ -123,6 +207,9 @@ test("resolveFfmpegPath / ffmpegInstallHints：Termux 优先给 pkg install ffmp
       isOnPath: () => false,
       staticPath: () => null,
       exists: () => false,
+      probe: () => {
+        throw new Error("Termux 不做自包含真执行校验");
+      },
     });
     assert.fail("应当抛错");
   } catch (err) {

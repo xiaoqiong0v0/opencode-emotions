@@ -40,7 +40,7 @@ import {
   monitorSourceFallbackGuidance,
   noAudioDeviceGuidance,
 } from "../voice/guidance.js";
-import { FFMPEG_ENV, resolveFfmpegPath } from "../voice/ffmpeg.js";
+import { FFMPEG_ENV, probeFfmpeg } from "../voice/ffmpeg.js";
 import { ensureFfmpegBinary } from "../voice/ffmpeg-heal.js";
 import { LEVEL_EVENT_INTERVAL_MS, rmsToLevel } from "../voice/meter.js";
 import { annotationForVoiceEmotion } from "../voice/mapping.js";
@@ -235,31 +235,34 @@ function createOutput(json: boolean): RuntimeOutput {
 /**
  * 启动前确保 ffmpeg 可用（**在枚举设备之前**调用）。
  *
- * 口径：
- * - `FFMPEG_BIN` / PATH / ffmpeg-static 任一已可用 ⇒ **完全跳过自愈**（不联网、不耗时）；
- * - 解析失败 ⇒ 发 NDJSON `progress` → `ensureFfmpegBinary()`（每进程一次）；
- * - 成功（ok/copied/installed）⇒ 进程内把 `FFMPEG_BIN` 指向补齐后的路径（不污染用户持久配置），继续枚举；
- * - 失败（unavailable/timeout/error）⇒ 抛错（main 统一发 `error` 并退出码 1），文案带原因 + 现有引导。
- * - Termux 走系统 ffmpeg（`ffmpeg-static` 是 Linux x64 预编译，不适用），直接跳过。
+ * 口径（2026-10-28 第十九批：**纯自包含**，不回落系统 PATH）：
+ * - Termux 例外：用系统 `ffmpeg`（无 Android 预编译二进制），直接跳过（不自检、不下载）；
+ * - `FFMPEG_BIN` 显式设置且 `-version` 真执行通过 ⇒ 视为人工逃生门，直接跳过自检（不联网、不耗时）；
+ * - **其余情况一律**发 NDJSON `progress` → `ensureFfmpegBinary()`（每进程一次）：
+ *   ① 随附二进制存在且 `-version` 通过 ⇒ 直接用（不 spawn install.js）；
+ *   ② 同机其它副本（校验通过）⇒ 拷贝后验证；
+ *   ③ 在包目录跑 `install.js` 下载 ⇒ 验证；
+ *   ④ 全失败 ⇒ 抛错（main 统一发 `error` 并退出码 1），文案带原因 + 明确引导。
+ * - 成功（ok/copied/installed）⇒ 进程内把 `FFMPEG_BIN` 指向补齐后的路径（不污染用户持久配置），继续枚举。
  * @param out 输出通道
- * @throws Error 自愈失败（含原因与引导）
+ * @throws Error 自检失败（含原因与引导）
  */
 async function prepareFfmpeg(out: RuntimeOutput): Promise<void> {
   if (isTermux()) return;
-  if (process.env[FFMPEG_FORCE_HEAL_ENV] !== "1") {
-    try {
-      const existing = resolveFfmpegPath();
-      out.info(`[ffmpeg] 已可用（${existing}），跳过自愈`);
-      return;
-    } catch {
-      // 解析失败：进入自愈
-    }
+  const force = process.env[FFMPEG_FORCE_HEAL_ENV] === "1";
+  const override = process.env[FFMPEG_ENV]?.trim();
+  if (!force && override && probeFfmpeg(override)) {
+    out.info(`[ffmpeg] 使用 FFMPEG_BIN（${override}），跳过自检`);
+    return;
   }
   out.event({ type: "progress", stage: "ffmpeg", message: "正在准备 ffmpeg…" });
-  const result = await ensureFfmpegBinary({ log: (message) => out.info(message) });
+  const result = await ensureFfmpegBinary({
+    log: (message) => out.info(message),
+    verify: (path) => probeFfmpeg(path),
+  });
   if (result.status === "ok" || result.status === "copied" || result.status === "installed") {
     if (result.binaryPath) process.env[FFMPEG_ENV] = result.binaryPath;
-    out.info(`[ffmpeg] 自愈完成（${result.status}）：${result.detail}`);
+    out.info(`[ffmpeg] 自检完成（${result.status}）：${result.detail}`);
     return;
   }
   throw new Error(

@@ -16,15 +16,35 @@ import {
   noAudioDeviceGuidance,
 } from "../dist/voice/guidance.js";
 
-test("ffmpegMissingGuidance：三类修复方式齐全，关键信息在前 120 字符内", () => {
+test("ffmpegMissingGuidance：三类修复方式齐全（纯自包含口径），关键信息在前 120 字符内", () => {
   const msg = ffmpegMissingGuidance({ platform: "win32", env: {} });
   assert.match(msg, /未找到可用的 ffmpeg/);
   assert.match(msg, /FFMPEG_BIN/);
-  assert.match(msg, /winget install Gyan\.FFmpeg/);
+  // 2026-10-28 第十九批：不再引导安装系统 ffmpeg（非 Termux 不读 PATH），改引导代理重下/重装依赖
+  assert.match(msg, /HTTPS_PROXY/);
   assert.match(msg, /重装插件依赖/);
+  assert.equal(/winget install/.test(msg), false, "不得再引导 PATH 上的系统 ffmpeg");
   // toast 口径：哪缺 + 怎么配（环境变量）在前 120 字符
   assert.match(msg.slice(0, 120), /未找到可用的 ffmpeg/);
   assert.match(msg.slice(0, 120), /FFMPEG_BIN/);
+});
+
+test("ffmpegMissingGuidance：override 存在但不可执行 → 文案点名 -version 校验失败", () => {
+  const msg = ffmpegMissingGuidance({
+    platform: "linux",
+    env: {},
+    override: "/opt/ffmpeg",
+    overrideProblem: "unusable",
+  });
+  assert.match(msg, /\/opt\/ffmpeg/);
+  assert.match(msg, /-version 校验失败/);
+  assert.match(msg.slice(0, 120), /-version 校验失败/);
+});
+
+test("ffmpegMissingGuidance：Termux 仍给 pkg install ffmpeg", () => {
+  const msg = ffmpegMissingGuidance({ platform: "linux", env: { TERMUX_VERSION: "0.118" } });
+  assert.match(msg, /pkg install ffmpeg/);
+  assert.match(msg, /FFMPEG_BIN/);
 });
 
 test("ffmpegMissingGuidance：override 指向不存在的文件 → 文案点名该路径", () => {
@@ -41,7 +61,7 @@ test("ffmpegMissingGuidance：override 指向不存在的文件 → 文案点名
 test("ffmpegMissingGuidance：ffmpeg-static 二进制缺失 → 文案点名随附二进制未下载", () => {
   const msg = ffmpegMissingGuidance({ platform: "linux", env: {}, staticProblem: "missing-file" });
   assert.match(msg, /随附二进制缺失/);
-  assert.match(msg, /apt install ffmpeg/);
+  assert.match(msg, /HTTPS_PROXY/);
 });
 
 test("ffmpegLaunchFailedGuidance：带可执行路径与底层原因", () => {

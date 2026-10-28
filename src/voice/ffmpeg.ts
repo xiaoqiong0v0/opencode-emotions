@@ -1,33 +1,39 @@
 /**
  * ffmpeg 可执行文件解析与音频转码工具（供采集复用）。
  *
- * - `resolveFfmpegPath()`：按 **`FFMPEG_BIN` → PATH 的 `ffmpeg` → `ffmpeg-static`（可选依赖）** 顺序解析，
- *   每一级都做**存在性校验**（`existsSync`；Windows 兼容 `.exe` 后缀补全）——解析到但文件不存在
- *   （典型：缓存安装未跑 ffmpeg-static 的 install 下载脚本，只有包文件没有二进制）→ **继续下一级**，
- *   全失败才抛带**用户引导**的清晰错误（文案见 `voice/guidance.ts`）。
- *   `ffmpeg-static` 为 `optionalDependencies`，故用**惰性 + try/catch** 加载——未安装时不能影响插件启动
- *   （尤其 Termux 上不会装该原生包）。
+ * - `resolveFfmpegPath()`：解析顺序（**纯自包含**，2026-10-28 第十九批）
+ *   1. `FFMPEG_BIN` —— 显式设置的**人工逃生门**（离线/内网），且必须通过真执行校验；
+ *   2. `ffmpeg-static` 随包二进制（`optionalDependencies`，惰性 + try/catch 加载）—— 存在且通过真执行校验；
+ *   3. 失败 —— 抛带**用户引导**的清晰错误（文案见 `voice/guidance.ts`）。
+ *   **不再回落到系统 PATH**（旧的 `isOnPath("ffmpeg")` 分支已删除；`commandExists` 仅 Termux 例外路径仍在用）。
+ *   **可用性判定＝真执行**：`spawnSync(<bin>, ["-version"])`（`shell:false`、3s 超时、退出码 0），
+ *   结果按路径 memo（每进程一次）——修掉「文件存在 / PATH 命中但不可执行」的假阳性。
+ *   **Termux 例外**：无 Android 预编译二进制，仍用系统 `ffmpeg`（PATH），缺失时提示 `pkg install ffmpeg`。
+ *   *为何用 `spawnSync` 而非异步 `spawn`*：`resolveFfmpegPath` 是同步 API（被 `listAudioDevices` /
+ *   `MicCapture.start` 等同步路径调用），改异步会波及全部采集调用方；memo 后每进程至多阻塞一次。
  * - `decodeToPcm()`：把任意音频字节（含 Termux 分块录音的 opus/aac）转成 16k 单声道 s16le PCM，喂 ASR。
  *
  * 纯 Node，用 `spawn` 走管道，不落中间文件。
  */
 
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { createRequire } from "node:module";
 import { isAbsolute } from "node:path";
 
 import { ffmpegInstallHints, ffmpegMissingGuidance } from "./guidance.js";
-import { commandExists } from "./platform.js";
+import { commandExists, isTermux } from "./platform.js";
 
 export { ffmpegInstallHints };
 
 const require = createRequire(import.meta.url);
 
-/** ffmpeg 路径环境变量名（用户自备 ffmpeg 时优先使用）。 */
+/** ffmpeg 路径环境变量名（用户自备 ffmpeg 时的显式逃生门）。 */
 export const FFMPEG_ENV = "FFMPEG_BIN";
 /** 转码超时（毫秒）。 */
 export const DECODE_TIMEOUT_MS = 15000;
+/** `-version` 真执行校验超时（毫秒）。 */
+export const FFMPEG_PROBE_TIMEOUT_MS = 3000;
 
 /** 缓存的 `ffmpeg-static` 路径（`undefined` = 尚未加载；`null` = 未安装/不可用）。 */
 let ffmpegStaticCache: string | null | undefined;
@@ -49,6 +55,67 @@ function loadFfmpegStatic(): string | null {
 }
 
 /**
+ * 真执行校验函数签名：执行 `<bin> -version`，返回退出码（启动失败/超时返回负值）。
+ */
+export type FfmpegProbe = (bin: string) => number;
+
+/**
+ * 执行 `<bin> -version` 探测可执行性（生产默认实现）。
+ *
+ * `shell:false`（不经过 shell）、3s 超时、stdout/stderr 全部丢弃但照常捕获管道（防子进程写满阻塞）。
+ * @param bin 候选可执行路径/命令名
+ * @returns 退出码；spawn 失败（ENOENT/EACCES）或超时为 -1
+ */
+function runVersionProbe(bin: string): number {
+  try {
+    const result = spawnSync(bin, ["-version"], {
+      shell: false,
+      windowsHide: true,
+      timeout: FFMPEG_PROBE_TIMEOUT_MS,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    if (result.error) return -1;
+    return typeof result.status === "number" ? result.status : -1;
+  } catch {
+    return -1;
+  }
+}
+
+/** 真执行校验结果 memo（key=可执行路径；`true`/`false` 都缓存，每进程只 spawn 一次）。 */
+const probeCache = new Map<string, boolean>();
+
+/**
+ * 复位真执行校验 memo（**仅供测试**；生产不要调用）。
+ */
+export function resetFfmpegProbeCache(): void {
+  probeCache.clear();
+}
+
+/**
+ * 清除单个路径的校验缓存（**文件被替换/重新下载后必须清**，否则会命中旧结论）。
+ * @param bin 可执行路径
+ */
+export function forgetFfmpegProbe(bin: string): void {
+  probeCache.delete(bin);
+}
+
+/**
+ * 判断 ffmpeg 可执行文件是否真正可用：真执行 `<bin> -version` 且退出码 0。
+ *
+ * 结果按路径 memo（同一进程第二次直接命中缓存，不再 spawn）。
+ * @param bin 可执行路径/命令名
+ * @param probe 执行实现（测试可注入；仍走 memo）
+ * @returns 可用 true
+ */
+export function probeFfmpeg(bin: string, probe: FfmpegProbe = runVersionProbe): boolean {
+  const cached = probeCache.get(bin);
+  if (cached !== undefined) return cached;
+  const ok = probe(bin) === 0;
+  probeCache.set(bin, ok);
+  return ok;
+}
+
+/**
  * `resolveFfmpegPath` 的可注入选项（便于离线单测，不影响生产默认行为）。
  */
 export interface ResolveFfmpegOptions {
@@ -56,73 +123,128 @@ export interface ResolveFfmpegOptions {
   env?: NodeJS.ProcessEnv;
   /** 目标平台；默认 `process.platform`。 */
   platform?: NodeJS.Platform;
-  /** PATH 探测函数；默认按 env/platform 走 `commandExists`。 */
+  /** PATH 探测函数（**仅 Termux 例外路径**使用）；默认按 env/platform 走 `commandExists`。 */
   isOnPath?: (bin: string) => boolean;
   /** 随附二进制解析函数；默认惰性 `ffmpeg-static`。 */
   staticPath?: () => string | null;
   /** 文件存在性检查；默认 `fs.existsSync`（测试可注入以覆盖「路径在但文件缺失」分支）。 */
   exists?: (path: string) => boolean;
+  /** 真执行校验实现（默认走 memo 化的 `-version` 探测）。 */
+  probe?: FfmpegProbe;
+  /** Termux 判定；默认 `platform.ts` 的 `isTermux`。 */
+  termux?: (env: NodeJS.ProcessEnv) => boolean;
 }
 
 /**
- * 判断候选 ffmpeg 路径是否真正可用：文件存在（Windows 兼容 `.exe` 后缀补全）或裸命令名在 PATH 上。
- * @param candidate 候选路径/命令名
+ * 存在性命中（Windows 兼容 `.exe` 后缀补全）。
+ * @param candidate 候选路径
  * @param exists 存在性检查
  * @param platform 目标平台
- * @param isOnPath PATH 探测（仅裸命令名使用）
- * @returns 可用 true
+ * @returns 命中的完整路径；未命中 null
  */
-function isUsableBinary(
+function existingCandidate(
   candidate: string,
   exists: (path: string) => boolean,
   platform: NodeJS.Platform,
-  isOnPath: (bin: string) => boolean,
-): boolean {
-  if (exists(candidate)) return true;
-  // Windows：用户/工具可能省略 `.exe` 后缀，补全后再验一次
-  if (platform === "win32" && !candidate.toLowerCase().endsWith(".exe") && exists(`${candidate}.exe`)) return true;
-  // 裸命令名（无路径分隔符）交给 PATH 探测（PATHEXT 由 commandExists 处理）
-  const hasSep = isAbsolute(candidate) || candidate.includes("/") || candidate.includes("\\");
-  if (!hasSep && isOnPath(candidate)) return true;
-  return false;
+): string | null {
+  if (exists(candidate)) return candidate;
+  if (platform === "win32" && !candidate.toLowerCase().endsWith(".exe") && exists(`${candidate}.exe`)) {
+    return `${candidate}.exe`;
+  }
+  return null;
 }
 
 /**
- * 解析 ffmpeg 可执行文件路径，顺序：`FFMPEG_BIN` → PATH `ffmpeg` → `ffmpeg-static`。
- *
- * 每一级都校验真实可用性；解析到但文件不存在 → **继续下一级**，全失败才抛错（含用户引导文案）。
- * @param options 可注入选项（env/platform/探测/存在性，缺省用生产默认）
- * @returns ffmpeg 可执行文件路径（PATH 命中时返回命令名 `ffmpeg`，交给 spawn 解析）
- * @throws Error 三者都不可用（错误文本含去哪配/怎么配的中文引导）
+ * 是否含路径分隔符（裸命令名交给 OS 按 PATH 解析）。
+ * @param candidate 候选值
+ * @returns 含分隔符/绝对路径 true
  */
-export function resolveFfmpegPath(options: ResolveFfmpegOptions = {}): string {
-  const env = options.env ?? process.env;
-  const platform = options.platform ?? process.platform;
-  const isOnPath = options.isOnPath ?? ((bin: string) => commandExists(bin, env, platform));
-  const exists = options.exists ?? existsSync;
+function hasPathSeparator(candidate: string): boolean {
+  return isAbsolute(candidate) || candidate.includes("/") || candidate.includes("\\");
+}
 
-  const override = env[FFMPEG_ENV]?.trim();
-  if (override && isUsableBinary(override, exists, platform, isOnPath)) {
-    // Windows 补全后缀的命中返回完整文件名（spawn 直接可用）
-    if (platform === "win32" && !exists(override) && exists(`${override}.exe`)) return `${override}.exe`;
-    return override;
+/**
+ * Termux 例外：系统 `ffmpeg`（PATH），无需自包含二进制、也不做真执行校验。
+ * @param override `FFMPEG_BIN` 原始值（已 trim，可能为空）
+ * @param context 注入项
+ * @returns 可执行路径/命令名
+ * @throws Error 系统 ffmpeg 不可用（文案提示 `pkg install ffmpeg`）
+ */
+function resolveTermuxFfmpeg(
+  override: string | undefined,
+  context: {
+    env: NodeJS.ProcessEnv;
+    platform: NodeJS.Platform;
+    exists: (path: string) => boolean;
+    isOnPath: (bin: string) => boolean;
+  },
+): string {
+  const { env, platform, exists, isOnPath } = context;
+  if (override) {
+    const hit = existingCandidate(override, exists, platform);
+    if (hit) return hit;
+    if (!hasPathSeparator(override) && isOnPath(override)) return override;
   }
   if (isOnPath("ffmpeg")) return "ffmpeg";
-
-  const staticPath = (options.staticPath ?? loadFfmpegStatic)();
-  if (staticPath) {
-    if (exists(staticPath)) return staticPath;
-    if (platform === "win32" && !staticPath.toLowerCase().endsWith(".exe") && exists(`${staticPath}.exe`)) {
-      return `${staticPath}.exe`;
-    }
-  }
   throw new Error(
     ffmpegMissingGuidance({
       platform,
       env,
       override: override || undefined,
       overrideProblem: override ? "missing-file" : undefined,
-      staticProblem: staticPath ? "missing-file" : undefined,
+    }),
+  );
+}
+
+/**
+ * 解析 ffmpeg 可执行文件路径（**纯自包含**）。
+ *
+ * 顺序：`FFMPEG_BIN`（显式且真执行通过）→ `ffmpeg-static`（存在且真执行通过）→ 抛错。
+ * **不回落系统 PATH**（Termux 例外：走系统 `ffmpeg`）。
+ * @param options 可注入选项（env/platform/存在性/真执行/随附路径，缺省用生产默认）
+ * @returns ffmpeg 可执行文件绝对路径（Termux 下可能是命令名 `ffmpeg`）
+ * @throws Error 均不可用（错误文本含去哪配/怎么配的中文引导）
+ */
+export function resolveFfmpegPath(options: ResolveFfmpegOptions = {}): string {
+  const env = options.env ?? process.env;
+  const platform = options.platform ?? process.platform;
+  const exists = options.exists ?? existsSync;
+  const override = env[FFMPEG_ENV]?.trim();
+
+  if ((options.termux ?? isTermux)(env)) {
+    return resolveTermuxFfmpeg(override, {
+      env,
+      platform,
+      exists,
+      isOnPath: options.isOnPath ?? ((bin: string) => commandExists(bin, env, platform)),
+    });
+  }
+
+  const probe = options.probe;
+  // ① 显式逃生门：文件存在（或裸命令名）且 `-version` 真执行通过
+  if (override) {
+    const hit = existingCandidate(override, exists, platform);
+    const candidate = hit ?? (hasPathSeparator(override) ? null : override);
+    if (candidate && probeFfmpeg(candidate, probe)) return candidate;
+  }
+
+  // ② 随包自包含二进制：存在且 `-version` 真执行通过
+  const staticPath = (options.staticPath ?? loadFfmpegStatic)();
+  const staticHit = staticPath ? existingCandidate(staticPath, exists, platform) : null;
+  if (staticHit && probeFfmpeg(staticHit, probe)) return staticHit;
+
+  // ③ 失败（不回落 PATH）
+  throw new Error(
+    ffmpegMissingGuidance({
+      platform,
+      env,
+      override: override || undefined,
+      overrideProblem: override ? (existingCandidate(override, exists, platform) ? "unusable" : "missing-file") : undefined,
+      staticProblem: staticPath
+        ? existingCandidate(staticPath, exists, platform)
+          ? "unusable"
+          : "missing-file"
+        : undefined,
     }),
   );
 }
