@@ -23,8 +23,8 @@ const RUNTIME_SCRIPT_NAME = "voice-runtime.js";
 export const RUNTIME_RELATIVE_TO_SELF: readonly string[] = ["runtime", RUNTIME_SCRIPT_NAME];
 /** 相对 **cwd** 的运行时脚本路径段（仅兜底：cwd 不定正是历史根因）。 */
 export const RUNTIME_RELATIVE_TO_CWD: readonly string[] = ["dist", "runtime", RUNTIME_SCRIPT_NAME];
-/** stderr 摘要的最大长度（toast 用；超出截断加省略号）。 */
-export const STDERR_SUMMARY_MAX = 160;
+/** stderr / 错误消息摘要的最大长度（toast 用；超长截断中部、保留首尾）。 */
+export const STDERR_SUMMARY_MAX = 300;
 
 /** 脚本解析来源：`env`=环境变量覆盖、`self`=插件产物自身位置、`cwd`=工作目录兜底、`none`=候选都不存在。 */
 export type RuntimeScriptSource = "env" | "self" | "cwd" | "none";
@@ -122,8 +122,8 @@ export function resolveRuntimeScript(input: ResolveRuntimeScriptInput): RuntimeS
  * 从子进程 stderr 里挑**最有信息量的一行**用于 toast。
  *
  * Node 崩溃输出的末行是版本横幅（`Node.js v24.16.0`），旧实现只取末行 ⇒ 用户只看到版本号。
- * 现口径：优先含错误标记的行（`Cannot find module` 等）→ 其次首个非噪声行 → 最后退化首行；
- * 全量 stderr 由调用方留存于日志。
+ * 现口径（2026-10-30）：取**最后一条含错误关键字的行**（真正原因通常在末尾）；没有命中就取
+ * **最后一行**（不再取首个非噪声行——采集统计在上、失败原因在下）。全量 stderr 由调用方留存于日志。
  * @param stderr stderr 缓冲文本（可含多行）
  * @param maxLength 摘要最大长度（默认 {@link STDERR_SUMMARY_MAX}）
  * @returns 单行摘要；空输入返回空串
@@ -131,13 +131,73 @@ export function resolveRuntimeScript(input: ResolveRuntimeScriptInput): RuntimeS
 export function pickStderrSummary(stderr: string, maxLength: number = STDERR_SUMMARY_MAX): string {
   const lines = toLines(stderr);
   if (lines.length === 0) return "";
-  const errorLine = lines.find((line) => STDERR_ERROR_MARKERS.some((marker) => line.toLowerCase().includes(marker)));
-  const chosen = errorLine ?? lines.find((line) => !isNoiseLine(line)) ?? lines[0];
-  return chosen.length > maxLength ? `${chosen.slice(0, maxLength)}…` : chosen;
+  let chosen: string | undefined;
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    const line = lines[index];
+    // 跳过 Node 错误对象的属性行（`code: 'MODULE_NOT_FOUND',` 也含错误标记，但不是给用户看的原因）
+    if (/^(code|errno|syscall|path|url|stack)\s*:/i.test(line)) continue;
+    const lower = line.toLowerCase();
+    if (STDERR_ERROR_MARKERS.some((marker) => lower.includes(marker))) {
+      chosen = line;
+      break;
+    }
+  }
+  return truncateMiddle(chosen ?? lines[lines.length - 1], maxLength);
 }
 
-/** stderr 里优先采信的错误标记（小写包含匹配）。 */
+/** `summarizeRuntimeFailure` 的入参（全部可空；调用方按实际拿到的信息填）。 */
+export interface RuntimeFailureSummaryInput {
+  /** 子进程 stderr 缓冲文本（可多行）。 */
+  stderr: string;
+  /** 已解析到的 NDJSON `error` 事件 message（**优先级最高**）。 */
+  errorMessage?: string | null;
+  /** 退出码（仅用于诊断日志，不参与文案拼接）。 */
+  code?: number | null;
+}
+
+/**
+ * 汇总「运行时为什么退出」给用户看的一句话。
+ *
+ * 优先级（2026-10-30 第二十一批）：
+ * 1. NDJSON `error` 事件自带的 `message`（运行时已经写好了可操作文案，最准确）；
+ * 2. stderr 中**最后一条**含错误关键字的行；
+ * 3. stderr **最后一行**（fallback，仍比固定截前 120 字符有用）。
+ * 超长按 {@link truncateMiddle} 保留首尾（错误信息常在尾部）。
+ * @param input 入参见 {@link RuntimeFailureSummaryInput}
+ * @param maxLength 摘要最大长度（默认 {@link STDERR_SUMMARY_MAX}）
+ * @returns 单行摘要；没有任何信息时为空串
+ */
+export function summarizeRuntimeFailure(
+  input: RuntimeFailureSummaryInput,
+  maxLength: number = STDERR_SUMMARY_MAX,
+): string {
+  const fromEvent = typeof input.errorMessage === "string" ? input.errorMessage.trim() : "";
+  if (fromEvent.length > 0) return truncateMiddle(fromEvent, maxLength);
+  return pickStderrSummary(input.stderr, maxLength);
+}
+
+/**
+ * 超长文本**保留首尾、截断中部**（错误关键字可能在开头「错误：」也可能在结尾具体原因）。
+ * @param text 原始单行文本
+ * @param maxLength 允许的最大长度（不含省略号）
+ * @returns 截断后的文本
+ */
+function truncateMiddle(text: string, maxLength: number): string {
+  if (maxLength <= 0 || text.length <= maxLength) return text;
+  const headLength = Math.max(1, Math.floor(maxLength * 0.4));
+  const tailLength = Math.max(1, maxLength - headLength);
+  return `${text.slice(0, headLength)}…${text.slice(-tailLength)}`;
+}
+
+/** stderr 里优先采信的错误标记（小写包含匹配；中英文并列，兼容运行时中文错误行）。 */
 const STDERR_ERROR_MARKERS: readonly string[] = [
+  "错误",
+  "失败",
+  "无法",
+  "未检测到",
+  "error",
+  "failed",
+  "cannot",
   "cannot find module",
   "cannot find package",
   "cannot use import statement",
@@ -174,21 +234,4 @@ function toLines(text: string): string[] {
     .split(/\r?\n/)
     .map((line) => line.trim())
     .filter((line) => line.length > 0);
-}
-
-/**
- * 判断是否为无信息量的框架行（Node 内部路径、版本横幅、`^`、`at ...` 栈帧、缩进的属性行等）。
- * @param line 已 trim 的行
- * @returns 是否噪声
- */
-function isNoiseLine(line: string): boolean {
-  if (/^node:/i.test(line)) return true;
-  if (/^node\.js v/i.test(line)) return true;
-  if (/^\^+$/.test(line)) return true;
-  if (/^at\s/i.test(line)) return true;
-  if (/^require stack:/i.test(line)) return true;
-  if (/^throw\b/i.test(line)) return true;
-  // Node 错误对象展开的属性行（`code: 'MODULE_NOT_FOUND',` 等）：已被 trim，形态是 key: value
-  if (/^(code|errno|syscall|path|url|stack)\s*:/i.test(line)) return true;
-  return false;
 }

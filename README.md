@@ -195,7 +195,7 @@ node dist/cli/emotions-cli.js speak --text "你好" --emotion happy --background
 
 | 键 | 默认值 | 含义 | 环境变量 |
 |---|---|---|---|
-| `uiLanguage` | `en` | **TUI UI 文案**语言：`zh` / `en`。用于槽位指示、toast、命令标题（改后重启 opencode 生效）；缺省回退旧键 `language` | `VOICE_UI_LANGUAGE`（旧名 `VOICE_LANGUAGE` 兜底） |
+| `uiLanguage` | `en` | **TUI UI 文案**语言：`zh` / `en`。用于槽位指示、toast、命令标题与**运行时错误/警告提示**（错误码稳定，文案按此语言渲染；改后重启 opencode 生效）；缺省回退旧键 `language` | `VOICE_UI_LANGUAGE`（旧名 `VOICE_LANGUAGE` 兜底） |
 | `toolLanguage` | `en` | **工具文案**语言：`zh` / `en`。用于 `emotions_cli` 工具描述（插件加载时本地化）与 `emotions-cli --help`；缺省回退旧键 `language` | `VOICE_TOOL_LANGUAGE`（旧名 `VOICE_LANGUAGE` 兜底） |
 | `device` | `""` | 音频输入设备（Linux 用 pulse source 名，Windows 用 dshow 友好名）；**未指定时**：Linux 取 `pactl get-default-source`（失败回退非 `.monitor` 真实输入源）；Windows 取 ffmpeg dshow 枚举第一条（dshow 无 default 语义，建议显式指定）；Termux 用系统 ffmpeg 默认 | `VOICE_DEVICE` |
 | `asr.provider` | `aliyun-qwen` | ASR 预设，分两类传输——**stream**（WebSocket 实时）：`aliyun-qwen`(realtime,16k,7类情绪) / `aliyun-8k`(inference,8k,3类) / `aliyun-v2`(inference,16k,无情绪)；**segment**（整段音频→HTTP→文本，本地能量静音切段）：`aliyun-qwen-file`(qwen3-asr-flash 同步,16k,7类情绪) / `mimo`(mimo-v2.5-asr,16k,无情绪) | `VOICE_ASR_PROVIDER` |
@@ -228,7 +228,7 @@ node dist/cli/emotions-cli.js speak --text "你好" --emotion happy --background
 
 自定义配置目录：环境变量 `EMOTIONS_CONFIG_DIR`（兼容旧名 `VOICE_CONFIG_DIR`，两者同时设置时新名优先）。
 
-**多语言（i18n）**：文案语言拆为两个独立键——`uiLanguage`（TUI 槽位指示/toast/命令标题）与 `toolLanguage`（**工具描述**，插件加载时本地化 + `emotions-cli --help`）；均 `zh` / `en`（内置默认 `en`）。旧键 `language` 向后兼容：新键缺 → 用 `language` → 再缺用 `en`（环境变量同理：`VOICE_UI_LANGUAGE`/`VOICE_TOOL_LANGUAGE` 缺省时旧名 `VOICE_LANGUAGE` 兜底两者）。词表集中在 `src/lib/i18n.ts`（新增语言只需在 `LANGUAGES` 与 `PHRASES` 各加一项，类型会强制补齐全部键）。
+**多语言（i18n）**：文案语言拆为两个独立键——`uiLanguage`（TUI 槽位指示/toast/命令标题/**错误与警告提示**）与 `toolLanguage`（**工具描述**，插件加载时本地化 + `emotions-cli --help`）；均 `zh` / `en`（内置默认 `en`）。运行时错误以稳定 `code` 上报，用户可见文案按 `uiLanguage` 渲染（日志保留内部原文）；`en` 下不会拼接中文详情。旧键 `language` 向后兼容：新键缺 → 用 `language` → 再缺用 `en`（环境变量同理：`VOICE_UI_LANGUAGE`/`VOICE_TOOL_LANGUAGE` 缺省时旧名 `VOICE_LANGUAGE` 兜底两者）。词表集中在 `src/lib/i18n.ts`（新增语言只需在 `LANGUAGES` 与 `PHRASES` 各加一项，类型会强制补齐全部键）。
 
 **抗噪**：阿里云无独立降噪参数，抗噪主要靠调高 `vad.threshold`（默认已从 0.2 调到 **0.5**）。`asr.language` 留空走服务端自动语种检测，即可多语言。
 
@@ -261,6 +261,19 @@ node dist/cli/emotions-cli.js speak --text "你好" --emotion happy --background
   - **采集（ASR）不可用**：`ffmpeg-static` 是 **Linux x64 预编译**二进制，在 Termux（Android/aarch64）跑不起来；**Termux 是唯一例外，直接用系统 `ffmpeg`（PATH）**，请 `pkg install ffmpeg`（也可 `FFMPEG_BIN` 指向可用 ffmpeg）。`devices` 子命令同样依赖 ffmpeg。
   - **播放走 `play-audio`**：`pkg install play-audio` 后可用（绝对路径 `$PREFIX/bin/play-audio`）；缺失时报清晰错误并提示安装命令。音频流由 `TTS_STREAM` 控制（默认 `media`）。
   - `sapi` 在 Termux 上必然报错（非 Windows）；请用 `aliyun`（CosyVoice）。
+
+## 故障排查
+
+- **提示「未检测到音频输入设备（麦克风）」**（`error.code="no-input-device"`）：设备枚举成功但**一个输入设备都没有**，运行时在取凭证/连 ASR/进采集**之前**就失败。按三条依次检查：
+  ① 麦克风**已连接**并在系统声音设置里**启用**；
+  ② **Windows 设置 → 隐私 → 麦克风**，打开「允许桌面应用访问你的麦克风」（关掉时驱动正常也枚举不到）；
+  ③ 外置/USB 麦克风确认**驱动已装、设备未被禁用**（设备管理器里无黄色感叹号）。
+  再用 `node dist/runtime/voice-runtime.js --list` 核对当前可见设备：**空列表同样以退出码 3 结束**并打印同一份提示；
+  能列出设备却一直没识别结果 ⇒ 不是「没设备」而是「没声音」（见下条静音提示）。
+  ffmpeg 自身起不来是**另一类**错误（退出码 1 + 明确路径/原因），不是没设备。
+- **toast 现在显示真实原因**：运行时失败时 toast 取 **NDJSON `error` 事件里的可操作文案**，没有则取 **stderr 中最后一条含错误关键字的行**、再退化到**末行**（总长上限 300 字符，超长保留首尾）——**不再只显示 stderr 第一行**（旧实现按固定长度截断开头，常把「自检成功」那行当成原因）。明细看日志 `runtime exited: …`；收集诊断时直接引用日志路径。
+  **退出码含义**：`3` = 未检测到音频输入设备（麦克风，`--list` 空设备同样是 3）；`1` = 采集/配置/连接/ffmpeg 等其它致命错误；`0` = 正常结束。
+  **配套静音提示**：设备正常、也在出流，但 3 秒观察窗内电平几乎为零（RMS < 1e-4）时**只弹一次**「麦克风似乎没有声音（RMS≈0），请检查静音、增益或是否选错设备」——按提示查系统静音键、输入音量/增益是否为 0、是否选错设备（`--device <设备名>` 或 `VOICE_DEVICE`）。
 
 ## 开发
 

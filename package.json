@@ -1,6 +1,6 @@
 {
   "name": "@xiaoqiong0v0/opencode-emotions",
-  "version": "0.2.4",
+  "version": "0.2.5",
   "type": "module",
   "description": "OpenCode plugin: emotion-aware voice I/O — realtime speech-to-text with emotion tagging, plus text-to-speech output.",
   "files": [

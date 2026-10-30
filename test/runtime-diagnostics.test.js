@@ -16,6 +16,8 @@ import { fileURLToPath } from "node:url";
 import {
   pickStderrSummary,
   resolveRuntimeScript,
+  STDERR_SUMMARY_MAX,
+  summarizeRuntimeFailure,
   RUNTIME_RELATIVE_TO_CWD,
   RUNTIME_RELATIVE_TO_SELF,
   selfDirFromModuleUrl,
@@ -216,7 +218,7 @@ test("resolveRuntimeScript：POSIX 语义（platform=linux）的归一、优先�
   assert.deepEqual(none.candidates, [selfScript, cwdScript]);
 });
 
-test("pickStderrSummary：Node 崩溃输出取 `Cannot find module` 关键行，而不是末行的版本号", () => {
+test("pickStderrSummary：Node 崩溃输出取错误关键行，而不是末行的版本号", () => {
   const crash = [
     "node:internal/modules/cjs/loader:1210",
     "  throw err;",
@@ -230,25 +232,54 @@ test("pickStderrSummary：Node 崩溃输出取 `Cannot find module` 关键行，
     "  code: 'MODULE_NOT_FOUND',",
     "Node.js v24.16.0",
   ].join("\r\n");
-  const summary = pickStderrSummary(crash, 120);
+  const summary = pickStderrSummary(crash, 300);
   assert.equal(summary, "Error: Cannot find module 'C:\\Users\\king-\\dist\\runtime\\voice-runtime.js'");
   assert.ok(!summary.includes("Node.js v"), "不得只显版本横幅");
 });
 
-test("pickStderrSummary：无错误标记时取首个非噪声行；全噪声退化首行", () => {
-  assert.equal(
-    pickStderrSummary("node:internal/foo:1\nVOICE mic=12 sumSq=34 captured=2s\nNode.js stats\n", 120),
-    "VOICE mic=12 sumSq=34 captured=2s",
-  );
-  assert.equal(pickStderrSummary("node:internal/a:1\nNode.js v24.16.0\n", 120), "node:internal/a:1");
+test("pickStderrSummary：多行含错误关键字 → 取**最后一条**错误行（修复前取首条，真因被埋）", () => {
+  const stderr = [
+    "[ffmpeg] 自检完成（ok）",
+    "错误：旧问题（已被后续覆盖）",
+    "[采集] 采样数=0 RMS=0.00000",
+    "错误：未检测到音频输入设备（麦克风）",
+    "[采集] 采样数=100 RMS=0.00001",
+  ].join("\n");
+  assert.equal(pickStderrSummary(stderr, 300), "错误：未检测到音频输入设备（麦克风）");
 });
 
-test("pickStderrSummary：空输入返回空串；超长按 maxLength 截断", () => {
-  assert.equal(pickStderrSummary("", 120), "");
-  assert.equal(pickStderrSummary("   \r\n\r\n  ", 120), "");
-  const long = `Error: ENOENT: no such file or directory, open '${"x".repeat(300)}'`;
-  const summary = pickStderrSummary(long, 40);
-  assert.equal(summary.length, 41, "40 字符 + 省略号");
-  assert.ok(summary.endsWith("…"));
-  assert.ok(summary.startsWith("Error: ENOENT"));
+test("pickStderrSummary：无错误关键字时取**最后一行**（不再取首个非噪声行）", () => {
+  assert.equal(pickStderrSummary("VOICE mic=12 sumSq=34 captured=2s\n采集中：device=麦克风", 300), "采集中：device=麦克风");
+  assert.equal(pickStderrSummary("node:internal/a:1\nNode.js v24.16.0\n", 300), "Node.js v24.16.0");
+});
+
+test("pickStderrSummary：空输入返回空串；超长**截断中部**、保留首尾错误信息", () => {
+  assert.equal(pickStderrSummary("", 300), "");
+  assert.equal(pickStderrSummary("   \r\n\r\n  ", 300), "");
+  const tail = `退出码=1：未检测到音频输入设备 ${"x".repeat(300)} 原因：设备被禁用`;
+  const summary = pickStderrSummary(`错误：${tail}`, 100);
+  assert.equal(summary.length, 101, "100 字符 + 中部省略号");
+  assert.ok(summary.startsWith("错误："), "必须保留开头「错误：」");
+  assert.ok(summary.includes("…"), "超长必须在中间插入省略号");
+  assert.ok(summary.endsWith("原因：设备被禁用"), "必须保留尾部具体原因");
+});
+
+test("summarizeRuntimeFailure：优先用 NDJSON error 事件的 message（stderr 再吵也不影响）", () => {
+  const stderr = ["[ffmpeg] 自检完成（ok）：ok", "错误：stderr 里的旧噪声"].join("\n");
+  const summary = summarizeRuntimeFailure({
+    stderr,
+    errorMessage: "未检测到音频输入设备（麦克风）。请检查：① 麦克风已连接…",
+    code: 3,
+  });
+  assert.equal(summary, "未检测到音频输入设备（麦克风）。请检查：① 麦克风已连接…");
+});
+
+test("summarizeRuntimeFailure：无 error 事件时退化到 stderr（错误行 → 末行）；全空返回空串", () => {
+  assert.equal(
+    summarizeRuntimeFailure({ stderr: "统计 1\n采集失败：ffmpeg 退出码=1", errorMessage: null, code: 1 }),
+    "采集失败：ffmpeg 退出码=1",
+  );
+  assert.equal(summarizeRuntimeFailure({ stderr: "统计 1\n最后一行", errorMessage: "" }), "最后一行");
+  assert.equal(summarizeRuntimeFailure({ stderr: "", errorMessage: null }), "");
+  assert.equal(STDERR_SUMMARY_MAX, 300, "摘要上限 300（旧口径 120/160 会截掉真因）");
 });

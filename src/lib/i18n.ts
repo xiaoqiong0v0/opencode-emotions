@@ -9,6 +9,16 @@
  * 带变量的文案用 `{name}` 占位符，经 `format()` 填充。
  */
 
+import {
+  ASR_CONNECT_FAILED_CODE,
+  ASR_FAILED_CODE,
+  CAPTURE_FAILED_CODE,
+  CREDENTIALS_MISSING_CODE,
+  FFMPEG_UNAVAILABLE_CODE,
+  MIC_SILENT_CODE,
+  NO_INPUT_DEVICE_CODE,
+} from "../voice/ndjson.js";
+
 /** 受支持的语言标识。 */
 export type Language = "zh" | "en";
 
@@ -40,6 +50,52 @@ export function format(template: string, vars: Record<string, string | number>):
   return template.replace(/\{(\w+)\}/g, (match, key: string) =>
     Object.prototype.hasOwnProperty.call(vars, key) ? String(vars[key]) : match,
   );
+}
+
+/** CJK 统一表意文字（基本区 + 扩展 A + 兼容区）：判定「内部中文详情」用。 */
+const CJK_PATTERN = /[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]/;
+
+/**
+ * 文本是否含 CJK 字符。
+ * @param text 待检文本
+ * @returns 含 CJK 时 true
+ */
+export function hasCjk(text: string): boolean {
+  return CJK_PATTERN.test(text);
+}
+
+/**
+ * 按目标语言挑选**可拼接的 detail**（2026-10-30 第二十二批）。
+ *
+ * `detail` 常是运行时/宿主的内部中文（如 `采集失败：ffmpeg 退出码 1`），若在 `en` 下直接拼进英文模板，
+ * 会出现「Audio capture failed: 采集失败…」的中英混排。契约：
+ * - `zh` ⇒ 原样保留（内部中文对中文用户可读）；
+ * - `en` ⇒ 含 CJK 时**丢弃**（只留英文模板句），不含 CJK 才保留（如技术路径、英文原因）。
+ * @param lang 目标语言
+ * @param detail 详情文本（可空）
+ * @returns 可直接拼接的 detail（en 下可能是空串）
+ */
+export function localizedDetail(lang: Language, detail?: string | null): string {
+  const text = typeof detail === "string" ? detail.trim() : "";
+  if (text.length === 0) return "";
+  if (lang === "en" && hasCjk(text)) return "";
+  return text;
+}
+
+/**
+ * 用 `{message}` 详情填充模板，并在 detail 被丢弃时清理模板尾部的分隔符。
+ *
+ * `zh` 的模板形如 `"音频采集失败：{message}"`，`en` 形如 `"Audio capture failed: {message}"`；
+ * detail 为空（en + 中文 detail）时模板会留下裸冒号，这里统一去掉尾部的 `:`/`：` 与空白。
+ * @param template 含 `{message}` 的模板
+ * @param lang 目标语言
+ * @param detail 详情
+ * @returns 渲染结果
+ */
+export function formatMessage(template: string, lang: Language, detail?: string | null): string {
+  const kept = localizedDetail(lang, detail);
+  const text = format(template, { message: kept });
+  return kept.length === 0 ? text.replace(/[\s:：]+$/, "") : text;
 }
 
 /** server 插件工具文案。 */
@@ -126,6 +182,39 @@ export interface CommandPhrases {
   autoTtsDesc: string;
 }
 
+/**
+ * **运行时错误**文案（按稳定错误码索引；`code` 见 `voice/ndjson.ts`）。
+ *
+ * 契约：`code` 稳定、不随语言变；本组文案只按 `uiLanguage` 渲染。
+ * 带 `{message}` 的为**详情模板**（detail 可能是内部消息，允许保留原文）。
+ */
+export interface RuntimeErrorPhrases {
+  /** `no-input-device` 短句（退出码提示用）。 */
+  noInputDeviceShort: string;
+  /** `no-input-device` 完整可操作说明（三条检查项 + `--list` 提示）。 */
+  noInputDevice: string;
+  /** `mic-silent`：麦克风无声。 */
+  micSilent: string;
+  /** `ffmpeg-unavailable`：ffmpeg 不可用（含 `FFMPEG_BIN` 与代理/网络提示）。 */
+  ffmpegUnavailable: string;
+  /** `capture-failed`：采集失败（占位符：message）。 */
+  captureFailed: string;
+  /** `asr-connect-failed`：ASR 连接失败（占位符：message）。 */
+  asrConnectFailed: string;
+  /** `asr-failed`：ASR 运行期错误（占位符：message）。 */
+  asrFailed: string;
+  /** `credentials-missing`：语音识别凭证缺失。 */
+  credentialsMissing: string;
+}
+
+/** 启动阶段（NDJSON `progress`）文案：TUI 直接展示 `message`，故必须按 `uiLanguage` 渲染。 */
+export interface ProgressPhrases {
+  /** ffmpeg 启动自检 / 自愈进行中。 */
+  preparingFfmpeg: string;
+  /** 只能选到回环 monitor 源时的提示（占位符：device）。 */
+  monitorFallback: string;
+}
+
 /** 单语言的完整文案表。 */
 export interface Phrases {
   tool: ToolPhrases;
@@ -133,6 +222,8 @@ export interface Phrases {
   label: LabelPhrases;
   toast: ToastPhrases;
   command: CommandPhrases;
+  progress: ProgressPhrases;
+  runtimeError: RuntimeErrorPhrases;
 }
 
 /** 中文帮助文本。 */
@@ -255,6 +346,34 @@ export const PHRASES: Readonly<Record<Language, Phrases>> = {
       autoTtsTitle: "语音：自动朗读开关 ({key})",
       autoTtsDesc: "开：后续助手回复自动朗读；关：立即停止当前朗读（模型不可切换，仅此热键控制）",
     },
+    progress: {
+      preparingFfmpeg: "正在准备 ffmpeg…",
+      monitorFallback:
+        "未找到真实输入源，自动选到了 monitor 监听源（{device}）——它是输出回环、通常永远静音。" +
+        "请用 --device <麦克风 source 名> 或环境变量 VOICE_DEVICE 显式指定输入设备" +
+        "（pactl list short sources 查看，排除 .monitor）。",
+    },
+    runtimeError: {
+      noInputDeviceShort: "未检测到麦克风",
+      noInputDevice:
+        "未检测到音频输入设备（麦克风）。请检查：" +
+        "① 麦克风已连接并在系统声音设置中启用；" +
+        "② Windows 设置 → 隐私 → 麦克风 允许桌面应用访问；" +
+        "③ 若使用外置/USB 麦克风，确认驱动与设备未被禁用。" +
+        "可用 --list 查看当前可见设备。",
+      micSilent: "麦克风似乎没有声音（RMS≈0）。请检查静音/增益或是否选错设备",
+      ffmpegUnavailable:
+        "未找到可用的 ffmpeg（语音采集依赖它）。请任选其一修复：" +
+        "① 设置环境变量 FFMPEG_BIN=<可用 ffmpeg 的绝对路径>；" +
+        "② 配置网络代理（HTTPS_PROXY / HTTP_PROXY）后重启，让插件重新下载随附二进制；" +
+        "③ 重装插件依赖后重试。",
+      captureFailed: "音频采集失败：{message}",
+      asrConnectFailed: "语音识别连接失败：{message}",
+      asrFailed: "语音识别出错：{message}",
+      credentialsMissing:
+        "未配置语音识别凭证：请在 emotions.jsonc 的 asr.credentials 填入" +
+        "（或设置环境变量 DASHSCOPE_API_KEY / MIMO_API_KEY）。",
+    },
   },
   en: {
     tool: {
@@ -310,6 +429,34 @@ export const PHRASES: Readonly<Record<Language, Phrases>> = {
       autoTtsTitle: "Voice: auto-read toggle ({key})",
       autoTtsDesc: "On: read future assistant replies; Off: stop current playback now (F10 only; the model cannot switch it)",
     },
+    progress: {
+      preparingFfmpeg: "Preparing ffmpeg…",
+      monitorFallback:
+        "No real input source found; selected the monitor loopback source ({device}) instead — " +
+        "it mirrors output and is usually silent. Pass --device <microphone source name> " +
+        "or set VOICE_DEVICE to pick the input explicitly (see `pactl list short sources`, exclude .monitor).",
+    },
+    runtimeError: {
+      noInputDeviceShort: "No microphone detected",
+      noInputDevice:
+        "No audio input device (microphone) detected. Check: " +
+        "(1) the microphone is connected and enabled in system sound settings; " +
+        "(2) Windows Settings → Privacy → Microphone allows desktop apps; " +
+        "(3) an external/USB microphone's driver is installed and the device is not disabled. " +
+        "Run --list to see currently visible devices.",
+      micSilent: "The microphone appears to be silent (RMS≈0). Check mute/gain settings or whether the wrong device is selected.",
+      ffmpegUnavailable:
+        "No usable ffmpeg found (required for audio capture). Fix any of: " +
+        "(1) set FFMPEG_BIN=<absolute path to a working ffmpeg>; " +
+        "(2) configure a network proxy (HTTPS_PROXY / HTTP_PROXY) and restart so the plugin re-downloads its bundled binary; " +
+        "(3) reinstall plugin dependencies and retry.",
+      captureFailed: "Audio capture failed: {message}",
+      asrConnectFailed: "Speech recognition connection failed: {message}",
+      asrFailed: "Speech recognition error: {message}",
+      credentialsMissing:
+        "Speech recognition credentials are missing: fill asr.credentials in emotions.jsonc " +
+        "(or set DASHSCOPE_API_KEY / MIMO_API_KEY).",
+    },
   },
 };
 
@@ -320,4 +467,61 @@ export const PHRASES: Readonly<Record<Language, Phrases>> = {
  */
 export function getPhrases(lang: Language): Phrases {
   return PHRASES[lang] ?? PHRASES[DEFAULT_LANGUAGE];
+}
+
+/** 稳定错误码 → 文案字段（`code` 定义见 `voice/ndjson.ts`）。 */
+const RUNTIME_ERROR_TEXT_KEY: Readonly<Record<string, keyof RuntimeErrorPhrases>> = {
+  [NO_INPUT_DEVICE_CODE]: "noInputDevice",
+  [MIC_SILENT_CODE]: "micSilent",
+  [FFMPEG_UNAVAILABLE_CODE]: "ffmpegUnavailable",
+  [CAPTURE_FAILED_CODE]: "captureFailed",
+  [ASR_CONNECT_FAILED_CODE]: "asrConnectFailed",
+  [ASR_FAILED_CODE]: "asrFailed",
+  [CREDENTIALS_MISSING_CODE]: "credentialsMissing",
+};
+
+/**
+ * 按稳定错误码渲染**用户可见**文案（纯映射 + 插值）。
+ *
+ * 已知 code ⇒ 该语言的完整可操作文案（`{message}` 用 `detail` 填充）；
+ * 未知 code（或 null）⇒ 兜底模板 `toast.runtimeError`（`"…：{message}"`），`detail` 为空时用空串。
+ * `en` 下 `detail` 含中文（内部消息）时**不拼接**，避免中英混排（见 {@link localizedDetail}）。
+ * @param code 稳定错误码（来自 NDJSON `error.code` / `warning.code` / `exitCodeReason()`）
+ * @param lang 展示语言（`uiLanguage`）
+ * @param detail 详情（已知 code 的模板占位符 / 未知 code 的兜底 message）
+ * @returns 该语言文案
+ */
+export function runtimeErrorText(code: string | null | undefined, lang: Language, detail?: string): string {
+  const phrases = getPhrases(lang);
+  const key = typeof code === "string" ? RUNTIME_ERROR_TEXT_KEY[code] : undefined;
+  if (key === undefined) return formatMessage(phrases.toast.runtimeError, lang, detail);
+  return formatMessage(phrases.runtimeError[key], lang, detail);
+}
+
+/**
+ * 该错误码的文案是否带 `{message}` 详情占位。
+ *
+ * 运行时据此决定 NDJSON `message` 的形态：**带占位符**的 code（`capture-failed` / `asr-*`）保留内部详情
+ * （TUI 拼接时按语言决定是否展示）；**不带占位符**的 code（`no-input-device` / `mic-silent` 等）直接
+ * 产出本地化可操作文案（JSON 消费者不必再查文案表）。
+ * @param code 稳定错误码
+ * @returns 需要 detail 填充时 true
+ */
+export function runtimeErrorUsesDetail(code: string | null | undefined): boolean {
+  const key = typeof code === "string" ? RUNTIME_ERROR_TEXT_KEY[code] : undefined;
+  return key !== undefined && getPhrases(DEFAULT_LANGUAGE).runtimeError[key].includes("{message}");
+}
+
+/**
+ * 按稳定错误码渲染**短句**（用于「运行时已退出（…）」这类只有一句位置的提示）。
+ *
+ * 只有 `no-input-device` 有独立短句；其它已知 code 回退完整文案；未知 code 返回 null（调用方用原 reason）。
+ * @param code 稳定错误码
+ * @param lang 展示语言
+ * @returns 短句或 null
+ */
+export function runtimeErrorShortText(code: string | null | undefined, lang: Language): string | null {
+  if (code === null || code === undefined) return null;
+  if (code === NO_INPUT_DEVICE_CODE) return getPhrases(lang).runtimeError.noInputDeviceShort;
+  return RUNTIME_ERROR_TEXT_KEY[code] === undefined ? null : runtimeErrorText(code, lang);
 }

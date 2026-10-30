@@ -63,9 +63,9 @@ import type { TuiPlugin, TuiPluginApi, TuiPluginModule, TuiSlotContext } from "@
 import createLogger from "@xiaoqiong0v0/opencode-plugin-logger";
 import type { Logger } from "@xiaoqiong0v0/opencode-plugin-logger";
 
-import { format, getPhrases } from "./lib/i18n.js";
+import { format, formatMessage, getPhrases, localizedDetail, runtimeErrorShortText, runtimeErrorText } from "./lib/i18n.js";
 import { KeyRepeatGuard } from "./lib/key-repeat.js";
-import { pickStderrSummary, resolveRuntimeScript, selfDirFromModuleUrl } from "./lib/runtime-diagnostics.js";
+import { STDERR_SUMMARY_MAX, summarizeRuntimeFailure, resolveRuntimeScript, selfDirFromModuleUrl } from "./lib/runtime-diagnostics.js";
 import { loadVoiceConfigWithWarnings } from "./voice/config.js";
 import { ASR_GATE_TAIL_MS, resolveFinalDelivery, shouldDropAsrFinal, type LastClosedVoiceMode } from "./voice/asr-gate.js";
 import {
@@ -79,7 +79,7 @@ import {
   writeAutoTts,
   writeInterruptRequest,
 } from "./voice/auto-tts.js";
-import { NdjsonLineSplitter, parseEventLine, type RuntimeFinal } from "./voice/ndjson.js";
+import { NdjsonLineSplitter, exitCodeReason, parseEventLine, type RuntimeFinal } from "./voice/ndjson.js";
 import {
   isInterruptablePlaybackActive,
   PLAYBACK_OWNERLESS_KEY,
@@ -157,8 +157,6 @@ const DEFAULT_NODE_BIN = AUTO_READ_DEFAULT_NODE_BIN;
 const SCRIPT_ENV = "VOICE_RUNTIME_SCRIPT";
 /** 子进程 stderr 缓冲保留的末尾字符数（防无界增长；全量仅进日志、不进 toast）。 */
 const STDERR_BUFFER_MAX = 4000;
-/** toast 里 stderr 关键行的最大长度（够容纳 `Error: Cannot find module '<绝对路径>'`）。 */
-const STDERR_TOAST_MAX = 120;
 /** 注入消息前缀标记（标识来源于语音）。 */
 const INJECT_MARKER = "🎙";
 /** 等待子进程 spawn 的超时（毫秒）。 */
@@ -178,11 +176,6 @@ const PREVIEW_LEN = 24;
  * 与 toast 预览（{@link PREVIEW_LEN}）分开——丢弃日志只进日志文件、不占 toast 版面。
  */
 const ASR_GATE_PREVIEW_LEN = 20;
-/**
- * toast 里**运行时 error 事件消息**的最大长度（与 stderr 摘要 `STDERR_TOAST_MAX` 同口径 120）：
- * 配置引导文案（哪缺、去哪配）的关键信息约定在前 120 字符内，不能用 24 字符的通用预览截掉。
- */
-const ERROR_TOAST_MAX = 120;
 /**
  * meter 列**连接中** spinner 的**换帧间隔**（毫秒，2026-10-22 第十三批）：
  * **仅 connecting**（F8/F9 开着但 `asrReady=false`）时定时器每 100ms 递增一次帧索引，由 `slot.ts` 取模选盲文字形；
@@ -242,7 +235,7 @@ function waitForSpawn(child: ChildProcess, timeoutMs: number): Promise<void> {
       if (err) rejectSpawn(err);
       else resolveSpawn();
     };
-    const timer = setTimeout(() => settle(new Error(`启动超时（${timeoutMs}ms 内未收到 spawn 事件）`)), timeoutMs);
+    const timer = setTimeout(() => settle(new Error(`spawn timeout: no "spawn" event within ${timeoutMs}ms`)), timeoutMs);
     child.once("spawn", () => settle());
     child.once("error", (err: Error) => settle(err));
   });
@@ -287,13 +280,15 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
   // 配置加载（带告警）：解析失败时 UI 仍用默认值启动，但**必须提示用户**（否则「改了配置没生效」无从排查）。
   const initialConfig = loadVoiceConfigWithWarnings();
   const phrases = getPhrases(initialConfig.config.uiLanguage);
+  /** 用户界面语言（`uiLanguage`）：运行时错误/告警文案按它渲染（`code` 稳定、文案按语言）。 */
+  const uiLanguage = initialConfig.config.uiLanguage;
   for (const warning of initialConfig.warnings) {
     if (warning.kind !== "parse-error") continue;
     try {
       api.ui.toast({
         variant: "warning",
         title: phrases.toast.title,
-        message: format(phrases.toast.configInvalid, { message: warning.message }),
+        message: formatMessage(phrases.toast.configInvalid, uiLanguage, warning.message),
       });
     } catch {
       // toast 不可用（启动早期）时已由 config 模块写 warn 日志，不影响 TUI
@@ -340,6 +335,14 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
   let disposed = false;
   /** 子进程 stderr 的末尾缓冲（运行时会周期性打采集统计，故留存全量尾部供**日志**还原，toast 只显关键行）。 */
   let stderrTail = "";
+  /** 最近一条 NDJSON `error` 事件（摘要**优先取它**：运行时已写好可操作文案）。 */
+  let lastErrorMessage: string | null = null;
+  /** 最近一条 `error` 事件的稳定错误码（如 `no-input-device`）。 */
+  let lastErrorCode: string | null = null;
+  /** 本轮是否已弹过错误 toast（保证一次失败只弹一次、不刷屏）。 */
+  let failureNotified = false;
+  /** 本轮已弹过的 warning 文案（如「麦克风似乎没有声音」只弹一次）。 */
+  const warnedMessages = new Set<string>();
 
   /** 模式是否开启。 */
   const isOn = (target: VoiceMode): boolean => (target === "inject" ? injectOn() : inputOn());
@@ -400,21 +403,39 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
   const stderrForLog = (): string => stderrTail.replace(/\r?\n/g, " | ").trim();
 
   /** 子进程结束/异常时复位开关并提示（主动停止时不提示）。 */
-  const handleChildGone = (reason: string): void => {
-    // 口径分开：toast 只显**关键行**（含 Error 的首行，退化时取首个非噪声行），日志留**全量尾部**。
-    // 旧实现只存末行 ⇒ Node 崩溃时末行是版本横幅（`Node.js v…`），用户看不到真正的原因。
-    const summary = pickStderrSummary(stderrTail, STDERR_TOAST_MAX);
-    log.warn(`runtime exited: reason=${reason} stderr=${stderrForLog() || "-"}`);
+  const handleChildGone = (reason: string, exitCode: number | null = null): void => {
+    // 口径（2026-10-30）：**优先用 NDJSON error 事件的 message**（运行时已写好可操作文案），
+    // 其次取 stderr 中**最后一条**含错误关键字的行，最后退化末行；超长截断中部，保留首尾。
+    const summary = summarizeRuntimeFailure(
+      { stderr: stderrTail, errorMessage: lastErrorMessage, code: exitCode },
+      STDERR_SUMMARY_MAX,
+    );
+    log.warn(
+      `runtime exited: reason=${reason} code=${exitCode ?? "-"} errorCode=${lastErrorCode ?? "-"} stderr=${stderrForLog() || "-"}`,
+    );
     child = null;
     splitter = new NdjsonLineSplitter();
     // runtime 没了 ⇒ 复位 asrReady（不再在听），停 spinner（含主动停止路径；开关信号下面按情况复位）
     setAsrReady(false);
     syncSpinFrame();
+    const notified = failureNotified;
+    lastErrorMessage = null;
+    lastErrorCode = null;
+    failureNotified = false;
     if (stopping) return;
     setInjectOn(false);
     setInputOn(false);
-    const detail = summary ? `；stderr：${summary}` : "";
-    toast("error", format(phrases.toast.runtimeExited, { reason, detail }));
+    // error 事件已弹过可操作文案 ⇒ 不再补一条「已退出」（一次失败只弹一次）
+    if (notified) return;
+    // 退出码语义：3 ⇒ no-input-device（与 runtime 的 EXIT_NO_INPUT_DEVICE 同源）；
+    // exitCodeReason 返回**稳定 code**，文案按 uiLanguage 渲染（不在此硬编码中文）
+    const exitReasonCode = exitCodeReason(exitCode);
+    const exitReasonText = runtimeErrorShortText(exitReasonCode, uiLanguage);
+    const reasonText = exitReasonText ? `${reason} — ${exitReasonText}` : reason;
+    // 摘要可能是内部中文（stderr/事件详情）：en 下丢弃，避免「…(-)；采集失败…」中英混排
+    const keptSummary = localizedDetail(uiLanguage, summary);
+    const detail = keptSummary ? `${uiLanguage === "zh" ? "；" : "; "}${keptSummary}` : "";
+    toast("error", format(phrases.toast.runtimeExited, { reason: reasonText, detail }));
   };
 
   /** 处理一条 NDJSON 事件。 */
@@ -441,10 +462,37 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
         // 启动阶段提示（如 ffmpeg 运行时自愈）：低频一次性事件，只 toast、不写日志
         toast("info", event.message);
         break;
-      case "error":
-        // 配置引导类错误（ffmpeg/设备/凭证）按 120 字符口径展示，保证「哪缺、去哪配」可见
-        toast("warning", format(phrases.toast.runtimeError, { message: preview(event.message, ERROR_TOAST_MAX) }));
+      case "warning": {
+        // 低频告警（如麦克风无声）：同一 code/文案只弹一次，避免刷屏；
+        // 有稳定 code ⇒ 按 uiLanguage 渲染（message 仅作兜底/详情）
+        const warningKey = event.code ?? event.message;
+        if (warnedMessages.has(warningKey)) break;
+        warnedMessages.add(warningKey);
+        // 无 code 时 message 是内部文案：en 下含中文则丢弃（不混排）；丢弃后无内容就不弹空 toast
+        const warningText = event.code
+          ? runtimeErrorText(event.code, uiLanguage, event.message)
+          : localizedDetail(uiLanguage, event.message);
+        if (warningText.length === 0) {
+          log.warn(`runtime warning dropped (no localized text): code=${event.code ?? "-"}`);
+          break;
+        }
+        toast("warning", preview(warningText, STDERR_SUMMARY_MAX));
         break;
+      }
+      case "error": {
+        // 记住运行时给的**真实原因**（退出摘要优先用它），并按 300 字符口径展示可操作文案
+        lastErrorMessage = event.message;
+        lastErrorCode = event.code ?? null;
+        failureNotified = true;
+        if (event.code) {
+          // 已知稳定 code ⇒ 文案按 uiLanguage 渲染（不再直接展示内部中文 message；en 下丢弃中文 detail）
+          toast("error", preview(runtimeErrorText(event.code, uiLanguage, event.message), STDERR_SUMMARY_MAX));
+        } else {
+          // 无 code（旧版 runtime / 未分类）⇒ 兜底模板（en 下丢弃中文 message）
+          toast("warning", formatMessage(phrases.toast.runtimeError, uiLanguage, event.message));
+        }
+        break;
+      }
       case "done":
         break;
       default:
@@ -476,7 +524,7 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
     // 不再 spawn 一个必死的 node 进程（旧行为：node 秒退 code=1，toast 只剩版本横幅，无从下手）。
     if (!resolution.exists) {
       throw new Error(
-        `语音运行时脚本不存在：${script}（来源=${resolution.source}，候选=${resolution.candidates.join(" | ")}，可用 ${SCRIPT_ENV} 指定绝对路径）`,
+        `runtime script not found: ${script} (source=${resolution.source}, candidates=${resolution.candidates.join(" | ")}; set ${SCRIPT_ENV} to an absolute path)`,
       );
     }
 
@@ -489,7 +537,7 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
         stdio: ["pipe", "pipe", "pipe"],
       });
     } catch (err) {
-      throw new Error(`无法启动 ${bin}：${errText(err)}`);
+      throw new Error(`failed to spawn ${bin}: ${errText(err)}`);
     }
     // 诊断埋点：spawn() 已同步返回句柄（尚未收到 spawn 事件）——与 begin/failed 对照即可判卡在哪一步
     log.info(`startRuntime spawned: pid=${spawned.pid ?? "-"}`);
@@ -497,12 +545,16 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
     child = spawned;
     splitter = new NdjsonLineSplitter();
     stderrTail = "";
+    lastErrorMessage = null;
+    lastErrorCode = null;
+    failureNotified = false;
+    warnedMessages.clear();
     spawned.stdout?.setEncoding("utf8");
     spawned.stdout?.on("data", (chunk: string) => onStdout(chunk));
     spawned.stderr?.on("data", (chunk: Buffer) => appendStderr(String(chunk)));
-    spawned.on("error", (err: Error) => handleChildGone(`进程错误：${err.message}`));
+    spawned.on("error", (err: Error) => handleChildGone(`spawn-error: ${err.message}`));
     spawned.on("exit", (code: number | null, signal: NodeJS.Signals | null) =>
-      handleChildGone(`code=${code ?? "-"} signal=${signal ?? "-"}`),
+      handleChildGone(`code=${code ?? "-"} signal=${signal ?? "-"}`, code),
     );
     // 优雅停止用 stdin 通道：子进程已退出时写入会 EPIPE，必须监听（否则未处理的 'error' 会炸宿主）
     spawned.stdin?.on("error", (err: Error) => {
@@ -607,12 +659,12 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
           parts: [{ type: "text", text: `${INJECT_MARKER} ${body}` }],
         });
         if (response.error) {
-          toast("error", format(phrases.toast.injectFailed, { message: preview(JSON.stringify(response.error)) }));
+          toast("error", formatMessage(phrases.toast.injectFailed, uiLanguage, JSON.stringify(response.error)));
         } else {
           toast("success", format(phrases.toast.injected, { text: preview(result.text) }));
         }
       } catch (err) {
-        toast("error", format(phrases.toast.injectException, { message: errText(err) }));
+        toast("error", formatMessage(phrases.toast.injectException, uiLanguage, errText(err)));
       }
       return;
     }
@@ -620,7 +672,7 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
       await api.client.tui.appendPrompt({ text: ` ${body} ` });
       toast("success", format(phrases.toast.appended, { text: preview(result.text) }));
     } catch (err) {
-      toast("error", format(phrases.toast.appendFailed, { message: errText(err) }));
+      toast("error", formatMessage(phrases.toast.appendFailed, uiLanguage, errText(err)));
     }
   };
 
@@ -684,7 +736,7 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
             );
             if (target === "inject") setInjectOn(false);
             else setInputOn(false);
-            toast("error", format(phrases.toast.startFailed, { message: errText(err) }));
+            toast("error", formatMessage(phrases.toast.startFailed, uiLanguage, errText(err)));
           }
         } else {
           toast("info", format(phrases.toast.switched, { label }));

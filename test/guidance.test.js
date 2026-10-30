@@ -71,13 +71,13 @@ test("ffmpegLaunchFailedGuidance：带可执行路径与底层原因", () => {
   assert.match(msg, /FFMPEG_BIN/);
 });
 
-test("noAudioDeviceGuidance：指向麦克风权限、--list、--device/VOICE_DEVICE，关键信息在前 120 字符内", () => {
+test("noAudioDeviceGuidance：点名「未检测到音频输入设备」并给三条检查项与 --list（关键信息在前 120 字符内）", () => {
   const msg = noAudioDeviceGuidance();
-  assert.match(msg, /未找到音频输入设备（枚举成功但结果为 0 个）/);
+  assert.match(msg, /未检测到音频输入设备（麦克风）/);
   assert.match(msg, /麦克风/);
-  assert.match(msg, /voice-runtime\.js --list/);
-  assert.match(msg, /VOICE_DEVICE/);
-  assert.match(msg.slice(0, 120), /未找到音频输入设备/);
+  assert.match(msg, /隐私 → 麦克风/);
+  assert.match(msg, /--list/);
+  assert.match(msg.slice(0, 120), /未检测到音频输入设备/);
   assert.match(msg.slice(0, 120), /麦克风/);
 });
 

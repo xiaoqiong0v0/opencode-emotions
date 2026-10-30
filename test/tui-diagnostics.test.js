@@ -158,14 +158,20 @@ test("运行时脚本以**产物自身位置**为锚点（Babel 产物保留 imp
   // ② 旧根因形态不得复活：直接拿 cwd 拼 dist/runtime/voice-runtime.js 当唯一口径
   assert.ok(!/resolve\(process\.cwd\(\),\s*\.\.\.RUNTIME_SCRIPT\)/.test(code), "产物仍残留 cwd 相对拼路径");
   // ③ 诊断埋点与失败闸门：来源/存在性/候选 + 不存在时先报错（不 spawn 必死进程）
-  for (const marker of ["scriptSource=", "scriptExists=", "selfDir=", "candidates=", "语音运行时脚本不存在"]) {
+  //    marker 用英文 `runtime script not found`（2026-10-30 第二十二批起诊断/闸门日志统一英文，
+  //    与 TUI 用户文案解耦：日志关键字不随 uiLanguage 变）
+  for (const marker of ["scriptSource=", "scriptExists=", "selfDir=", "candidates=", "runtime script not found"]) {
     assert.ok(code.includes(marker), `startRuntime 诊断/闸门缺少 ${marker}`);
   }
 });
 
 test("stderr 关键行进 toast、全量尾部进日志（修「只显 Node.js 版本号」）", () => {
   const code = tuiCode();
-  assert.ok(code.includes("pickStderrSummary(stderrTail"), "toast 未取 stderr 关键行（会退回末行=版本横幅）");
+  assert.ok(
+    code.includes("summarizeRuntimeFailure("),
+    "toast 未走 summarizeRuntimeFailure（error 事件 message / stderr 尾部原因会丢）",
+  );
+  assert.ok(code.includes("lastErrorMessage"), "未接线 NDJSON error 事件 message（真实原因优先级不够）");
   assert.ok(code.includes("runtime exited: reason="), "缺少退出日志（全量 stderr 尾部无处可查）");
   assert.ok(code.includes("stderrForLog()"), "退出/失败日志未带 stderr 全量尾部");
   assert.ok(!code.includes("lastStderr"), "旧的「只存末行」状态应已清除");

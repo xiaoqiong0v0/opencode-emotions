@@ -153,45 +153,19 @@ export function ffmpegLaunchFailedGuidance(bin: string, cause: string): string {
 }
 
 /**
- * 枚举**成功**但音频输入设备为 0 个时的用户引导。
+ * 枚举**成功**但音频输入设备为 0 个时的用户引导（一等错误：错误码 `no-input-device`、退出码 3）。
  *
  * 只有枚举成功且确实 0 设备才用本文案；ffmpeg 启动失败走 {@link ffmpegLaunchFailedGuidance}。
- * @param platform 目标平台（Linux 给 pactl/arecord/audio 组提示）
+ * 文案保持**跨平台通用**（Windows 隐私开关只是最常见的一步），Linux/Termux 同样按此引导排查。
  * @returns 中文可操作提示
  */
-export function noAudioDeviceGuidance(platform: NodeJS.Platform = process.platform): string {
-  const listCommand = "node dist/runtime/voice-runtime.js --list";
-  const deviceHint = '用 --device "<设备名>" 或环境变量 VOICE_DEVICE 指定设备';
-  const listed = `③ 用 ${listCommand} 查看设备列表；`;
-  const specify = `④ ${deviceHint}。`;
-  if (platform === "linux") {
-    return (
-      "未找到音频输入设备（枚举成功但结果为 0 个）。请检查：" +
-      "① 系统麦克风是否已连接并启用；" +
-      "② pactl list short sources / arecord -l 是否有 source；" +
-      `③ ${linuxCaptureGuidance("no-permission")} ` +
-      `④ 用 ${listCommand} 查看设备列表，并${deviceHint}。`
-    );
-  }
+export function noAudioDeviceGuidance(): string {
   return (
-    "未找到音频输入设备（枚举成功但结果为 0 个）。请检查：" +
-    "① 系统麦克风是否已连接并启用；" +
-    "② Windows：设置 → 隐私和安全性 → 麦克风，允许桌面应用访问；" +
-    listed +
-    specify
-  );
-}
-
-/**
- * 自动选到 monitor（输出回环）源时的提示：该源通常永远静音，建议显式指定麦克风。
- * @param device 选中的 source 名
- * @returns 中文可操作提示
- */
-export function monitorSourceFallbackGuidance(device: string): string {
-  return (
-    `未找到真实输入源，自动选到了 monitor 监听源（${device}）——它是输出回环、通常永远静音。` +
-    "请用 --device <麦克风 source 名> 或环境变量 VOICE_DEVICE 显式指定输入设备" +
-    "（pactl list short sources 查看，排除 .monitor）。"
+    "未检测到音频输入设备（麦克风）。请检查：" +
+    "① 麦克风已连接并在系统声音设置中启用；" +
+    "② Windows 设置 → 隐私 → 麦克风 允许桌面应用访问；" +
+    "③ 若使用外置/USB 麦克风，确认驱动与设备未被禁用。" +
+    "可用 --list 查看当前可见设备。"
   );
 }
 

@@ -107,6 +107,7 @@ test("采集进程立即异常退出：无 ready / 有 error / 无 level / 退�
     assert.equal(types.includes("done"), false, "失败路径不得发 done（会与退出码 0 混淆）");
     const errors = events.filter((event) => event.type === "error");
     assert.equal(errors.length, 1, "必须发且只发一条 error");
+    assert.equal(errors[0].code, "capture-failed", "error 事件必须带稳定 code（修复前无 code）");
     assert.match(errors[0].message, /采集|音频/, "error 文案点明采集链");
     assert.match(errors[0].message, /退出码/, "error 带采集进程退出码");
     assert.equal(code, 1, "异常退出必须以非 0 退出码结束（修复前为 0）");

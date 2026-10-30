@@ -25,6 +25,13 @@ import { ffmpegBinaryName } from "../dist/voice/ffmpeg-heal.js";
 const RUNTIME = fileURLToPath(new URL("../dist/runtime/voice-runtime.js", import.meta.url));
 /** 默认（麦克风模式）argv。 */
 const MIC_ARGV = ["--json", "--device", "___nope___", "--provider", "aliyun-qwen-file"];
+/**
+ * 断言中文文案的用例**必须固定** `uiLanguage=zh`。
+ *
+ * 2026-10-30 第二十二批起 NDJSON `message` / stderr 用户文案按 `uiLanguage` 渲染，而内置默认是 `en`；
+ * 不固定语言就会读到英文（例：「No usable ffmpeg found…」而不是「未找到可用的 ffmpeg…」）。
+ */
+const UI_ZH = { VOICE_UI_LANGUAGE: "zh" };
 
 /**
  * 造一个「`-version` 退出码 0」的假 ffmpeg（不联任何网）。
@@ -109,6 +116,7 @@ test("自检不可用 ⇒ progress + error（带引导）+ 非 0 退出、不悬
     const emptyStatic = join(dir, "empty-static");
     mkdirSync(emptyStatic, { recursive: true });
     const { code, events, elapsedMs } = await runRuntime(dir, {
+      ...UI_ZH,
       VOICE_FFMPEG_STATIC_DIRS: emptyStatic,
       FFMPEG_BIN: join(dir, "missing-ffmpeg.exe"),
     });
@@ -118,7 +126,9 @@ test("自检不可用 ⇒ progress + error（带引导）+ 非 0 退出、不悬
     assert.equal(progress.stage, "ffmpeg");
     const errors = events.filter((event) => event.type === "error");
     assert.equal(errors.length, 1, "失败必须发且只发一条 error");
-    assert.match(errors[0].message, /ffmpeg 自动补齐失败/, "文案点明自检失败");
+    assert.equal(errors[0].code, "ffmpeg-unavailable", "error 事件必须带稳定 code（修复前无 code）");
+    // 文案口径（第二十二批）：`message` 是**按 uiLanguage 渲染的用户文案**，不再是内部拼接串
+    assert.match(errors[0].message, /未找到可用的 ffmpeg/, "文案点明自检失败（zh 用户文案）");
     assert.match(errors[0].message, /FFMPEG_BIN/, "带引导（可设 FFMPEG_BIN）");
     assert.equal(types.includes("done"), false, "失败路径不得发 done");
     assert.equal(code, 1, "自检失败必须以非 0 退出");
@@ -138,11 +148,12 @@ test("随附二进制存在且 -version 通过 ⇒ 直接用，不 spawn install
     // 刻意不写 install.js：若误判为「不可用」会走下载并因缺脚本失败
     const { code, stdout, stderr } = await runRuntime(
       dir,
-      { VOICE_FFMPEG_STATIC_DIRS: staticDir, FFMPEG_BIN: join(dir, "missing-ffmpeg.exe") },
+      { ...UI_ZH, VOICE_FFMPEG_STATIC_DIRS: staticDir, FFMPEG_BIN: join(dir, "missing-ffmpeg.exe") },
       ["--list"],
     );
-    assert.equal(code, 0, `应越过自检继续枚举；stderr=${stderr}`);
-    assert.match(stdout, /音频输入设备|未找到音频输入设备/, "必须走到设备枚举输出");
+    // 假 ffmpeg 枚举不出真实设备 ⇒ 枚举成功但 0 设备 = 一等错误（退出码 3，见第二十一批）
+    assert.equal(code, 3, `应越过自检并走到设备枚举（无设备 ⇒ 3）；stderr=${stderr}`);
+    assert.match(stdout, /未检测到音频输入设备/, "必须走到设备枚举并给出提示");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -158,11 +169,11 @@ test("随附二进制存在但 -version 失败 ⇒ 视为不可用（不信「�
     writeFileSync(join(staticDir, ffmpegBinaryName(process.platform)), "not an executable");
     const { code, stderr } = await runRuntime(
       dir,
-      { VOICE_FFMPEG_STATIC_DIRS: staticDir, FFMPEG_BIN: join(dir, "missing-ffmpeg.exe") },
+      { ...UI_ZH, VOICE_FFMPEG_STATIC_DIRS: staticDir, FFMPEG_BIN: join(dir, "missing-ffmpeg.exe") },
       ["--list"],
     );
     assert.equal(code, 1, "存在但不可执行不得被当作可用");
-    assert.match(stderr, /ffmpeg 自动补齐失败/);
+    assert.match(stderr, /未找到可用的 ffmpeg/, "stderr 用户文案点明失败原因（zh）");
     assert.match(stderr, /FFMPEG_BIN/);
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -176,12 +187,13 @@ test("FFMPEG_BIN 通过 -version 校验 ⇒ 完全跳过自检（无 progress）
     mkdirSync(fakeDir, { recursive: true });
     const fake = writeFakeFfmpeg(fakeDir);
     const { code, stdout, stderr } = await runRuntime(dir, {
+      ...UI_ZH,
       FFMPEG_BIN: fake,
       VOICE_FFMPEG_STATIC_DIRS: join(dir, "unused"),
     }, ["--list"]);
-    assert.equal(code, 0, `应使用 FFMPEG_BIN 继续枚举；stderr=${stderr}`);
+    assert.equal(code, 3, `应使用 FFMPEG_BIN 继续枚举（假 ffmpeg 无设备 ⇒ 3）；stderr=${stderr}`);
     assert.equal(/准备 ffmpeg/.test(stdout), false, "已可用时不得触发自检/联网");
-    assert.match(stdout, /音频输入设备|未找到音频输入设备/);
+    assert.match(stdout, /未检测到音频输入设备/);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

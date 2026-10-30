@@ -5,9 +5,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { NdjsonLineSplitter, encodeEvent, parseEventLine } from "../dist/voice/ndjson.js";
+import { NdjsonLineSplitter, encodeEvent, exitCodeReason, parseEventLine } from "../dist/voice/ndjson.js";
 
-test("encodeEvent / parseEventLine：六类事件往返一致", () => {
+test("encodeEvent / parseEventLine：八类事件往返一致（含 warning 与 error.code）", () => {
   const events = [
     { type: "ready", model: "qwen3-asr-flash-realtime" },
     { type: "final", text: "你好", emotion: "happy", annotation: "😊(2/3)" },
@@ -15,7 +15,10 @@ test("encodeEvent / parseEventLine：六类事件往返一致", () => {
     { type: "level", level: 0 },
     { type: "level", level: 1 },
     { type: "progress", stage: "ffmpeg", message: "正在准备 ffmpeg…" },
+    { type: "warning", message: "麦克风似乎没有声音（RMS≈0）" },
+    { type: "warning", message: "麦克风似乎没有声音（RMS≈0）", code: "mic-silent" },
     { type: "error", message: "连接失败" },
+    { type: "error", message: "未检测到音频输入设备", code: "no-input-device" },
     { type: "done" },
   ];
   for (const event of events) {
@@ -94,5 +97,28 @@ test("NdjsonLineSplitter：CRLF 与末尾残留", () => {
     text: "x",
     emotion: "",
     annotation: "",
+  });
+});
+
+test("exitCodeReason：退出码 3 映射稳定 code（契约变更：不再返回中文文案）", () => {
+  assert.equal(exitCodeReason(3), "no-input-device", "修复前返回「未检测到麦克风」（中文硬编码，en 下仍显中文）");
+  assert.equal(exitCodeReason(1), null, "采集/配置异常=1 不抢语义");
+  assert.equal(exitCodeReason(0), null);
+  assert.equal(exitCodeReason(null), null);
+});
+
+test("parseEventLine：warning 缺 message 补空串；error 的 code 非字符串时丢弃该字段", () => {
+  assert.deepEqual(parseEventLine('{"type":"warning"}'), { type: "warning", message: "" });
+  assert.deepEqual(parseEventLine('{"type":"warning","message":"x","code":"mic-silent"}'), {
+    type: "warning",
+    message: "x",
+    code: "mic-silent",
+  });
+  assert.deepEqual(parseEventLine('{"type":"warning","message":"x","code":3}'), { type: "warning", message: "x" });
+  assert.deepEqual(parseEventLine('{"type":"error","message":"x","code":3}'), { type: "error", message: "x" });
+  assert.deepEqual(parseEventLine('{"type":"error","message":"x","code":"no-input-device"}'), {
+    type: "error",
+    message: "x",
+    code: "no-input-device",
   });
 });

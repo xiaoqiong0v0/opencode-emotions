@@ -35,19 +35,29 @@ import {
 } from "../voice/capture.js";
 import { loadVoiceConfig, resolveAsrParams, resolveAsrProvider, voiceConfigPath } from "../voice/config.js";
 import { defaultCredentialsPath, resolveCredentials, resolveMimoApiKey, ASR_MIMO_CREDENTIALS_CONFIG_PATH } from "../voice/credentials.js";
-import {
-  ffmpegLaunchFailedGuidance,
-  monitorSourceFallbackGuidance,
-  noAudioDeviceGuidance,
-} from "../voice/guidance.js";
+import { ffmpegLaunchFailedGuidance, noAudioDeviceGuidance } from "../voice/guidance.js";
 import { FFMPEG_ENV, probeFfmpeg } from "../voice/ffmpeg.js";
 import { ensureFfmpegBinary } from "../voice/ffmpeg-heal.js";
 import { LEVEL_EVENT_INTERVAL_MS, rmsToLevel } from "../voice/meter.js";
+import { createSilenceWatch } from "../voice/mic-watch.js";
 import { annotationForVoiceEmotion } from "../voice/mapping.js";
 import { isTermux } from "../voice/platform.js";
-import { encodeEvent, type RuntimeEvent, type RuntimeFinal } from "../voice/ndjson.js";
+import {
+  ASR_CONNECT_FAILED_CODE,
+  ASR_FAILED_CODE,
+  CAPTURE_FAILED_CODE,
+  CREDENTIALS_MISSING_CODE,
+  encodeEvent,
+  EXIT_NO_INPUT_DEVICE,
+  FFMPEG_UNAVAILABLE_CODE,
+  MIC_SILENT_CODE,
+  NO_INPUT_DEVICE_CODE,
+  type RuntimeEvent,
+  type RuntimeFinal,
+} from "../voice/ndjson.js";
 import { readWavAsPcm16, silencePcm } from "../voice/wav.js";
 import { createStopController } from "./stop-signal.js";
+import { DEFAULT_LANGUAGE, format, getPhrases, runtimeErrorText, runtimeErrorUsesDetail, type Language } from "../lib/i18n.js";
 
 /** 强制走 ffmpeg 自愈（排障/测试；生产不需要）。 */
 const FFMPEG_FORCE_HEAL_ENV = "VOICE_FFMPEG_FORCE_HEAL";
@@ -57,6 +67,56 @@ const STATS_INTERVAL_MS = 2000;
 const WAV_TAIL_SILENCE_MS = 1000;
 /** WAV 自测发送完后的额外等待（毫秒）：等最终结果回传。 */
 const WAV_TAIL_WAIT_MS = 1500;
+
+/**
+ * 本次运行的用户界面语言（来自 `emotions.jsonc` / env 的 `uiLanguage`，解析失败回退默认）。
+ *
+ * 只影响**面向用户**的 stderr 行；NDJSON `message` 仍为内部文案（日志/兜底），
+ * 用户最终文案由 TUI 按 `code` + `uiLanguage` 渲染。
+ */
+let uiLanguage: Language = DEFAULT_LANGUAGE;
+
+/** 取异常的可读 message（`Error` 之外的值也兜住）。 */
+function errorMessageOf(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+/**
+ * 带**稳定错误码**的运行时致命错误（`code` 进 NDJSON `error`，用户文案由 TUI 按 `uiLanguage` 渲染）。
+ *
+ * `message` 是内部/日志文案（中文），不直接作为最终用户文案；`exitCode` 决定进程退出码。
+ */
+export class RuntimeFailureError extends Error {
+  /**
+   * @param code 稳定错误码（见 `voice/ndjson.ts`）
+   * @param message 内部/日志文案
+   * @param exitCode 进程退出码（默认 1）
+   */
+  constructor(
+    readonly code: string,
+    message: string,
+    readonly exitCode: number = 1,
+  ) {
+    super(message);
+    this.name = "RuntimeFailureError";
+  }
+}
+
+/**
+ * 「无音频输入设备」的致命错误（一等错误，2026-10-30 第二十一批）。
+ *
+ * 与普通 `Error`（按退出码 1 处理）区分：带稳定错误码 `no-input-device` 与专用退出码
+ * {@link EXIT_NO_INPUT_DEVICE}，上层据此展示可操作文案而不是笼统的「运行时已退出」。
+ */
+export class NoInputDeviceError extends RuntimeFailureError {
+  /**
+   * @param message 内部/日志文案（用户文案由 `runtimeErrorText("no-input-device", uiLanguage)` 渲染）
+   */
+  constructor(message: string) {
+    super(NO_INPUT_DEVICE_CODE, message, EXIT_NO_INPUT_DEVICE);
+    this.name = "NoInputDeviceError";
+  }
+}
 
 /** 命令行选项。 */
 interface CliOptions {
@@ -170,23 +230,29 @@ function printHelp(): void {
   console.log(lines.join("\n"));
 }
 
-/** 打印本机音频输入设备（Linux 按系统默认源/真实输入源优先排序）。 */
-function printDevices(): void {
+/**
+ * 打印本机音频输入设备（Linux 按系统默认源/真实输入源优先排序）。
+ * @param out 输出通道（`--json` 时人类日志转 stderr，不污染 stdout）
+ * @returns 可见设备数（0 ⇒ 调用方按 `no-input-device` 以退出码 3 结束）
+ */
+function printDevices(out: RuntimeOutput): number {
   const devices = listAudioDevices();
   if (devices.length === 0) {
-    // 枚举成功但确实 0 设备：给面向用户的检查引导（ffmpeg 启动失败会先抛错，不会走到这里）
-    console.log(noAudioDeviceGuidance());
-    return;
+    // 枚举成功但确实 0 设备：给面向用户的检查引导（ffmpeg 启动失败会先抛错，不会走到这里）。
+    // 按 uiLanguage 渲染（同一条错误不得中英混排）。
+    out.info(runtimeErrorText(NO_INPUT_DEVICE_CODE, uiLanguage));
+    return 0;
   }
   const ordered =
     process.platform === "linux" ? orderLinuxDevicesForDisplay(devices, getDefaultPulseSource()) : devices;
-  console.log("音频输入设备：");
+  out.info("音频输入设备：");
   ordered.forEach((device, index) => {
     const alt = device.alternativeName ? `（备用名：${device.alternativeName}）` : "";
     // Linux 的「取值」（pactl source 名 / hw:C,D）与友好名不同时才额外显示
     const value = device.value && device.value !== device.name ? `（取值：${device.value}）` : "";
-    console.log(`  [${index}] ${device.name}${alt}${value}`);
+    out.info(`  [${index}] ${device.name}${alt}${value}`);
   });
+  return ordered.length;
 }
 
 /**
@@ -200,8 +266,8 @@ interface RuntimeOutput {
   event(event: RuntimeEvent): void;
   /** 一条最终结果（json → NDJSON `final`；否则人类可读行）。 */
   final(result: RuntimeFinal): void;
-  /** 错误（json → NDJSON `error`；否则 stderr）。 */
-  error(message: string): void;
+  /** 错误（json → NDJSON `error`；否则 stderr）。`code` 为可选稳定错误码。 */
+  error(message: string, code?: string): void;
 }
 
 /**
@@ -225,8 +291,8 @@ function createOutput(json: boolean): RuntimeOutput {
       }
       console.log(result.annotation ? `${result.text}  ${result.annotation}` : result.text);
     },
-    error(message: string): void {
-      if (json) process.stdout.write(encodeEvent({ type: "error", message }));
+    error(message: string, code?: string): void {
+      if (json) process.stdout.write(encodeEvent(code ? { type: "error", message, code } : { type: "error", message }));
       else console.error(message);
     },
   };
@@ -255,7 +321,7 @@ async function prepareFfmpeg(out: RuntimeOutput): Promise<void> {
     out.info(`[ffmpeg] 使用 FFMPEG_BIN（${override}），跳过自检`);
     return;
   }
-  out.event({ type: "progress", stage: "ffmpeg", message: "正在准备 ffmpeg…" });
+  out.event({ type: "progress", stage: "ffmpeg", message: getPhrases(uiLanguage).progress.preparingFfmpeg });
   const result = await ensureFfmpegBinary({
     log: (message) => out.info(message),
     verify: (path) => probeFfmpeg(path),
@@ -265,7 +331,8 @@ async function prepareFfmpeg(out: RuntimeOutput): Promise<void> {
     out.info(`[ffmpeg] 自检完成（${result.status}）：${result.detail}`);
     return;
   }
-  throw new Error(
+  throw new RuntimeFailureError(
+    FFMPEG_UNAVAILABLE_CODE,
     `ffmpeg 自动补齐失败（${result.status}）：${result.detail}。` +
       ffmpegLaunchFailedGuidance(result.binaryPath ?? "ffmpeg", result.detail),
   );
@@ -285,7 +352,7 @@ interface ResolveDeviceResult {
  * Linux 未显式指定时：先取 `pactl get-default-source`，再回退到枚举中的非 monitor 真实输入源。
  * @param explicit 显式设备名（空串/undefined 表示自动）
  * @returns 设备取值与 monitor 标记
- * @throws Error 无可用设备
+ * @throws NoInputDeviceError 枚举成功但没有任何输入设备（错误码 `no-input-device`、退出码 3）
  */
 function resolveDevice(explicit?: string): ResolveDeviceResult {
   const hasExplicit = typeof explicit === "string" && explicit.trim().length > 0;
@@ -298,13 +365,13 @@ function resolveDevice(explicit?: string): ResolveDeviceResult {
     // 显式指定与自动解析统一走同一生产入口（显式时该函数内部直接返回，不触发 pactl 查询）
     const resolved = resolveLinuxCaptureDevice({ explicit });
     if (!resolved) {
-      // 枚举成功但 0 设备：给检查/指定设备的引导（ffmpeg 启动失败会先从 listAudioDevices 抛错）
-      throw new Error(noAudioDeviceGuidance());
+      // 枚举成功但 0 设备：一等错误（ffmpeg 启动失败会先从 listAudioDevices 抛错）
+      throw new NoInputDeviceError(noAudioDeviceGuidance());
     }
     return { device: resolved.value, monitor: resolved.monitor };
   }
   const first = listAudioDevices()[0];
-  if (!first) throw new Error(noAudioDeviceGuidance());
+  if (!first) throw new NoInputDeviceError(noAudioDeviceGuidance());
   // Windows：name 是友好 description，真正传给 ffmpeg 的是 value
   return { device: first.value ?? first.name, monitor: false };
 }
@@ -434,6 +501,11 @@ async function runMic(
 ): Promise<void> {
   const capture = new MicCapture({ device, sampleRate });
   const stop = createStopController({ seconds });
+  /**
+   * 无声告警观察器（2026-10-30）：自首包起 ~3s 内 RMS 峰值仍低于阈值 ⇒ **只发一次** warning。
+   * 选错设备/系统静音时用户只会看到「在听」却没有结果，这里给一条明确提示。
+   */
+  const silenceWatch = createSilenceWatch();
   let capturedBytes = 0;
   let sampleCount = 0;
   let squareSum = 0;
@@ -479,6 +551,13 @@ async function runMic(
     squareSum += sum;
     windowSamples += count;
     windowSquareSum += sum;
+    // 无声判定按**单块 RMS**喂入（观察窗口内取峰值），命中即一次性告警
+    const chunkRms = count > 0 ? Math.sqrt(sum / count) : 0;
+    if (silenceWatch.observe(chunkRms, Date.now())) {
+      // 告警带稳定 code；NDJSON `message` 与 stderr 都按 uiLanguage 渲染（JSON 消费者无需再查文案表）
+      out.event({ type: "warning", code: MIC_SILENT_CODE, message: runtimeErrorText(MIC_SILENT_CODE, uiLanguage) });
+      out.info(runtimeErrorText(MIC_SILENT_CODE, uiLanguage));
+    }
     client.feed(chunk);
   });
   capture.on("error", (error: Error) => {
@@ -499,9 +578,10 @@ async function runMic(
   try {
     capture.start();
   } catch (err) {
-    // 启动期抛错（ffmpeg 路径解析/spawn）：先摘掉停止通道监听，避免 stdin 句柄把进程拖住
+    // 启动期抛错（ffmpeg 路径解析/spawn）：先摘掉停止通道监听，避免 stdin 句柄把进程拖住；
+    // 统一带上 capture-failed 稳定错误码（退出码 1）
     stop.dispose();
-    throw err;
+    throw new RuntimeFailureError(CAPTURE_FAILED_CODE, errorMessageOf(err));
   }
   out.info(`采集中：device=${device}（Ctrl+C 结束${seconds ? `，或 ${seconds}s 后` : ""}）`);
 
@@ -520,7 +600,7 @@ async function runMic(
   }
   intentionalStop = true;
   capture.stop();
-  if (failure !== null) throw new Error(failure);
+  if (failure !== null) throw new RuntimeFailureError(CAPTURE_FAILED_CODE, failure);
   await client.finish();
 }
 
@@ -533,10 +613,22 @@ async function main(): Promise<void> {
     printHelp();
     return;
   }
+  // 用户可见文案语言：尽早解析（`--list` 也要用）；配置坏了回退默认，不影响主流程后续抛出真实错误
+  try {
+    uiLanguage = loadVoiceConfig().uiLanguage;
+  } catch {
+    uiLanguage = DEFAULT_LANGUAGE;
+  }
   if (options.list) {
     // 列表要枚举设备：同样先确保 ffmpeg（新机器首次运行也能直接看到设备）
-    await prepareFfmpeg(createOutput(options.json));
-    printDevices();
+    const out = createOutput(options.json);
+    await prepareFfmpeg(out);
+    const count = printDevices(out);
+    if (count === 0) {
+      // 枚举成功但 0 设备 ⇒ 一等错误：打印引导并以专用退出码结束（不再「空列表 + 退出 0」）
+      out.event({ type: "error", code: NO_INPUT_DEVICE_CODE, message: runtimeErrorText(NO_INPUT_DEVICE_CODE, uiLanguage) });
+      process.exitCode = EXIT_NO_INPUT_DEVICE;
+    }
     return;
   }
 
@@ -556,24 +648,39 @@ async function main(): Promise<void> {
   }
   const language = asrParams.language;
 
+  const out = createOutput(options.json);
+  // 麦克风模式：枚举设备前先确保 ffmpeg（`--wav` 不碰采集，跳过硬避免多余联网/耗时）
+  if (!options.wav) await prepareFfmpeg(out);
+  // 「无输入设备」是一等错误：在取凭证 / 连 ASR / 进入采集**之前**判定，
+  // 保证用户看到的是「没麦克风」而不是被后面的凭证/连接错误掩盖。
+  const target = options.wav ? null : resolveDevice(device);
+  if (target?.monitor) {
+    const notice = format(getPhrases(uiLanguage).progress.monitorFallback, { device: target.device });
+    // TUI 只在 runtime 退出时取样 stderr：改用 NDJSON progress 即时 toast；非 json 模式仍打人类日志
+    out.event({ type: "progress", stage: "capture", message: notice });
+    out.info(notice);
+  }
+
   // 凭证分流：mimo 走 resolveMimoApiKey（env MIMO_API_KEY > asr.mimoCredentials，与 tts.mimoCredentials 相互独立、无 workspace）；
   // 其余 provider（含 aliyun-qwen-file 按段）沿用 resolveCredentials（env > asr.credentials > 凭证文件）。
   let credentials: { workspace: string; apiKey: string } | undefined;
   let mimoApiKey: string | undefined;
-  if (provider.id === "mimo") {
-    mimoApiKey = resolveMimoApiKey({ config: config.asr.mimoCredentials, configPath: ASR_MIMO_CREDENTIALS_CONFIG_PATH });
-  } else {
-    credentials = resolveCredentials({
-      config: config.asr.credentials,
-      cliPath: options.credentials,
-      defaultPath: defaultCredentialsPath(),
-      section: "asr",
-      providerLabel: provider.id,
-    });
+  try {
+    if (provider.id === "mimo") {
+      mimoApiKey = resolveMimoApiKey({ config: config.asr.mimoCredentials, configPath: ASR_MIMO_CREDENTIALS_CONFIG_PATH });
+    } else {
+      credentials = resolveCredentials({
+        config: config.asr.credentials,
+        cliPath: options.credentials,
+        defaultPath: defaultCredentialsPath(),
+        section: "asr",
+        providerLabel: provider.id,
+      });
+    }
+  } catch (err) {
+    // 凭证缺失/不可用是一类稳定错误（TUI 按 code 展示本地化引导）
+    throw new RuntimeFailureError(CREDENTIALS_MISSING_CODE, errorMessageOf(err));
   }
-  const out = createOutput(options.json);
-  // 麦克风模式：枚举设备前先确保 ffmpeg（`--wav` 不碰采集，跳过硬避免多余联网/耗时）
-  if (!options.wav) await prepareFfmpeg(out);
   const onFinal = (result: AsrResult): void => {
     const text = result.text.trim();
     if (text.length === 0) return;
@@ -603,13 +710,17 @@ async function main(): Promise<void> {
       if (result.isFinal) onFinal(result);
     },
     onError: (message: string) => {
-      if (options.json) out.error(message);
+      if (options.json) out.error(message, ASR_FAILED_CODE);
       else console.error(`[ASR 错误] ${message}`);
     },
   });
 
   try {
-    await client.connect();
+    try {
+      await client.connect();
+    } catch (err) {
+      throw new RuntimeFailureError(ASR_CONNECT_FAILED_CODE, errorMessageOf(err));
+    }
     out.info(
       `ASR 已连接：provider=${provider.id} model=${model} language=${language || "自动"}${
         options.wav ? "（WAV 自测）" : ""
@@ -621,13 +732,7 @@ async function main(): Promise<void> {
       await runWav(client, options.wav, out, provider.sampleRate, client.transport);
     } else {
       // 麦克风模式：`ready` 由 runMic 在**首包到达**时发（采集进程异常退出则绝不发）
-      const target = resolveDevice(device);
-      if (target.monitor) {
-        const notice = monitorSourceFallbackGuidance(target.device);
-        // TUI 只在 runtime 退出时取样 stderr：改用 NDJSON progress 即时 toast；非 json 模式仍打人类日志
-        out.event({ type: "progress", stage: "capture", message: notice });
-        out.info(notice);
-      }
+      if (target === null) throw new Error("内部错误：麦克风模式缺少采集设备解析结果");
       await runMic(client, target.device, options.seconds, out, provider.sampleRate, model);
     }
   } finally {
@@ -636,19 +741,28 @@ async function main(): Promise<void> {
 
   out.event({ type: "done" });
   if (client.errorMessage) {
-    if (options.json) out.error(client.errorMessage);
-    else console.error(`[voice-runtime] 结束（有错误）：${client.errorMessage}`);
+    if (options.json) out.error(client.errorMessage, ASR_FAILED_CODE);
+    else console.error(`[voice-runtime] ${runtimeErrorText(ASR_FAILED_CODE, uiLanguage, client.errorMessage)}`);
     process.exitCode = 1;
   }
 }
 
 void main().catch((err: Error) => {
-  const message = err.message;
-  console.error(`[voice-runtime] ${message}`);
+  const message = errorMessageOf(err);
+  const code = err instanceof RuntimeFailureError ? err.code : null;
+  // 带占位符的 code（capture-failed / asr-*）保留内部 detail；无占位符的直接产出本地化可操作文案
+  const ndjsonMessage =
+    code !== null && !runtimeErrorUsesDetail(code) ? runtimeErrorText(code, uiLanguage, message) : message;
+  // stderr 是面向用户的行：按 uiLanguage 渲染（en 下丢弃中文内部 detail，未知错误走兜底模板）
+  console.error(`[voice-runtime] ${runtimeErrorText(code, uiLanguage, message)}`);
   // --json 模式：致命错误（ffmpeg/设备/凭证缺失等配置引导）也走 NDJSON error，
-  // TUI toast 直接展示文案；stderr 行保留供日志与 runtimeExited 摘要兜底。
+  // TUI 据此按 `code` + `uiLanguage` 展示文案；stderr 行保留供日志与 runtimeExited 摘要兜底。
   if (process.argv.includes("--json")) {
-    process.stdout.write(encodeEvent({ type: "error", message }));
+    process.stdout.write(
+      encodeEvent(code === null ? { type: "error", message } : { type: "error", message: ndjsonMessage, code }),
+    );
   }
-  process.exitCode = 1;
+  // 退出码分层：无设备=3（不进采集）、其余致命错误=1（保持既有语义）
+  process.exitCode = err instanceof RuntimeFailureError ? err.exitCode : 1;
 });
+
