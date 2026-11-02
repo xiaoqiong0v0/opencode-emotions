@@ -254,13 +254,19 @@ test("两处中断出口都写会话级中断请求水位（F10 双态中断 + F
     "F10 中断埋点缺少 interruptReq=（水位是否落盘无从取证）",
   );
 
-  // ② F8/F9 barge-in：有会话路由才写（取不到会话则不写，保持「无主」语义）
+  // ② F8/F9 barge-in：有会话路由才写且才停（取不到会话则两者都不做，避免退化成“全清”）
   const modeAt = code.indexOf("const interruptSession = currentSessionID(api);");
   assert.ok(modeAt > 0, "找不到 F8/F9 barge-in 入口");
   const modeBlock = code.slice(modeAt, code.indexOf("f8f9 interrupt: stopped=", modeAt));
   assert.ok(
-    /if \(interruptSession\) writeInterruptRequest\(interruptSession\);/.test(modeBlock),
-    "F8/F9 barge-in 未写水位，或未做「取不到会话则不写」门",
+    /if \(interruptSession\) \{[\s\S]*?writeInterruptRequest\(interruptSession\);[\s\S]*?stopPlayback\(/.test(
+      modeBlock,
+    ),
+    "F8/F9 barge-in 未在「有会话」门内写水位，或水位未先于停播",
+  );
+  assert.ok(
+    !/\}\s*else\s*\{[\s\S]*?stopPlayback\(/.test(modeBlock),
+    "F8/F9 不得在「取不到会话」分支里调用 stopPlayback（会退化成全清、误杀其它会话）",
   );
   assert.ok(
     modeBlock.indexOf("writeInterruptRequest") < modeBlock.indexOf("stopPlayback({"),

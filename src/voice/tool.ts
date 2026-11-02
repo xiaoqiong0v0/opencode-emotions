@@ -36,6 +36,7 @@ import type { Logger } from "@xiaoqiong0v0/opencode-plugin-logger";
 import { DEFAULT_LANGUAGE, getPhrases, type Phrases } from "../lib/i18n.js";
 import { loadVoiceConfig } from "./config.js";
 import { readAutoTts } from "./auto-tts.js";
+import { PLAYBACK_SESSION_ENV } from "./playback-state.js";
 
 /** 工具名（CLI 风格；与包名对齐）。 */
 const TOOL_NAME = "emotions_cli";
@@ -278,6 +279,7 @@ function preview(text: string, max: number): string {
  * @param argv 完整参数（含脚本路径）
  * @param stdinText 写入 stdin 的正文（undefined = 只关闭 stdin）
  * @param abortSignal 宿主取消信号（`ToolContext.abort`）
+ * @param env 子进程环境（含归属注入 `EMOTIONS_SESSION_ID`；undefined = 继承父进程）
  * @returns 执行结果
  */
 function runCli(
@@ -285,6 +287,7 @@ function runCli(
   argv: string[],
   stdinText: string | undefined,
   abortSignal: AbortSignal | undefined,
+  env?: NodeJS.ProcessEnv,
 ): Promise<SpawnOutcome> {
   const timeoutMs = resolveTimeoutMs();
   return new Promise<SpawnOutcome>((resolveOutcome) => {
@@ -320,6 +323,7 @@ function runCli(
         windowsHide: true,
         stdio: ["pipe", "pipe", "pipe"],
         signal: abortSignal,
+        ...(env ? { env } : {}),
       });
     } catch (err) {
       // spawn 同步失败（极少见；异步失败走 error 事件）
@@ -421,6 +425,9 @@ export function createVoiceTool(log: Logger): Record<string, ToolDefinition> {
         // 只拦 `speak`（含 --follow/--background 变体），help/devices/status 不拦；
         // **auto-read 自身不经此工具**（`auto-read.ts` 直接 spawn CLI 派生 worker），不会自拦。
         const sid = context?.sessionID ?? "";
+        // 播放归属注入：工具触发的 CLI 播放按本会话登记（CLI 读 `EMOTIONS_SESSION_ID`），
+        // 避免落成无主 `_` 被任意会话的 stop 杀掉；空 sessionID 不注入（CLI 侧缺归属即跳过清场）。
+        const childEnv = sid ? { ...process.env, [PLAYBACK_SESSION_ENV]: sid } : undefined;
         if (shouldInterceptSpeakForAutoRead(extra, readAutoTts(sid))) {
           log.info(`speak intercepted (auto-read on): session=${sid || "-"} args=${extra}`);
           // 文案 execute 时**现取**（toolLanguage 可能在加载后被改，不用 createVoiceTool 的加载期缓存表）
@@ -449,6 +456,7 @@ export function createVoiceTool(log: Logger): Record<string, ToolDefinition> {
             [cliPath, ...invocation.args],
             invocation.stdinText,
             context?.abort,
+            childEnv,
           );
           const canRetry = outcome.error?.code === "ENOENT" && index < attempts.length - 1;
           if (canRetry) continue;

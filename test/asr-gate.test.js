@@ -6,7 +6,8 @@
  * `tailMs` 缺省 = `ASR_GATE_TAIL_MS`；
  * **归属口径边界**（真值取自 helper、临时目录注入、`isAlive` 注入不真探进程）：其它会话有**存活**播放 →
  * 传**本会话 id** 判假 ⇒ 门放行；传哨兵键 `_`（TUI 无会话路由时的口径）同样判假；传**空串**才为真
- * （本门不使用空串口径，此处钉死差异，防止改用空 sessionID 越界读其它会话）；无主条目任何会话都算 → 拦。
+ * （本门不使用空串口径，此处钉死差异，防止改用空 sessionID 越界读其它会话）；无主条目仍算活跃 → 拦
+ * （判活比 stopPlayback 宽：`stopPlayback({ sessionID })` 按方案 A 会跳过无主）。
  * **活跃口径（审计 P1，2026-10-22）**：新鲜 ≠ 活跃——判活以 pid 存活为准，判死条目当场清理；
  * 仅无 pid 的条目用 ≤15s 短 TTL，探测异常一律 fail-open（不阻断）。
  * 产物接线断言见 `test/tui-diagnostics.test.js`。
@@ -109,7 +110,7 @@ test("静音门：无主（手动 speak）播放算本会话可见 → 拦", () 
     const opts = { dataDir: dir, now: () => T };
     assert.equal(writePlayback({ pid: 4343, provider: "sapi", startedAt: T, kind: "speak" }, opts), true);
     const active = isInterruptablePlaybackActive("ses_self", T, { ...opts, isAlive: () => true });
-    assert.equal(active, true, "无主条目任何会话都算（与 stopPlayback 同口径）");
+    assert.equal(active, true, "无主条目仍算活跃（判活门比 stopPlayback 宽）");
     assert.equal(shouldDropAsrFinal(active, T, T, ASR_GATE_TAIL_MS), true);
   } finally {
     rmSync(dir, { recursive: true, force: true });

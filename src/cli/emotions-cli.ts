@@ -78,6 +78,34 @@ export const ENV_PLAY_PAYLOAD = "OC_VOICE_PLAY";
 
 const log: Logger = createLogger("emotions-cli");
 
+/** 开播前清场的可注入依赖（单测用 spy 断言「无 env 不清场」）。 */
+export interface EnvScopedStopOptions {
+  /** 环境变量来源（默认 `process.env`）。 */
+  env?: NodeJS.ProcessEnv;
+  /** 停止函数（默认 `stopPlayback`）。 */
+  stop?: (options: { sessionID: string }) => boolean;
+}
+
+/**
+ * 开播前清场：**只在 env `EMOTIONS_SESSION_ID` 非空时按会话停**；缺失/空白 → 跳过（不隐式全清）。
+ *
+ * 缺归属意味着无法判断本次播放属于哪个会话，全清会误杀其它会话正在播的语音（跨会话误杀根因之二）。
+ * 需要真正的全清时由显式入口（`stopPlayback()` 无参）负责，本函数绝不退化。
+ * @param options 可注入 env / stop（单测）
+ * @returns 是否执行了按会话停止
+ */
+export function stopPlaybackForEnvSession(options: EnvScopedStopOptions = {}): boolean {
+  const env = options.env ?? process.env;
+  const sessionID = env[PLAYBACK_SESSION_ENV]?.trim() ?? "";
+  if (sessionID.length === 0) {
+    // logger 无 debug 级；该路径只在手动 speak/工具无归属时出现，info 一行低噪
+    log.info("跳过开播前清场：未设置 EMOTIONS_SESSION_ID（不隐式全清）");
+    return false;
+  }
+  const stop = options.stop ?? stopPlayback;
+  return stop({ sessionID });
+}
+
 /** 无法得知时的占位。 */
 const NONE = "-";
 
@@ -308,8 +336,8 @@ async function runSpeakFollow(command: Extract<CliCommand, { kind: "speak" }>): 
     return 1;
   }
   try {
-    // 只清本会话（含无主）再开播：跨会话混音——B 会话开播不杀 A 会话；无 env（手动/工具）= 无参全清（既有语义）
-    stopPlayback({ sessionID: process.env[PLAYBACK_SESSION_ENV]?.trim() || undefined });
+    // 只清本会话（含无主）再开播：跨会话混音——B 会话开播不杀 A 会话；无 env（手动/工具）= 跳过清场（不隐式全清）
+    stopPlaybackForEnvSession();
     provider.followStart({
       text: "",
       voice: resolved.voice,
@@ -887,8 +915,8 @@ async function runSpeak(command: Extract<CliCommand, { kind: "speak" }>): Promis
 
   if (!command.background) {
     try {
-      // 只清本会话（含无主）再开播：跨会话混音——B 会话开播不杀 A 会话；无 env（手动/工具）= 无参全清（既有语义）
-      stopPlayback({ sessionID: process.env[PLAYBACK_SESSION_ENV]?.trim() || undefined });
+      // 只清本会话（含无主）再开播：跨会话混音——B 会话开播不杀 A 会话；无 env（手动/工具）= 跳过清场（不隐式全清）
+      stopPlaybackForEnvSession();
       const result = speak(request);
       out(
         format(phrases.cli.speakStarted, {
@@ -978,8 +1006,8 @@ async function runPlay(): Promise<number> {
     return 1;
   }
   try {
-    // 只清本会话（含无主）再开播：跨会话混音——B 会话开播不杀 A 会话；无 env（手动/工具）= 无参全清（既有语义）
-    stopPlayback({ sessionID: process.env[PLAYBACK_SESSION_ENV]?.trim() || undefined });
+    // 只清本会话（含无主）再开播：跨会话混音——B 会话开播不杀 A 会话；无 env（手动/工具）= 跳过清场（不隐式全清）
+    stopPlaybackForEnvSession();
     const result = speak({
       text: payload.text,
       voice: payload.voice,

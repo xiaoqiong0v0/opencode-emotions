@@ -39,7 +39,7 @@ import {
 } from "../dist/voice/slot.js";
 import { LEVEL_EVENT_INTERVAL_MS, LEVEL_FULL_SCALE_RMS, rmsToLevel } from "../dist/voice/meter.js";
 import { PLAY_COMMAND, parseCliArgs } from "../dist/voice/cli.js";
-import { registerPlaybackLifecycle } from "../dist/cli/emotions-cli.js";
+import { registerPlaybackLifecycle, stopPlaybackForEnvSession } from "../dist/cli/emotions-cli.js";
 import {
   clearPlayback,
   PLAYBACK_OWNERLESS_KEY,
@@ -570,7 +570,7 @@ test("CLI 登记：env EMOTIONS_SESSION_ID → tts-playback 条目带 sessionID�
 
 test("CLI 开播前清场带 env sessionID（跨会话混音：三处无裸 stopPlayback() 全清）", () => {
   // 手法同 tui-diagnostics/emotions-hook：读构建产物文本做接线断言——三处清场（speak/follow/__play）
-  // 必须带 env 会话（B 会话开播不杀 A 会话）；裸 stopPlayback() = 停全部条目 = 跨会话误杀回归
+  // 必须走 stopPlaybackForEnvSession()（只在 env 非空时按会话停；缺 env 跳过，绝不隐式全清）
   const src = readFileSync(fileURLToPath(new URL("../dist/cli/emotions-cli.js", import.meta.url)), "utf8");
   const code = src
     .split("\n")
@@ -580,10 +580,32 @@ test("CLI 开播前清场带 env sessionID（跨会话混音：三处无裸 stop
     })
     .join("\n");
   assert.deepEqual(code.match(/stopPlayback\(\s*\)/g) ?? [], [], "存在裸 stopPlayback()：B 会话开播会杀 A 会话");
-  const scoped = code.match(/stopPlayback\(\{\s*sessionID/g) ?? [];
-  assert.equal(scoped.length, 3, "三处清场（speak/follow/__play）都带 sessionID（本会话隔离）");
-  const envBound = code.match(/process\.env\[PLAYBACK_SESSION_ENV\]/g) ?? [];
-  assert.ok(envBound.length >= 3, "清场与登记的 sessionID 都来自 env EMOTIONS_SESSION_ID 机制");
+  assert.deepEqual(
+    code.match(/stopPlayback\(\{\s*sessionID:\s*process\.env/g) ?? [],
+    [],
+    "不得把可能在缺失时变 undefined 的 env 直接传给 stopPlayback（会隐式全清）",
+  );
+  const scoped = code.match(/stopPlaybackForEnvSession\(\)/g) ?? [];
+  assert.equal(scoped.length, 3, "三处清场（speak/follow/__play）都走 env 会话收窄 helper");
+  assert.ok(/process\.env\[PLAYBACK_SESSION_ENV\]/.test(code), "清场与登记的 sessionID 都来自 env EMOTIONS_SESSION_ID 机制");
+});
+
+test("stopPlaybackForEnvSession：env 缺失/空白 → 跳过（不触发全清）；有值 → 只按该 id 停", () => {
+  // 修复前行为会把 undefined 传给 stopPlayback ⇒ 停全部条目（跨会话误杀）。本用例在修复前必红。
+  const calls = [];
+  const stop = (options) => {
+    calls.push(options);
+    return true;
+  };
+  assert.equal(stopPlaybackForEnvSession({ env: {}, stop }), false, "无 env → 不执行停止");
+  assert.equal(stopPlaybackForEnvSession({ env: { [PLAYBACK_SESSION_ENV]: "   " }, stop }), false, "纯空白 → 不执行停止");
+  assert.deepEqual(calls, [], "缺归属时 stop 一次都不调用（不得隐式全清）");
+  assert.equal(
+    stopPlaybackForEnvSession({ env: { [PLAYBACK_SESSION_ENV]: " ses_env_2 " }, stop }),
+    true,
+    "有 env → 执行按会话停止",
+  );
+  assert.deepEqual(calls, [{ sessionID: "ses_env_2" }], "只以 trim 后的会话 id 调用");
 });
 
 test("config：语言拆两键 uiLanguage/toolLanguage（默认 en / 旧键兜底 / 环境变量覆盖）", () => {

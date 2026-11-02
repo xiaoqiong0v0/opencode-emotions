@@ -10,7 +10,7 @@
  * **多条目 map（2026-10-21 第五批，跨会话混音）**：文件内容为 `{ [sessionID]: PlaybackEntry }`——
  * 每个会话一键、并行播放互不覆盖（旧单槽整文件覆盖写会让先播条目失踪、无法再被停）；
  * 无 sessionID（手动 speak）与**旧单条格式**（顶层有数值 `pid`）读作哨兵键
- * {@link PLAYBACK_OWNERLESS_KEY}（无主条目：任何会话的打断都可停）。
+ * {@link PLAYBACK_OWNERLESS_KEY}（无主条目：**按会话停一律跳过，只有显式全清 `stopPlayback()` 无参才停**）。
  * 产品口径（用户拍板）：**跨会话混音**（B 会话开播**不杀** A 会话，Windows 混音器天然多流并存）、
  * **单会话互斥**（同会话内新播顶旧播、发消息/F10 关仍立即停本会话）、**不做排队**。
  *
@@ -34,12 +34,14 @@ export { PLAYBACK_FILE_NAME };
 /**
  * 播放会话归属的环境变量名：**auto-read 派生 CLI 时按消息 sessionID 注入**（`spawnSpeak`/`spawnWorker`），
  * CLI 登记 `tts-playback` 时读取（`emotions-cli` `registerPlaybackLifecycle`）。走 **env 而非 argv**——
- * 免改 CLI 参数解析；手动 speak（工具/命令行）未设置该 env ⇒ 条目无主，任何消息可打断（有意兼容）。
+ * 免改 CLI 参数解析；手动命令行 `emotions-cli` 未设置该 env ⇒ 条目无主。**按会话停不会触碰无主条目**，
+ * 只有显式全清（`stopPlayback()` 无参）才停它——避免任何会话的打断误杀手动播放。
  */
 export const PLAYBACK_SESSION_ENV = "EMOTIONS_SESSION_ID";
 /**
  * **无主条目**的 map 键（哨兵）：手动 speak（无 sessionID）与旧单条格式（顶层有数值 `pid`）都落此键。
- * 语义沿用「无主可被任意停止」；导出供单测与文档引用（opencode 会话 ID 恒为 `ses_` 前缀，不会撞键）。
+ * 语义：**按会话停跳过无主；仅显式全清（无参 `stopPlayback()`）停止**。导出供单测与文档引用
+ * （opencode 会话 ID 恒为 `ses_` 前缀，不会撞键）。
  */
 export const PLAYBACK_OWNERLESS_KEY = "_";
 /** 状态条目被认为「新鲜」的最长时间（超过则视为陈旧，防 PID 复用误杀；每次读写时顺带清）。 */
@@ -78,7 +80,7 @@ export interface PlaybackEntry {
   /**
    * 播放归属会话（**可选**；旧格式/手动 speak 未设置时无此键=无主播放）。
    * 写入：auto-read 派生 CLI 时经 env {@link PLAYBACK_SESSION_ENV} 传递、CLI 登记时带入；
-   * 读取：带 sessionID 的 `stopPlayback` 据此做跨会话隔离（无主条目任何消息都可打断）；
+   * 读取：带 sessionID 的 `stopPlayback` 据此做跨会话隔离（无主条目按会话停一律跳过）；
    * 存储：map 键恒为 `sessionID ?? PLAYBACK_OWNERLESS_KEY`（读写两侧同口径）。
    */
   sessionID?: string;
@@ -97,9 +99,9 @@ export interface PlaybackStateOptions extends PlaybackFileOptions {
   /** 存活探测；默认 `process.kill(pid, 0)`。 */
   isAlive?: (pid: number) => boolean;
   /**
-   * 打断方所属会话（`chat.message`/TUI/CLI 清场按当前会话传入）：非空 → 只停「**该会话键 + 无主**」
-   * 条目，条目 `sessionID` 存在且不等 → 跨会话**不杀**（不清状态、记一行 info）；
-   * 空/缺省 → **停全部条目**（dispose/全清路径）。
+   * 打断方所属会话（`chat.message`/TUI/CLI 清场按当前会话传入）：非空 → **只停该会话键条目**；
+   * 无主条目（`_`）→ **跳过**（记一行 INFO），条目 `sessionID` 存在且不等 → 跨会话**不杀**（不清状态、记一行 info）；
+   * 空/缺省 → **停全部条目（含无主）**（显式 dispose/全清路径）。
    */
   sessionID?: string;
 }
@@ -198,22 +200,23 @@ export function isProcessAlive(pid: number): boolean {
  * 停止播放（多条目）：读 map → **逐条目**过会话归属门 → 对每条目的 **`pid` 与 `playerPid` 两个目标**
  * 各自过红线后 `SIGTERM`（有界超时后 `SIGKILL`）→ 清该条目。
  *
- * **多条目语义表（2026-10-21 第五批）**：
+ * **多条目语义表（2026-10-21 第五批；2026-11-02 方案 A 修订）**：
  * | 操作 | sessionID | 行为 |
  * | --- | --- | --- |
- * | stop | 非空 | 停「该会话键 + 无主条目」；条目 `sessionID` 存在且不等 → 跳过（info 一行） |
- * | stop | 空/缺省 | 停**全部条目**（dispose/全清） |
+ * | stop | 非空 | 只停该会话键条目；**无主条目跳过**（INFO `skipped ownerless stop`）；条目 `sessionID` 存在且不等 → 跳过（info 一行） |
+ * | stop | 空/缺省 | 停**全部条目（含无主 `_`）**——**唯一**能停无主的入口（显式 dispose/全清） |
  * | write | —（看 `entry.sessionID`） | 按 `sessionID ?? "_"` upsert 单键，不动其它键 |
  * | read | 非空 | 该键条目（无 → undefined） |
  * | read | 空/缺省 | 全部条目（键 map） |
  * | clear | —（按 pid） | 删**含该 pid**（`pid`/`playerPid`）的条目，可能多条 |
- * | 旧单条格式 | — | 顶层有数值 `pid` → 读作无主键 `_`（无主可被任意停止） |
+ * | 旧单条格式 | — | 顶层有数值 `pid` → 读作无主键 `_`（按会话停跳过；仅显式全清停） |
  *
  * 为什么两个都杀：`pid` 是 CLI（node）进程，`playerPid` 是真正发声的孙进程（如 sapi 的 PowerShell）；
  * Windows `TerminateProcess` 不杀子孙——只杀 `pid` 会让孙进程继续把当前块播完（用户实测缺陷）。
  * 静默降级：无记录 / 条目陈旧（超 TTL，读取时已清）/ 目标都不可杀（`<=1`、指向自身、已退出）→ 不杀。
  * 日志（`createLogger("playback")`）：成功停止每条记 info `stopped playback session=<id|-> provider=<…>`；
- * 跨会话跳过每条记一行 info（低噪，一行，带双方 session 键）。
+ * 跨会话跳过每条记一行 info（低噪，一行，带双方 session 键）；按会话停跳过无主条目记一行 INFO
+ * `skipped ownerless stop: requestedBy=<id> provider=<…> pid=<…>`。
  * @param options 选项（路径/注入的 kill·isAlive·now/`sessionID` 会话范围）
  * @returns 是否发出了终止信号（任一目标命中即 true；全部跳过为 false）
  */
@@ -223,12 +226,20 @@ export function stopPlayback(options: PlaybackStateOptions = {}): boolean {
   const kill = options.kill ?? ((pid: number, signal: NodeJS.Signals) => process.kill(pid, signal));
   const isAlive = options.isAlive ?? isProcessAlive;
   let signaled = false;
-  // 逐条目：门（带 sessionID 且条目有主且不等 → 跳过）→ 红线流程（TERM→KILL）→ 清条目
+  // 逐条目：门（带 sessionID 且条目有主且不等 → 跳过）→ 无主跳过 → 红线流程（TERM→KILL）→ 清条目
   for (const entry of Object.values(map)) {
     const owned = typeof entry.sessionID === "string" && entry.sessionID.length > 0;
     if (wanted.length > 0 && owned && entry.sessionID !== wanted) {
       log.info(
         `skipped cross-session stop: session=${wanted} entry=${entry.sessionID} provider=${entry.provider}`,
+      );
+      continue;
+    }
+    // 方案 A（2026-11-02）：**按会话停一律不碰无主条目**——无主只来自手动 CLI/未注入会话的路径，
+    // 任何会话的打断都不应误杀它；只有显式全清（wanted 为空）才停 `_`。
+    if (wanted.length > 0 && !owned) {
+      log.info(
+        `skipped ownerless stop: requestedBy=${wanted} provider=${entry.provider} pid=${entry.pid}`,
       );
       continue;
     }
@@ -290,8 +301,9 @@ export function classifyPlaybackEntry(
 /**
  * **F10 双态中断判活**（2026-10-22）：该会话（或**无主**）是否存在「可中断的活跃播放」。
  *
- * 会话归属口径与 {@link stopPlayback} **完全一致**（同源 `loadMap` + 同一道归属门）：
- * `sessionID` 非空 → 只看「该会话键条目 + 无主条目」，其它会话的条目**一律不算**；
+ * 会话归属口径与 {@link stopPlayback} **同源 `loadMap`**，但判活门有意更宽：
+ * `sessionID` 非空 → 看「该会话键条目 + **无主条目**」（无主仍算活跃——半双工门要防回声、F10 要判「有播」），
+ * 其它会话的条目**一律不算**；`stopPlayback` 则按会话停**跳过无主**（方案 A，2026-11-02），两者不同是有意为之。
  * `sessionID` 空/空白 → 全部条目都算（与无参 stop 停全部同口径）。
  *
  * 「活跃」判据（{@link classifyPlaybackEntry}）：
@@ -322,7 +334,7 @@ export function isInterruptablePlaybackActive(
     const isAlive = options.isAlive ?? isProcessAlive;
     const deadKeys: string[] = [];
     let active = false;
-    // 逐条目：会话归属门（与 stopPlayback 同口径：有主且不等 → 跳过）→ 存活探测/短 TTL
+    // 逐条目：会话归属门（有主且不等 → 跳过；**无主仍计入活跃**，与 stopPlayback 按会话停跳过无主有意不同）→ 存活探测/短 TTL
     for (const [key, entry] of Object.entries(map)) {
       const owned = typeof entry.sessionID === "string" && entry.sessionID.length > 0;
       if (wanted.length > 0 && owned && entry.sessionID !== wanted) continue;

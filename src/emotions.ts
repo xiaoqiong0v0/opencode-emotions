@@ -52,6 +52,90 @@ interface TextPartLike {
   text?: string;
 }
 
+/** `chat.message` 入参的会话归属候选（运行时可能出现在非类型声明的字段上）。 */
+export interface ChatMessageInputLike {
+  sessionID?: unknown;
+  messageID?: unknown;
+  properties?: { sessionID?: unknown; messageID?: unknown } | undefined;
+  message?: { sessionID?: unknown; messageID?: unknown } | undefined;
+}
+
+/** 缺归属 warn 的进程内一次性标记（防每条消息刷屏；单测可注入独立 state）。 */
+const missingSessionWarnState = { warned: false };
+
+/** 用户消息打断的可注入依赖（单测用 spy 断言「缺归属不调用任何停止入口」）。 */
+export interface UserMessageInterruptDeps {
+  /** 停止播放（默认 `stopPlayback`）。 */
+  stop?: (options: { sessionID: string }) => unknown;
+  /** 自动朗读打断（默认 `autoReader.interrupt`）。 */
+  interrupt?: (sessionID: string) => void;
+  /** 告警输出（默认插件 logger）。 */
+  warn?: (message: string, err?: Error | string) => void;
+  /** 「只记一次 warn」状态（默认模块级，单测传新对象隔离）。 */
+  warnState?: { warned: boolean };
+}
+
+/**
+ * 解析 `chat.message` 入参的会话 id：`sessionID` → `properties.sessionID` → `message.sessionID`。
+ * 逐级回落，任一非空白字符串即返回（trim 后）。
+ * @param input 钩子入参（可能缺字段）
+ * @returns 会话 id；全部缺失/空白 → undefined
+ */
+export function resolveChatSessionID(input: ChatMessageInputLike | undefined): string | undefined {
+  const candidates = [input?.sessionID, input?.properties?.sessionID, input?.message?.sessionID];
+  for (const candidate of candidates) {
+    if (typeof candidate === "string" && candidate.trim().length > 0) return candidate.trim();
+  }
+  return undefined;
+}
+
+/**
+ * 列出钩子入参上实际存在的字段名（缺归属 warn 的诊断信息）。
+ * @param input 钩子入参
+ * @returns 逗号分隔字段名；无字段 → `(none)`
+ */
+function describeAvailableFields(input: ChatMessageInputLike | undefined): string {
+  if (!input || typeof input !== "object") return "(none)";
+  const names = Object.keys(input as Record<string, unknown>);
+  return names.length > 0 ? names.join(",") : "(none)";
+}
+
+/**
+ * 用户发消息时的打断（barge-in）：**归属缺失一律跳过（fail-safe）**，绝不隐式全清。
+ *
+ * 缺归属时只记一次 warn（含入参可用字段名）并返回 false：不调 `stopPlayback`、不调 `interrupt`，
+ * 避免另一会话/无归属事件把当前会话正在播的 TTS 杀在句中。
+ * @param input 钩子入参（会话 id 按 {@link resolveChatSessionID} 逐级回落）
+ * @param autoReader 自动朗读实例（`interrupt` 按会话收窄）
+ * @param deps 可注入依赖（单测）
+ * @returns 是否执行了打断（false = 缺归属跳过）
+ */
+export function interruptOnUserMessage(
+  input: ChatMessageInputLike | undefined,
+  autoReader: { interrupt(sessionID?: string): void } | undefined,
+  deps: UserMessageInterruptDeps = {},
+): boolean {
+  const warn = deps.warn ?? ((message: string, err?: Error | string) => log.warn(message, err));
+  const sessionID = resolveChatSessionID(input);
+  if (!sessionID) {
+    const state = deps.warnState ?? missingSessionWarnState;
+    if (!state.warned) {
+      state.warned = true;
+      warn(`chat.message 缺少会话归属，已跳过打断（可用字段：${describeAvailableFields(input)}）`);
+    }
+    return false;
+  }
+  const stop = deps.stop ?? ((options: { sessionID: string }) => stopPlayback(options));
+  try {
+    stop({ sessionID });
+  } catch (err) {
+    warn("打断播放失败", err as Error);
+  }
+  const interrupt = deps.interrupt ?? ((sid: string) => autoReader?.interrupt(sid));
+  interrupt(sessionID);
+  return true;
+}
+
 /**
  * 把全部情绪主命令就地注册到 opencode 配置（只注册主命令，不含别名）。
  * @param cfg opencode 配置对象（会被就地修改）
@@ -145,17 +229,10 @@ const server: Plugin = async (input): Promise<Hooks> => {
       try {
         // 打断（barge-in）：用户一发送消息，立刻停掉正在播放的 TTS（按共享状态文件里的 PID 终止），
         // 并对**本会话**在途消息置打断水位（清其待读队列、停其朗读；水位语义见 auto-read `interrupt`）。
-        // **带 sessionID 按会话隔离**（2026-10-21 修跨会话误杀）：只停「本会话」或「无主」播放——
-        // 另一窗口新会话的消息不再把本会话正在播的 worker 杀在句中（钩子入参含 sessionID，
-        // 类型见 @opencode-ai/plugin dist/index.d.ts `chat.message` input）。
-        try {
-          stopPlayback({ sessionID: input.sessionID });
-        } catch (err) {
-          log.warn("打断播放失败", err as Error);
-        }
-        // 队列/水位/朗读子进程同样按会话收窄（2026-10-21 第四批）：只打断**本会话**的在途消息，
-        // 不清其它会话的待读队列、不置其水位、不杀其子进程；sessionID 缺失/空白 → 退化全清（旧行为）
-        autoReader?.interrupt(input.sessionID);
+        // **带 sessionID 按会话隔离**（2026-10-21 修跨会话误杀；2026-11-02 修「缺归属隐式全清」）：
+        // 会话 id 按 input.sessionID → properties.sessionID → message.sessionID 逐级回落；
+        // **仍取不到 → 只记一次 warn 并跳过**（return），绝不把 undefined 传下去触发全清。
+        if (!interruptOnUserMessage(input as ChatMessageInputLike, autoReader)) return;
         const parts = output?.parts as ReadonlyArray<TextPartLike> | undefined;
         if (!Array.isArray(parts)) return;
         // 只处理首个 text part

@@ -6,9 +6,9 @@
  * **双 PID（playerPid）**：新格式 roundtrip、旧格式（无 playerPid）兼容、stopPlayback 对
  * `pid`+`playerPid` 双目标各自过红线后都杀（消「杀父不杀孙」）；
  * **会话隔离（sessionID）**：roundtrip/旧格式无键、跨会话不杀不清、同会话照杀、
- * 无主条目任意会话可打断、无参（或空 sessionID）停任意。
+ * **方案 A（2026-11-02）**：按会话停跳过无主条目、只有无参全清才停无主。
  * **多条目 map（2026-10-21 第五批，跨会话混音）**：两会话并行 upsert 互不覆盖、按会话停只停
- * 本会话+无主、无参停全部、旧单条格式读作无主键 `_` 并可停、clearPlayback 删含该 pid 的多条目、
+ * 本会话、无参停全部（含无主）、旧单条格式读作无主键 `_`、clearPlayback 删含该 pid 的多条目、
  * 读时顺带清 TTL 陈旧条目并落盘。
  * **TUI 退出停播（2026-10-21 第七批）**：`stopPlaybackForSessions()` 逐会话各停一次（mock 注入断言）、
  * 单会话抛错不中断其余、空 id 跳过、接真 stopPlayback 时每会话条目各杀一次。
@@ -270,11 +270,12 @@ test("stopPlayback：带 sessionID——跨会话不杀不清、同会话照杀�
   }
 });
 
-test("stopPlayback：带 sessionID 而条目无 sessionID → 照杀（无主播放向后兼容）", () => {
+test("stopPlayback：带 sessionID 而条目无主 → 跳过（方案 A：不杀、不清、返回 false）", () => {
   const dir = tempConfigDir();
   try {
-    // 手动 speak / 旧格式条目：无归属 ⇒ 任何会话的打断都可停（有意兼容）
-    writePlayback(entry(), { dataDir: dir });
+    // 手动 CLI / 未注入会话的播放：无主条目。按会话停不再触碰它（旧口径会照杀）。
+    const ownerless = entry();
+    writePlayback(ownerless, { dataDir: dir });
     const signals = [];
     const stopped = stopPlayback({
       dataDir: dir,
@@ -283,9 +284,10 @@ test("stopPlayback：带 sessionID 而条目无 sessionID → 照杀（无主播
       isAlive: () => true,
       kill: (pid, sig) => signals.push([pid, sig]),
     });
-    assert.equal(stopped, true, "无主条目 → 停");
-    assert.deepEqual(signals, [[4242, "SIGTERM"]]);
-    assert.equal(existsSync(playbackStatePath({ dataDir: dir })), false, "停后清状态");
+    assert.equal(stopped, false, "无主条目 → 不发信号（false）");
+    assert.deepEqual(signals, [], "按会话停零信号");
+    assert.deepEqual(readPlayback(PLAYBACK_OWNERLESS_KEY, { dataDir: dir }), ownerless, "无主条目保留");
+    assert.equal(existsSync(playbackStatePath({ dataDir: dir })), true, "状态文件未被清");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -294,14 +296,20 @@ test("stopPlayback：带 sessionID 而条目无 sessionID → 照杀（无主播
 test("stopPlayback：无参或 sessionID 空 → 停全部条目（dispose/全清语义）", () => {
   const dir = tempConfigDir();
   try {
-    // 无参：条目即便带 sessionID 也停（dispose/清场 = 全清，多条目逐一过红线）
-    writePlayback(entry({ sessionID: "ses_a" }), { dataDir: dir });
+    // 无参：条目即便带 sessionID 也停（dispose/清场 = 全清）；**无主条目也只有这里才停**
+    writePlayback(entry({ sessionID: "ses_a", pid: 111 }), { dataDir: dir });
+    writePlayback(entry({ pid: 222 }), { dataDir: dir });
     let signals = [];
     assert.equal(
       stopPlayback({ dataDir: dir, now: () => 2000, isAlive: () => true, kill: (pid, sig) => signals.push([pid, sig]) }),
       true,
       "无参 → 停全部");
-    assert.deepEqual(signals, [[4242, "SIGTERM"]]);
+    assert.deepEqual(
+      signals.map(([pid]) => pid).sort((a, b) => a - b),
+      [111, 222],
+      "有主 + 无主条目都被停",
+    );
+    assert.equal(existsSync(playbackStatePath({ dataDir: dir })), false, "全清后状态文件删除");
 
     // sessionID 为空白（等价无参）：同样停全部
     writePlayback(entry({ sessionID: "ses_a" }), { dataDir: dir });
@@ -381,7 +389,7 @@ test("多条目 map：两会话并行 upsert 互不覆盖、同会话重写只�
   }
 });
 
-test("stopPlayback：按会话停只停本会话+无主（跨会话混音），无参停全部", () => {
+test("stopPlayback：按会话停只停本会话（跨会话混音），无参停全部", () => {
   const dir = tempConfigDir();
   try {
     writePlayback(entry({ sessionID: "ses_a", pid: 111 }), { dataDir: dir });
@@ -410,30 +418,60 @@ test("stopPlayback：按会话停只停本会话+无主（跨会话混音），�
   }
 });
 
-test("stopPlayback：按会话停连带无主条目、跳过其它会话（归属门逐条目生效）", () => {
+test("stopPlayback 方案 A 四条边界：按会话只停本会话、跳过无主；无参全清停无主", () => {
   const dir = tempConfigDir();
   try {
-    // 无主（手动 speak）+ ses_b（另一会话）并存；ses_a 打断 → 无主被停、ses_b 保留
-    writePlayback(entry({ pid: 111 }), { dataDir: dir });
-    writePlayback(entry({ sessionID: "ses_b", pid: 222 }), { dataDir: dir });
+    // `_`（无主）+ ses_a + ses_b 三键并存
+    const ownerless = entry({ pid: 111 });
+    writePlayback(ownerless, { dataDir: dir });
+    writePlayback(entry({ sessionID: "ses_a", pid: 222 }), { dataDir: dir });
+    writePlayback(entry({ sessionID: "ses_b", pid: 333 }), { dataDir: dir });
     const signals = [];
-    assert.equal(
-      stopPlayback({ dataDir: dir, sessionID: "ses_a", now: () => 2000, isAlive: () => true, kill: (pid, sig) => signals.push([pid, sig]) }),
-      true,
-      "无主条目被停 → true",
+    const stop = (sessionID) =>
+      stopPlayback({
+        dataDir: dir,
+        ...(sessionID === undefined ? {} : { sessionID }),
+        now: () => 2000,
+        isAlive: () => true,
+        kill: (pid, sig) => signals.push([pid, sig]),
+      });
+
+    // ① 带 sessionID=ses_a 且条目 ses_a → 正常停；无主与 ses_b 不动
+    assert.equal(stop("ses_a"), true, "本会话条目 → 停");
+    assert.deepEqual(signals, [[222, "SIGTERM"]], "只杀 ses_a");
+    assert.deepEqual(readPlayback(PLAYBACK_OWNERLESS_KEY, { dataDir: dir }), ownerless, "无主条目保留");
+    assert.equal(readPlayback("ses_b", { dataDir: dir }).pid, 333, "ses_b 保留");
+
+    // ② 带 sessionID=ses_x 且条目无主 → 跳过（不杀不清、无其它命中 → false）
+    signals.length = 0;
+    assert.equal(stop("ses_x"), false, "无主条目被跳过 → false");
+    assert.deepEqual(signals, [], "零信号");
+    assert.deepEqual(readPlayback(PLAYBACK_OWNERLESS_KEY, { dataDir: dir }), ownerless, "无主条目仍保留");
+
+    // ③ 带 sessionID=ses_a 且条目 ses_b → 跳过（跨会话既有行为不变）
+    signals.length = 0;
+    assert.equal(stop("ses_a"), false, "跨会话条目被跳过 → false");
+    assert.deepEqual(signals, [], "零信号");
+    assert.equal(readPlayback("ses_b", { dataDir: dir }).pid, 333, "ses_b 仍保留");
+
+    // ④ 无参 → 停全部（含无主 `_`）
+    signals.length = 0;
+    assert.equal(stop(undefined), true, "无参 → 停全部");
+    assert.deepEqual(
+      signals.map(([pid]) => pid).sort((a, b) => a - b),
+      [111, 333],
+      "剩余的无主 + ses_b 都被停",
     );
-    assert.deepEqual(signals, [[111, "SIGTERM"]], "无主可停、跨会话有主不停");
-    assert.equal(readPlayback(PLAYBACK_OWNERLESS_KEY, { dataDir: dir }), undefined, "无主条目已清");
-    assert.equal(readPlayback("ses_b", { dataDir: dir }).pid, 222, "ses_b 保留");
+    assert.equal(existsSync(playbackStatePath({ dataDir: dir })), false, "全清后状态文件删除");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
 });
 
-test("旧单条格式兼容：读作无主键 `_`、可被任意会话停；带 sessionID 的旧条目键归一", () => {
+test("旧单条格式兼容：读作无主键 `_`（按会话停跳过、仅全清停）；带 sessionID 的旧条目键归一", () => {
   const dir = tempConfigDir();
   try {
-    // 旧单条格式（顶层有数值 pid、无 sessionID）→ 无主键，任何会话可停
+    // 旧单条格式（顶层有数值 pid、无 sessionID）→ 无主键；按会话停不再触碰它
     const legacyPlain = entry({ pid: 4242 });
     writeFileSync(playbackStatePath({ dataDir: dir }), JSON.stringify(legacyPlain), "utf8");
     const all = readPlayback(undefined, { dataDir: dir });
@@ -442,8 +480,16 @@ test("旧单条格式兼容：读作无主键 `_`、可被任意会话停；带 
     const signals = [];
     assert.equal(
       stopPlayback({ dataDir: dir, sessionID: "ses_any", now: () => 2000, isAlive: () => true, kill: (pid, sig) => signals.push([pid, sig]) }),
+      false,
+      "无主旧条目按会话停跳过",
+    );
+    assert.deepEqual(signals, [], "按会话停零信号");
+    assert.deepEqual(readPlayback(PLAYBACK_OWNERLESS_KEY, { dataDir: dir }), legacyPlain, "无主旧条目保留");
+    // 显式全清才停无主旧条目
+    assert.equal(
+      stopPlayback({ dataDir: dir, now: () => 2000, isAlive: () => true, kill: (pid, sig) => signals.push([pid, sig]) }),
       true,
-      "无主旧条目任意会话可停",
+      "无参全清停无主旧条目",
     );
     assert.deepEqual(signals, [[4242, "SIGTERM"]]);
 
@@ -716,6 +762,37 @@ test("判活：无状态文件/空 map → false；nowMs 缺省走 Date.now 口�
     writePlayback(entry({ sessionID: "ses_a", pid: 111 }), { dataDir: dir }); // startedAt=Date.now()
     assert.equal(isInterruptablePlaybackActive("ses_a", undefined, { dataDir: dir, isAlive: () => true }), true,
       "nowMs 缺省：pid 存活 → true");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("按会话停命中无主条目：INFO 取证行存在，且无主条目不再被停（方案 A）", async () => {
+  const { readFileSync } = await import("node:fs");
+  // 日志走文件（默认关闭）+ 无注入点：按本仓既有先例（emotions-hook.test.js）断言产物源码。
+  const code = readFileSync(new URL("../dist/voice/playback-state.js", import.meta.url), "utf8");
+  assert.match(code, /skipped ownerless stop: requestedBy=/, "按会话停跳过无主条目必须留 INFO 取证行");
+  assert.match(
+    code,
+    /skipped ownerless stop: requestedBy=\$\{wanted\} provider=\$\{entry\.provider\} pid=\$\{entry\.pid\}/,
+    "取证行字段：requestedBy/provider/pid（单行）",
+  );
+  assert.doesNotMatch(code, /stopping\s+ownerless entry:/, "旧 WARN 取证行已删除");
+  assert.match(code, /if \(wanted\.length > 0 && !owned\)/, "仅按会话停（wanted 非空）才跳过无主；显式全清不跳过");
+  assert.match(code, /skipped cross-session stop: session=/, "既有跨会话跳过 info 行保持");
+
+  const dir = tempConfigDir();
+  try {
+    const ownerless = entry({ pid: 111 });
+    writePlayback(ownerless, { dataDir: dir }); // 无主条目（键 `_`）
+    const signals = [];
+    assert.equal(
+      stopPlayback({ dataDir: dir, sessionID: "ses_b", now: () => 2000, isAlive: () => true, kill: (pid, sig) => signals.push([pid, sig]) }),
+      false,
+      "按会话停不再连带无主条目（无其它命中 → false）",
+    );
+    assert.deepEqual(signals, [], "无主条目零信号");
+    assert.deepEqual(readPlayback(PLAYBACK_OWNERLESS_KEY, { dataDir: dir }), ownerless, "无主条目保留");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

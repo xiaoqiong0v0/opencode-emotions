@@ -89,6 +89,7 @@ for await (const chunk of process.stdin) chunks.push(chunk);
 process.stdout.write(JSON.stringify({
   argv: process.argv.slice(2),
   stdin: Buffer.concat(chunks).toString("utf8"),
+  envSession: process.env.EMOTIONS_SESSION_ID ?? null,
 }));
 `;
 
@@ -125,6 +126,31 @@ test("emotions_cli execute：特殊字符 + 中英混排 + 9000 字正文经 std
     const parsed = JSON.parse(result.output);
     assert.equal(parsed.stdin, text, "正文必须逐字符原样（无变量展开/引号丢失/长度截断）");
     assert.deepEqual(parsed.argv, ["speak", "--text-stdin", "--emotion", "happy", "--background"]);
+  } finally {
+    env.cleanup();
+  }
+});
+
+test("emotions_cli execute：spawn env 注入 EMOTIONS_SESSION_ID=<context.sessionID>（工具播放有归属）", async () => {
+  const env = withFakeCli(ECHO_SCRIPT);
+  try {
+    const tool = createVoiceTool(logStub)["emotions_cli"];
+    const result = await tool.execute(
+      { args: "status" },
+      { sessionID: "ses_tool_1", abort: new AbortController().signal },
+    );
+    assert.equal(JSON.parse(result.output).envSession, "ses_tool_1", "子进程必须收到本会话归属");
+  } finally {
+    env.cleanup();
+  }
+});
+
+test("emotions_cli execute：sessionID 为空 → env 不含 EMOTIONS_SESSION_ID（不落无主）", async () => {
+  const env = withFakeCli(ECHO_SCRIPT);
+  try {
+    const tool = createVoiceTool(logStub)["emotions_cli"];
+    const result = await tool.execute({ args: "status" }, { sessionID: "", abort: new AbortController().signal });
+    assert.equal(JSON.parse(result.output).envSession, null, "空 sessionID 不得注入归属键");
   } finally {
     env.cleanup();
   }

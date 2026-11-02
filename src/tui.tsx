@@ -32,7 +32,7 @@
  *     不 bump 指示灯修订号，开关与灯原样；水位文件是跨进程兜底——停播按 PID 杀，单元间隙无进程可杀、
  *     worker 死后朗读侧又可能重新 spawn，两种都由 server 侧 `auto-read` 读水位拦）；**无活跃播放**时才走原 toggle 语义——点按切换**当前会话**的共享状态文件
  *   （每会话目录 `<root>/<sessionID>/auto-tts`，内容 `on`/`off`，缺省=关；一个会话的开关不影响其它会话）；
- *   关闭时立即 `stopPlayback({ sessionID })` 停掉**本会话**正在朗读的那段（跨会话不误杀、无主播放仍可停），开启只影响后续助手回复、**不**补读历史。
+ *   关闭时立即 `stopPlayback({ sessionID })` 停掉**本会话**正在朗读的那段（跨会话不误杀；无主条目按方案 A 跳过），开启只影响后续助手回复、**不**补读历史。
  *   **键重复抑制**：按住 F10 会被 OS 连发按键事件（长按会键重复），逐事件切换会偶数次翻转净回「关」，
  *   故一次按键事件流只算一次切换（尾沿静默窗口见 `KeyRepeatGuard`）。
  *   子会话（subagent）不支持：按 F10 时 toast 提示「子会话不自动朗读」，不写状态文件。
@@ -694,16 +694,20 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
     if (toggling) return;
     toggling = true;
     // 打断（barge-in）：按 F8/F9 语音输入时，立刻停掉正在播放的 TTS（按共享状态文件里的 PID）。
-    // 带当前 sessionID 做会话隔离：只停本会话/无主播放（取不到会话路由时退化为停任意，与旧行为一致）。
+    // 带当前 sessionID 做会话隔离：只停本会话键条目（无主条目按方案 A 跳过）。
+    // **取不到会话路由时不做任何停播**（避免 `stopPlayback({sessionID: undefined})` 退化成“全清”误杀其它会话）。
     // 诊断埋点（2026-10-22，与 F10 中断日志同风格）：stopped=是否发出终止信号 + 会话，
     // 用于核实「F8/F9 到底有没有停掉播放」——false 也可能是「本就没有在播」，结合 playback 日志判定。
     const interruptSession = currentSessionID(api);
     try {
-      // 会话级中断请求水位（2026-10-22）：`stopPlayback` 只按 PID 杀，**单元间隙无进程可杀**时杀空、
-      // 朗读侧随后又可能重新 spawn ⇒ 中断意图必须落文件由 auto-read 自查。取不到会话路由则不写
-      // （保持「无主」语义，与 stopPlayback 的无参退化同口径）。写失败静默（不影响语音输入）。
-      if (interruptSession) writeInterruptRequest(interruptSession);
-      const stopped = stopPlayback({ sessionID: interruptSession });
+      // 会话级中断请求水位（2026-10-22）：`stopPlayback` 只按 PID 杀，**单元间隙没有进程可杀**时杀空、
+      // 朗读侧随后又可能重新 spawn ⇒ 中断意图必须落文件由 auto-read 自查。取不到会话路由则不写、不停。
+      // 写失败静默（不影响语音输入）。
+      let stopped = false;
+      if (interruptSession) {
+        writeInterruptRequest(interruptSession);
+        stopped = stopPlayback({ sessionID: interruptSession });
+      }
       log.info(`f8f9 interrupt: stopped=${stopped} session=${interruptSession ?? "-"} toggling=${target}`);
     } catch {
       log.info(`f8f9 interrupt: stopped=false session=${interruptSession ?? "-"} error=true`);
@@ -833,7 +837,7 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
     setAutoReadRev((n: number) => n + 1);
     if (!next) {
       // 关闭：立刻停止当前正在播放的朗读（子进程登记的 PID），不等它自然播完。
-      // 带当前 sessionID 会话隔离：F10 只关本会话，故也只停本会话/无主的播放。
+      // 带当前 sessionID 会话隔离：F10 只关本会话，故也只停本会话键的播放（无主条目跳过）。
       try {
         stopPlayback({ sessionID });
       } catch {
